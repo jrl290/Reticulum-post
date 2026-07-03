@@ -21,10 +21,8 @@ trait RequestControlPlaneTrait
                 $announce,
             );
 
-            // Register as a local destination if the announce arrived on a non-relay interface
-            // (e.g. the browser's HTTP exchange interface, not a backbone-facing transport)
-            $this->registerLocalDestinationIfOwnInterface((string) $packet['destination_hash_hex'], $interfaceId);
-
+            // Path table alone determines routing — no separate local_destinations table.
+            // 0-hop entries are directly attached endpoints.
             return $this->upsertPathFromAnnounce($interfaceId, $packet, $announce);
         } catch (\Throwable $error) {
             return ['invalid', $error->getMessage()];
@@ -71,11 +69,11 @@ trait RequestControlPlaneTrait
 
         $path = $this->usablePathEntry($destinationHashHex);
         if ($path === null) {
-            // If this destination is registered as local, try to respond
+            // If this destination is directly attached (0 hops), try to respond
             // even if the path entry's interface is currently inactive.
-            // This ensures late-joining peers can discover local endpoints.
-            $localIface = $this->localDestinationInterface($destinationHashHex);
-            if ($localIface !== null) {
+            // This ensures late-joining peers can discover directly-attached endpoints.
+            $directIface = $this->directlyAttachedInterface($destinationHashHex);
+            if ($directIface !== null) {
                 $path = $this->pathEntry($destinationHashHex);
             }
 
@@ -156,44 +154,28 @@ trait RequestControlPlaneTrait
         return true;
     }
 
-    private function registerLocalDestinationIfOwnInterface(string $destinationHashHex, string $interfaceId): void
+    /**
+     * Find the interface a destination is directly attached to (0 hops away).
+     * Replaces the separate local_destinations table — the path table IS the source of truth.
+     */
+    private function directlyAttachedInterface(string $destinationHashHex): ?string
     {
-        // Use the standard RNS interface mode to decide local-destination registration.
-        // Modes that represent foreign/transit destinations (gateway, access-point, boundary)
-        // must NOT be registered as local — their announces are for peers BEHIND them.
-        // Endpoint modes (full, point-to-point, roaming) register normally.
-        $metadata = $this->interfaceMetadata($interfaceId);
-        $mode = (int) ($metadata['mode'] ?? 1); // default MODE_FULL
-
-        // RNS mode constants: MODE_ACCESS_POINT=3, MODE_BOUNDARY=5, MODE_GATEWAY=6
-        if ($mode === 3 || $mode === 5 || $mode === 6) {
-            return; // Transit interface — announces represent remote peers, not local
-        }
-
-        $stmt = $this->db->prepare(
-            'INSERT OR REPLACE INTO local_destinations (destination_hash_hex, interface_id, registered_at)
-             VALUES (:dest, :iface, :ts)'
-        );
-        $stmt->bindValue(':dest', $destinationHashHex, SQLITE3_TEXT);
-        $stmt->bindValue(':iface', $interfaceId, SQLITE3_TEXT);
-        $stmt->bindValue(':ts', time(), SQLITE3_INTEGER);
-        $stmt->execute();
-    }
-
-    private function localDestinationInterface(string $destinationHashHex): ?string
-    {
-        $stmt = $this->db->prepare(
-            'SELECT interface_id FROM local_destinations WHERE destination_hash_hex = :dest LIMIT 1'
-        );
-        $stmt->bindValue(':dest', $destinationHashHex, SQLITE3_TEXT);
-        $row = $stmt->execute()->fetchArray(SQLITE3_ASSOC);
-
-        if (!is_array($row)) {
+        $path = $this->pathEntry($destinationHashHex);
+        if ($path === null) {
             return null;
         }
 
-        $ifaceId = (string) ($row['interface_id'] ?? '');
-        // Verify the interface still exists
+        // A destination is directly attached if it's 0 hops away
+        if ((int) ($path['hops'] ?? -1) !== 0) {
+            return null;
+        }
+
+        $ifaceId = (string) ($path['interface_id'] ?? '');
+        if ($ifaceId === '') {
+            return null;
+        }
+
+        // Verify the interface still exists (may have gone offline)
         $metadata = $this->interfaceMetadata($ifaceId);
         if ($metadata === []) {
             return null;

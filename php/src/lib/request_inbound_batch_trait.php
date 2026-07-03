@@ -184,21 +184,24 @@ trait RequestInboundBatchTrait
         ];
     }
 
-    private function deliverLocallyIfKnown(string $sourceInterfaceId, string $rawBase64, array $packet): bool
+    /**
+     * Deliver a packet directly if the destination is 0 hops away via some interface.
+     * Uses the path table — no separate local_destinations table needed.
+     */
+    private function deliverIfDirectlyAttached(string $sourceInterfaceId, string $rawBase64, array $packet): bool
     {
         $destHash = (string) ($packet['destination_hash_hex'] ?? '');
         if ($destHash === '') {
             return false;
         }
 
-        $localIface = $this->localDestinationInterface($destHash);
-        if ($localIface === null || $localIface === $sourceInterfaceId) {
+        $targetIface = $this->directlyAttachedInterface($destHash);
+        if ($targetIface === null || $targetIface === $sourceInterfaceId) {
             return false;
         }
 
-        // Queue the packet as-is (no hop increment) for local delivery
-        $queueReason = 'local_delivery';
-        $this->queueOutboundPacket($localIface, $rawBase64, $queueReason, $sourceInterfaceId);
+        $queueReason = 'direct_delivery';
+        $this->queueOutboundPacket($targetIface, $rawBase64, $queueReason, $sourceInterfaceId);
 
         return true;
     }
@@ -291,18 +294,18 @@ trait RequestInboundBatchTrait
                     }
                 }
 
-                $deliveredLocally = false;
+                $deliveredDirectly = false;
                 if ($filterStatus === 'accepted'
                     && in_array((int) ($packet['packet_type'] ?? -1), [0, 2], true)
                     && (int) ($packet['destination_type'] ?? -1) !== 3
                 ) {
-                    $deliveredLocally = $this->deliverLocallyIfKnown($interfaceId, $normalizedRawBase64, $packet);
-                    if ($deliveredLocally) {
+                    $deliveredDirectly = $this->deliverIfDirectlyAttached($interfaceId, $normalizedRawBase64, $packet);
+                    if ($deliveredDirectly) {
                         $summary['local_deliveries']++;
                     }
                 }
 
-                if (!$deliveredLocally) {
+                if (!$deliveredDirectly) {
                     if ($filterStatus === 'accepted' && $this->shouldTransportLinkRequestProofPacket($packet)) {
                         $summary['relay_packets_queued'] += $this->relayLinkRequestProofPacket($interfaceId, $normalizedRawBase64, $packet);
                     } elseif ($filterStatus === 'accepted' && $this->shouldRelayLinkTransportPacket($packet)) {

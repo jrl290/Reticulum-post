@@ -86,16 +86,6 @@ trait RequestSchemaTrait
         $this->db->exec('CREATE INDEX IF NOT EXISTS idx_inbound_batches_unprocessed ON inbound_batches(processed_at, created_at)');
         $this->db->exec('CREATE INDEX IF NOT EXISTS idx_inbound_packets_status ON inbound_packets(status, created_at)');
 
-        // Local destination registry: maps destination_hash → owning interface_id
-        $this->db->exec(
-            'CREATE TABLE IF NOT EXISTS local_destinations (
-                destination_hash_hex TEXT PRIMARY KEY,
-                interface_id TEXT NOT NULL,
-                registered_at INTEGER NOT NULL,
-                FOREIGN KEY (interface_id) REFERENCES interfaces(interface_id) ON DELETE CASCADE
-            )'
-        );
-        $this->db->exec('CREATE INDEX IF NOT EXISTS idx_local_destinations_interface ON local_destinations(interface_id)');
         $this->db->exec(
             'CREATE TABLE IF NOT EXISTS packet_hashes (
                 packet_hash_hex TEXT PRIMARY KEY,
