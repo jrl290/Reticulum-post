@@ -203,6 +203,12 @@ trait RequestInboundBatchTrait
         $queueReason = 'direct_delivery';
         $this->queueOutboundPacket($targetIface, $rawBase64, $queueReason, $sourceInterfaceId);
 
+        // Remember reverse path so return PROOFs can be routed back
+        $truncatedHashHex = (string) ($packet['truncated_hash_hex'] ?? '');
+        if ($truncatedHashHex !== '') {
+            $this->rememberReversePath($truncatedHashHex, $sourceInterfaceId, $targetIface);
+        }
+
         return true;
     }
 
