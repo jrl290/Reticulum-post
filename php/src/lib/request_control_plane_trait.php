@@ -71,12 +71,22 @@ trait RequestControlPlaneTrait
 
         $path = $this->usablePathEntry($destinationHashHex);
         if ($path === null) {
-            $queued = $this->forwardPathRequestPacket($interfaceId, $rawBase64, $packet);
-            if ($queued > 0) {
-                return ['forwarded', 'unknown_destination_forwarded', $queued];
+            // If this destination is registered as local, try to respond
+            // even if the path entry's interface is currently inactive.
+            // This ensures late-joining peers can discover local endpoints.
+            $localIface = $this->localDestinationInterface($destinationHashHex);
+            if ($localIface !== null) {
+                $path = $this->pathEntry($destinationHashHex);
             }
 
-            return ['ignored', 'unknown_destination_path', 0];
+            if ($path === null) {
+                $queued = $this->forwardPathRequestPacket($interfaceId, $rawBase64, $packet);
+                if ($queued > 0) {
+                    return ['forwarded', 'unknown_destination_forwarded', $queued];
+                }
+
+                return ['ignored', 'unknown_destination_path', 0];
+            }
         }
 
         $nextHopHex = (string) $path['next_hop_hex'];
