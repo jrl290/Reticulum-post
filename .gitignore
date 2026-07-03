@@ -1,0 +1,29 @@
+# Runtime state
+var/
+*.sqlite
+*.log
+
+# Local configuration overrides
+config.local.toml
+config.local.php
+config.toml
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Keys and secrets
+*.pem
+*.key
+id_rsa*

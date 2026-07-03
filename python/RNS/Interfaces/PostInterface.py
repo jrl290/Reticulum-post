@@ -1,0 +1,238 @@
+"""
+PostInterface — HTTP POST-based interface for Reticulum.
+
+Connects a Reticulum transport node to a remote Reticulum-php node
+via HTTP exchange (the same protocol as rns_transport.php).
+
+Place this file in ~/.reticulum/interfaces/ and add to config:
+
+  [[PostInterface]]
+    type = PostInterface
+    enabled = yes
+    node_url = https://your-node.example.com/reticulum
+    name = PHP Node Bridge
+"""
+
+import threading
+import time
+import base64
+import json
+import urllib.request
+import urllib.error
+
+from RNS.Interfaces.Interface import Interface
+import RNS
+
+
+class PostInterface(Interface):
+    DEFAULT_IFAC_SIZE = 16
+    HW_MTU = 500
+    BITRATE_GUESS = 100_000_000
+
+    owner = None
+    node_url = None
+    online = False
+    _interface_id = None
+    _session_token = None
+    _max_batch = 64
+    _idle_ms = 1000
+    _poll_thread = None
+    _running = False
+    _outgoing_queue = []
+    _queue_lock = threading.Lock()
+    _ack_ids = []
+    _batch_seq = 0
+
+    def __init__(self, owner, configuration):
+        super().__init__()
+
+        ifconf = Interface.get_config_obj(configuration)
+        name = ifconf["name"]
+        self.name = name
+        self.owner = owner
+
+        node_url = ifconf["node_url"] if "node_url" in ifconf else None
+        if not node_url:
+            raise ValueError(f"No node_url specified for {self}")
+        self.node_url = node_url.rstrip('/')
+
+        # Read optional config with proper defaults
+        self.HW_MTU = 500
+        self.bitrate = 100_000_000
+        if "bitrate" in ifconf:
+            try:
+                self.bitrate = int(ifconf["bitrate"])
+            except (ValueError, TypeError):
+                pass
+        if "mtu" in ifconf:
+            try:
+                self.HW_MTU = int(ifconf["mtu"])
+            except (ValueError, TypeError):
+                pass
+
+        self.IN = True
+        self.OUT = True
+        self.mode = RNS.Interfaces.Interface.Interface.MODE_FULL
+        self.online = False
+        self._running = True
+        self._poll_thread = None
+
+        # Register with the PHP node
+        try:
+            self._register()
+        except Exception as e:
+            RNS.log(f"PostInterface[{self.name}]: Registration failed: {e}", RNS.LOG_ERROR)
+            raise e
+
+        # Verify we're in the transport interfaces list
+        if hasattr(RNS.Transport, 'interfaces') and self in RNS.Transport.interfaces:
+            RNS.log(f"PostInterface[{self.name}]: Registered in Transport.interfaces (OUT={self.OUT}, IN={self.IN})", RNS.LOG_NOTICE)
+        else:
+            RNS.log(f"PostInterface[{self.name}]: NOT in Transport.interfaces! Attempting self-registration...", RNS.LOG_ERROR)
+            if hasattr(RNS.Transport, 'interfaces'):
+                RNS.Transport.interfaces.append(self)
+                RNS.log(f"PostInterface[{self.name}]: Self-registered in Transport.interfaces", RNS.LOG_NOTICE)
+
+        # Mark as online and start the exchange poll thread
+        self.online = True
+        self._poll_thread = threading.Thread(target=self._poll_loop, daemon=True)
+        self._poll_thread.start()
+        RNS.log(f"PostInterface[{self.name}]: Online and polling (idle_ms={self._idle_ms})", RNS.LOG_NOTICE)
+
+    def _register(self):
+        """Register this interface with the PHP node."""
+        body = {
+            'name': f'RNS PostInterface ({self.name})',
+            'bitrate': self.bitrate,
+            'mtu': self.HW_MTU,
+            'metadata': {
+                'client': 'rns-post-interface',
+                'transport': 'http-exchange',
+                'implementation': 'PostInterface',
+                'mode': 'full',
+            },
+        }
+        resp = self._http_post(f"{self.node_url}/v1/interfaces/register", body)
+        self._interface_id = resp.get('interface_id')
+        self._session_token = resp.get('session_token')
+        self._max_batch = int(resp.get('max_batch_packets', 64))
+        self._idle_ms = int(resp.get('idle_exchange_interval_ms', 1000))
+        if not self._interface_id or not self._session_token:
+            raise RuntimeError("Registration did not return credentials")
+
+    def _http_post(self, url, body):
+        """Make an HTTP POST request."""
+        data = json.dumps(body).encode('utf-8')
+        req = urllib.request.Request(url, data=data, headers={
+            'Content-Type': 'application/json',
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return json.loads(resp.read().decode('utf-8'))
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode('utf-8', errors='replace')
+            raise RuntimeError(f"HTTP {e.code}: {error_body[:200]}")
+        except Exception as e:
+            raise RuntimeError(f"HTTP POST failed: {e}")
+
+    def process_incoming(self, data):
+        """Called when we receive a packet from the PHP node (via exchange).
+        The data is a raw Reticulum packet that the PHP node wants to send
+        to the backbone.
+        """
+        self.rxb += len(data)
+        # Log inbound packet for diagnostics
+        if len(data) >= 18:
+            dest = data[2:18].hex() if len(data) >= 18 else '?'
+            pkt_type = data[0] & 0x03 if data else -1
+            types = {0:'DATA',1:'ANNOUNCE',2:'LINK',3:'PROOF'}
+            tname = types.get(pkt_type, str(pkt_type))
+            RNS.log(f"PostInterface IN: {tname} dest={dest[:12]}... len={len(data)}", RNS.LOG_NOTICE)
+        # Forward to RNS transport for processing and forwarding to backbone
+        self.owner.inbound(data, self)
+
+    def process_outgoing(self, data):
+        """Called by RNS when it wants to send a packet through this interface.
+        We queue it for the next exchange with the PHP node.
+        """
+        if self.online:
+            with self._queue_lock:
+                self._outgoing_queue.append(data)
+            self.txb += len(data)
+            if len(data) >= 18:
+                dest = data[2:18].hex() if len(data) >= 18 else '?'
+                pkt_type = data[0] & 0x03 if data else -1
+                types = {0:'DATA',1:'ANNOUNCE',2:'LINK',3:'PROOF'}
+                tname = types.get(pkt_type, str(pkt_type))
+                # Use NOTICE level so we can see it
+                RNS.log(f"PostInterface OUT: {tname} dest={dest[:12]}... len={len(data)}", RNS.LOG_NOTICE)
+
+    def _poll_loop(self):
+        """Background thread that periodically exchanges packets with the PHP node."""
+        last_exchange = 0
+        # Minimum 3 second poll interval to avoid SQLite lock contention
+        _min_interval = 3.0
+        while self._running:
+            now = time.time()
+            # Exchange at most every max(idle_ms/2, _min_interval) seconds
+            interval = max(self._idle_ms / 2000.0, _min_interval)
+            if now - last_exchange < interval:
+                time.sleep(0.5)
+                continue
+
+            try:
+                # Collect queued outgoing packets
+                with self._queue_lock:
+                    packets = self._outgoing_queue[:self._max_batch]
+                    self._outgoing_queue = self._outgoing_queue[self._max_batch:]
+                    ack_ids = list(self._ack_ids)
+                    self._ack_ids = []
+
+                body = {
+                    'interface_id': self._interface_id,
+                    'session_token': self._session_token,
+                    'ack_batch_ids': ack_ids,
+                    'max_packets': self._max_batch,
+                    'packets': [base64.b64encode(p).decode('ascii') for p in packets],
+                }
+                if packets:
+                    self._batch_seq += 1
+                    body['batch_id'] = f'rns-post-{int(time.time()*1000)}-{self._batch_seq}'
+
+                resp = self._http_post(f"{self.node_url}/v1/interfaces/exchange", body)
+
+                # Process delivery packets → send them as incoming
+                delivery = resp.get('delivery_packets', [])
+                delivery_batch = resp.get('delivery_batch_id')
+
+                for pkt_b64 in delivery:
+                    if not isinstance(pkt_b64, str) or not pkt_b64:
+                        continue
+                    try:
+                        raw = base64.b64decode(pkt_b64)
+                        self.process_incoming(raw)
+                    except Exception as e:
+                        RNS.log(f"PostInterface[{self.name}]: Failed to decode delivery packet: {e}", RNS.LOG_WARNING)
+
+                if isinstance(delivery_batch, str) and delivery_batch:
+                    self._ack_ids.append(delivery_batch)
+
+                last_exchange = now
+
+            except Exception as e:
+                RNS.log(f"PostInterface[{self.name}]: Exchange error: {e}", RNS.LOG_WARNING)
+                # Re-queue packets on failure
+                if packets:
+                    with self._queue_lock:
+                        self._outgoing_queue = packets + self._outgoing_queue
+                time.sleep(1)
+
+    def should_ingress_limit(self):
+        return False
+
+    def __str__(self):
+        return f"PostInterface[{self.name}]"
+
+
+# Register the interface class
+interface_class = PostInterface

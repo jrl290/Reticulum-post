@@ -1,0 +1,1 @@
+from .PostInterface import PostInterface
