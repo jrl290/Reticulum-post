@@ -148,12 +148,16 @@ trait RequestControlPlaneTrait
 
     private function registerLocalDestinationIfOwnInterface(string $destinationHashHex, string $interfaceId): void
     {
-        // Only register as local if this interface is NOT a relay/peer interface
+        // Use the standard RNS interface mode to decide local-destination registration.
+        // Modes that represent foreign/transit destinations (gateway, access-point, boundary)
+        // must NOT be registered as local — their announces are for peers BEHIND them.
+        // Endpoint modes (full, point-to-point, roaming) register normally.
         $metadata = $this->interfaceMetadata($interfaceId);
-        $transport = (string) ($metadata['transport'] ?? '');
-        // http-exchange = browser, unknown/unset = local client
-        if ($transport === 'tcp-backbone-gateway' || $transport === 'php-peer-exchange') {
-            return; // Don't register backbone-facing interfaces as local
+        $mode = (int) ($metadata['mode'] ?? 1); // default MODE_FULL
+
+        // RNS mode constants: MODE_ACCESS_POINT=3, MODE_BOUNDARY=5, MODE_GATEWAY=6
+        if ($mode === 3 || $mode === 5 || $mode === 6) {
+            return; // Transit interface — announces represent remote peers, not local
         }
 
         $stmt = $this->db->prepare(
