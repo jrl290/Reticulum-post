@@ -209,6 +209,11 @@ trait RequestInboundBatchTrait
             $this->rememberReversePath($truncatedHashHex, $sourceInterfaceId, $targetIface);
         }
 
+        // Remember link transport entry for LINKREQUEST so LRPROOFs can be routed back
+        if ((int) ($packet['packet_type'] ?? -1) === 2) {
+            $this->rememberLinkTransportRelay($sourceInterfaceId, $targetIface, $rawBase64, $packet);
+        }
+
         return true;
     }
 
