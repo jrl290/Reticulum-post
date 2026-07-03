@@ -9,7 +9,7 @@ Place this file in ~/.reticulum/interfaces/ and add to config:
   [[PostInterface]]
     type = PostInterface
     enabled = yes
-    node_url = https://your-node.example.com/reticulum
+    node_url = https://selectivesubconscious.com/reticulum
     name = PHP Node Bridge
 """
 
@@ -59,6 +59,20 @@ class PostInterface(Interface):
         # Read optional config with proper defaults
         self.HW_MTU = 500
         self.bitrate = 100_000_000
+        # Interface mode — uses the standard RNS mode enum.
+        #   MODE_FULL (1)     — endpoint: announces represent THIS node
+        #   MODE_GATEWAY (6)  — relay:   announces represent remote peers
+        # Sent to PHP router in metadata to control local_destination registration.
+        mode_map = {
+            "full":             RNS.Interfaces.Interface.Interface.MODE_FULL,
+            "point_to_point":   RNS.Interfaces.Interface.Interface.MODE_POINT_TO_POINT,
+            "access_point":     RNS.Interfaces.Interface.Interface.MODE_ACCESS_POINT,
+            "roaming":          RNS.Interfaces.Interface.Interface.MODE_ROAMING,
+            "boundary":         RNS.Interfaces.Interface.Interface.MODE_BOUNDARY,
+            "gateway":          RNS.Interfaces.Interface.Interface.MODE_GATEWAY,
+        }
+        mode_str = str(ifconf.get("mode", "full")).lower()
+        self._rns_mode = mode_map.get(mode_str, RNS.Interfaces.Interface.Interface.MODE_FULL)
         if "bitrate" in ifconf:
             try:
                 self.bitrate = int(ifconf["bitrate"])
@@ -82,8 +96,7 @@ class PostInterface(Interface):
             self._register()
         except Exception as e:
             RNS.log(f"PostInterface[{self.name}]: Registration failed: {e}", RNS.LOG_ERROR)
-            self.online = False
-            return
+            raise e
 
         # Verify we're in the transport interfaces list
         if hasattr(RNS.Transport, 'interfaces') and self in RNS.Transport.interfaces:
@@ -108,9 +121,9 @@ class PostInterface(Interface):
             'mtu': self.HW_MTU,
             'metadata': {
                 'client': 'rns-post-interface',
-                'transport': 'http-exchange',
                 'implementation': 'PostInterface',
-                'mode': 'full',
+                'mode': self._rns_mode,
+                'transport': 'tcp-backbone-gateway' if self._rns_mode == RNS.Interfaces.Interface.Interface.MODE_GATEWAY else 'http-exchange',
             },
         }
         resp = self._http_post(f"{self.node_url}/v1/interfaces/register", body)
