@@ -234,7 +234,6 @@ trait RequestControlPlaneTrait
             $preserveTransportPath = $currentUsable
                 && $currentInterfaceId !== ''
                 && hash_equals($currentInterfaceId, $interfaceId)
-                && (string) ($metadata['transport'] ?? '') === 'http-exchange'
                 && $currentNextHopHex !== ''
                 && !hash_equals($currentNextHopHex, $normalizedDestinationHashHex)
                 && $incomingTransportIdHex === null

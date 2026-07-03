@@ -130,11 +130,6 @@ trait RequestRelayRoutingTrait
             return $this->incrementedHopRaw($raw, $forwardedHops);
         }
 
-        $metadata = $this->interfaceMetadata($interfaceId);
-        if ((string) ($metadata['transport'] ?? '') !== 'http-exchange') {
-            return $this->incrementedHopRaw($raw, $forwardedHops);
-        }
-
         $nextHopHex = strtolower((string) ($path['next_hop_hex'] ?? ''));
         $destinationHashHex = strtolower((string) ($packet['destination_hash_hex'] ?? ''));
         $remainingHops = (int) ($path['hops'] ?? 0);

@@ -237,11 +237,6 @@ trait RequestOutboundBatchTrait
 
     private function shouldDeferPathlessRelayPacket(string $interfaceId, array $packetRow): bool
     {
-        $metadata = $this->interfaceMetadata($interfaceId);
-        if ((string) ($metadata['transport'] ?? '') !== 'http-exchange') {
-            return false;
-        }
-
         if ((string) ($packetRow['queue_reason'] ?? '') !== 'relay') {
             return false;
         }
@@ -258,11 +253,6 @@ trait RequestOutboundBatchTrait
     {
         $packetBase64 = (string) ($packetRow['packet_base64'] ?? '');
         if ((string) ($packetRow['queue_reason'] ?? '') !== 'relay') {
-            return $packetBase64;
-        }
-
-        $metadata = $this->interfaceMetadata($interfaceId);
-        if ((string) ($metadata['transport'] ?? '') !== 'http-exchange') {
             return $packetBase64;
         }
 
