@@ -1540,6 +1540,11 @@ final class HttpApi
         try {
             $path = $this->normalizedPath($uri, $server);
 
+            // Handle CORS preflight
+            if ($method === 'OPTIONS') {
+                $this->respond(204, []);
+            }
+
             if ($method === 'GET' && $path === '/health') {
                 $this->respond(200, [
                     'status' => 'ok',
@@ -3465,6 +3470,9 @@ if (realpath($_SERVER['SCRIPT_FILENAME'] ?? '') === __FILE__) {
 
         http_response_code(500);
         header('Content-Type: application/json');
+        header('Access-Control-Allow-Origin: *');
+        header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
+        header('Access-Control-Allow-Headers: Content-Type, X-Interface-Id, X-Session-Token');
         echo json_encode(['error' => 'internal error'], JSON_THROW_ON_ERROR);
         exit;
     }

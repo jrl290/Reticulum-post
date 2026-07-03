@@ -233,6 +233,10 @@ trait RequestHttpApiHelperTrait
     {
         http_response_code($statusCode);
         header('Content-Type: application/json');
+        header('Access-Control-Allow-Origin: *');
+        header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
+        header('Access-Control-Allow-Headers: Content-Type, X-Interface-Id, X-Session-Token');
+        header('Access-Control-Max-Age: 86400');
         echo json_encode($payload, JSON_THROW_ON_ERROR);
         exit;
     }
