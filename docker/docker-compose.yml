@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  rnsd:
+    image: python:3.11-slim
+    container_name: reticulum-post-bridge
+    restart: unless-stopped
+    command:
+      - /bin/sh
+      - -c
+      - "pip install -q rns 2>/dev/null && exec rnsd --config /reticulum"
+    volumes:
+      - /volume1/docker/reticulum-post-bridge:/reticulum
+    networks:
+      - reticulum
+
+networks:
+  reticulum:
