@@ -104,33 +104,7 @@ trait RequestLxmfHandoffTrait
 
     private function usableLxmfOutboxPathEntry(string $destinationHashHex): ?array
     {
-        $path = $this->usablePathEntry($destinationHashHex);
-        if ($path === null) {
-            return null;
-        }
-
-        $interfaceId = (string) ($path['interface_id'] ?? '');
-        if ($interfaceId === '') {
-            return null;
-        }
-
-        $metadata = $this->interfaceMetadata($interfaceId);
-        if ((string) ($metadata['transport'] ?? '') !== 'php-peer-exchange') {
-            return $path;
-        }
-
-        foreach ($this->activePeerInterfaceIds('') as $candidateInterfaceId) {
-            if ($candidateInterfaceId === $interfaceId) {
-                continue;
-            }
-
-            $candidateMetadata = $this->interfaceMetadata($candidateInterfaceId);
-            if ((string) ($candidateMetadata['transport'] ?? '') === 'http-exchange') {
-                return null;
-            }
-        }
-
-        return $path;
+        return $this->usablePathEntry($destinationHashHex);
     }
 
     private function knownRatchetMaxAgeSeconds(): int
@@ -247,11 +221,6 @@ trait RequestLxmfHandoffTrait
     ): string
     {
         if ($path === null || $interfaceId === null) {
-            return $packetRaw;
-        }
-
-        $metadata = $this->interfaceMetadata($interfaceId);
-        if ((string) ($metadata['transport'] ?? '') !== 'http-exchange') {
             return $packetRaw;
         }
 

@@ -133,17 +133,6 @@ trait RequestSchemaTrait
             )'
         );
         $this->db->exec(
-            'CREATE TABLE IF NOT EXISTS php_peer_sessions (
-                peer_name TEXT PRIMARY KEY,
-                local_interface_id TEXT NOT NULL,
-                local_session_token TEXT NOT NULL,
-                remote_url TEXT,
-                updated_at INTEGER NOT NULL
-            )'
-        );
-        $this->db->exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_php_peer_sessions_local_interface_id ON php_peer_sessions(local_interface_id)');
-        $this->db->exec('CREATE INDEX IF NOT EXISTS idx_php_peer_sessions_remote_url ON php_peer_sessions(remote_url)');
-        $this->db->exec(
             'CREATE TABLE IF NOT EXISTS reverse_path_entries (
                 truncated_hash_hex TEXT NOT NULL,
                 received_interface_id TEXT NOT NULL,
