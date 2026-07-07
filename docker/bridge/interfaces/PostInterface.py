@@ -84,6 +84,16 @@ class PostInterface(Interface):
             except (ValueError, TypeError):
                 pass
 
+        # Override poll interval from config (seconds, float).
+        # When set, this takes precedence over the server-provided
+        # idle_exchange_interval_ms for the local poll rate.
+        self._poll_interval = None
+        if "poll_interval" in ifconf:
+            try:
+                self._poll_interval = float(ifconf["poll_interval"])
+            except (ValueError, TypeError):
+                pass
+
         self.IN = True
         self.OUT = True
         self.mode = RNS.Interfaces.Interface.Interface.MODE_FULL
@@ -111,7 +121,8 @@ class PostInterface(Interface):
         self.online = True
         self._poll_thread = threading.Thread(target=self._poll_loop, daemon=True)
         self._poll_thread.start()
-        RNS.log(f"PostInterface[{self.name}]: Online and polling (idle_ms={self._idle_ms})", RNS.LOG_NOTICE)
+        poll_info = f"poll_interval={self._poll_interval}s" if self._poll_interval is not None else f"idle_ms={self._idle_ms}"
+        RNS.log(f"PostInterface[{self.name}]: Online and polling ({poll_info})", RNS.LOG_NOTICE)
 
     def _register(self):
         """Register this interface with the PHP node."""
@@ -188,8 +199,11 @@ class PostInterface(Interface):
         _min_interval = 3.0
         while self._running:
             now = time.time()
-            # Exchange at most every max(idle_ms/2, _min_interval) seconds
-            interval = max(self._idle_ms / 2000.0, _min_interval)
+            # Use config poll_interval if set, else derive from server idle_ms
+            if self._poll_interval is not None:
+                interval = max(self._poll_interval, _min_interval)
+            else:
+                interval = max(self._idle_ms / 2000.0, _min_interval)
             if now - last_exchange < interval:
                 time.sleep(0.5)
                 continue
