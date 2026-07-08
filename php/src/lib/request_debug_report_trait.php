@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace ReticulumPhp;
 
+use PDO;
+
 // Reticulum-php is request-operated. These reporting helpers expose request
 // path state for /health and /debug inspection only; they do not alter packet
 // flow or create a second transport mechanism.
@@ -89,11 +91,11 @@ trait RequestDebugReportTrait
              ORDER BY packet_record_id DESC
              LIMIT :limit'
         );
-        $stmt->bindValue(':limit', $limit, SQLITE3_INTEGER);
-        $result = $stmt->execute();
+        $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
+        $stmt->execute();
 
         $packets = [];
-        while (($row = $result->fetchArray(SQLITE3_ASSOC)) !== false) {
+        while (($row = $stmt->fetch(PDO::FETCH_ASSOC)) !== false) {
             $packets[] = $row;
         }
 
@@ -108,11 +110,11 @@ trait RequestDebugReportTrait
              ORDER BY updated_at DESC
              LIMIT :limit'
         );
-        $stmt->bindValue(':limit', $limit, SQLITE3_INTEGER);
-        $result = $stmt->execute();
+        $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
+        $stmt->execute();
 
         $paths = [];
-        while (($row = $result->fetchArray(SQLITE3_ASSOC)) !== false) {
+        while (($row = $stmt->fetch(PDO::FETCH_ASSOC)) !== false) {
             $paths[] = $row;
         }
 
@@ -139,11 +141,11 @@ trait RequestDebugReportTrait
              ORDER BY last_seen_at DESC, created_at DESC
              LIMIT :limit'
         );
-        $stmt->bindValue(':limit', $limit, SQLITE3_INTEGER);
-        $result = $stmt->execute();
+        $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
+        $stmt->execute();
 
         $interfaces = [];
-        while (($row = $result->fetchArray(SQLITE3_ASSOC)) !== false) {
+        while (($row = $stmt->fetch(PDO::FETCH_ASSOC)) !== false) {
             if (!is_array($row)) {
                 continue;
             }
@@ -177,12 +179,12 @@ trait RequestDebugReportTrait
              ORDER BY last_seen_at DESC, created_at DESC
              LIMIT :limit'
         );
-        $stmt->bindValue(':status', $status, SQLITE3_TEXT);
-        $stmt->bindValue(':limit', $limit, SQLITE3_INTEGER);
-        $result = $stmt->execute();
+        $stmt->bindValue(':status', $status, PDO::PARAM_STR);
+        $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
+        $stmt->execute();
 
         $interfaces = [];
-        while (($row = $result->fetchArray(SQLITE3_ASSOC)) !== false) {
+        while (($row = $stmt->fetch(PDO::FETCH_ASSOC)) !== false) {
             if (!is_array($row)) {
                 continue;
             }
@@ -210,11 +212,11 @@ trait RequestDebugReportTrait
              ORDER BY created_at DESC
              LIMIT :limit'
         );
-        $stmt->bindValue(':limit', $limit, SQLITE3_INTEGER);
-        $result = $stmt->execute();
+        $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
+        $stmt->execute();
 
         $batches = [];
-        while (($row = $result->fetchArray(SQLITE3_ASSOC)) !== false) {
+        while (($row = $stmt->fetch(PDO::FETCH_ASSOC)) !== false) {
             if (!is_array($row)) {
                 continue;
             }
@@ -248,11 +250,11 @@ trait RequestDebugReportTrait
              ORDER BY packet_id DESC
              LIMIT :limit'
         );
-        $stmt->bindValue(':limit', $limit, SQLITE3_INTEGER);
-        $result = $stmt->execute();
+        $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
+        $stmt->execute();
 
         $packets = [];
-        while (($row = $result->fetchArray(SQLITE3_ASSOC)) !== false) {
+        while (($row = $stmt->fetch(PDO::FETCH_ASSOC)) !== false) {
             if (!is_array($row)) {
                 continue;
             }
@@ -276,11 +278,11 @@ trait RequestDebugReportTrait
              ORDER BY created_at DESC
              LIMIT :limit'
         );
-        $stmt->bindValue(':limit', $limit, SQLITE3_INTEGER);
-        $result = $stmt->execute();
+        $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
+        $stmt->execute();
 
         $batches = [];
-        while (($row = $result->fetchArray(SQLITE3_ASSOC)) !== false) {
+        while (($row = $stmt->fetch(PDO::FETCH_ASSOC)) !== false) {
             if (!is_array($row)) {
                 continue;
             }
@@ -312,11 +314,11 @@ trait RequestDebugReportTrait
              ORDER BY wake_event_id DESC
              LIMIT :limit'
         );
-        $stmt->bindValue(':limit', $limit, SQLITE3_INTEGER);
-        $result = $stmt->execute();
+        $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
+        $stmt->execute();
 
         $events = [];
-        while (($row = $result->fetchArray(SQLITE3_ASSOC)) !== false) {
+        while (($row = $stmt->fetch(PDO::FETCH_ASSOC)) !== false) {
             if (!is_array($row)) {
                 continue;
             }
@@ -346,9 +348,49 @@ trait RequestDebugReportTrait
 
     private function countByQuery(string $query): int
     {
-        /** @var SQLite3Result $result */
         $result = $this->db->query($query);
-        $row = $result->fetchArray(SQLITE3_NUM);
+        $row = $result->fetch(PDO::FETCH_NUM);
         return (int) ($row[0] ?? 0);
+    }
+
+    /**
+     * Per-table row counts for diagnosing database bloat.
+     *
+     * On SQLite this is lightweight (just COUNT scans).
+     * On MySQL, InnoDB COUNT(*) requires a full-table scan;
+     * consider running this only on /debug if the DB is large.
+     */
+    public function healthDbSize(): array
+    {
+        $tables = [
+            'interfaces',
+            'inbound_batches',
+            'inbound_packets',
+            'local_destinations',
+            'packet_hashes',
+            'known_destinations',
+            'path_entries',
+            'path_request_tags',
+            'transport_state',
+            'php_peer_sessions',
+            'reverse_path_entries',
+            'link_transport_entries',
+            'outbound_packets',
+            'outbound_batches',
+            'wake_events',
+        ];
+
+        $sizes = [];
+        foreach ($tables as $table) {
+            $key = $table . '_rows';
+            $sizes[$key] = $this->countByQuery("SELECT COUNT(*) FROM {$table}");
+        }
+
+        // Quick estimate: average row overhead ~ 100 bytes/page overhead
+        $totalRows = array_sum($sizes);
+        $sizes['_estimated_total_rows'] = $totalRows;
+        $sizes['_estimated_disk_mb'] = (int) round($totalRows * 100 / (1024 * 1024));
+
+        return $sizes;
     }
 }

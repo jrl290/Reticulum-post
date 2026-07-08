@@ -31,6 +31,7 @@ class PostInterface(Interface):
 
     owner = None
     node_url = None
+    wake_url = None
     online = False
     _interface_id = None
     _session_token = None
@@ -55,6 +56,15 @@ class PostInterface(Interface):
         if not node_url:
             raise ValueError(f"No node_url specified for {self}")
         self.node_url = node_url.rstrip('/')
+
+        # wake_url: when present, the remote PHP node will POST /v1/wake to
+        # this URL when it has queued packets for us. This is the primary
+        # trigger for exchange in wake mode (polling serves as a fallback).
+        wake_url = ifconf.get("wake_url")
+        if wake_url:
+            self.wake_url = str(wake_url).rstrip('/')
+        else:
+            self.wake_url = None
 
         # Read optional config with proper defaults
         self.HW_MTU = 500
@@ -126,16 +136,25 @@ class PostInterface(Interface):
 
     def _register(self):
         """Register this interface with the PHP node."""
+        metadata = {
+            'client': 'rns-post-interface',
+            'implementation': 'PostInterface',
+            'mode': self._rns_mode,
+            'transport': 'tcp-backbone-gateway' if self._rns_mode == RNS.Interfaces.Interface.Interface.MODE_GATEWAY else 'http-exchange',
+        }
+
+        # When wake_url is configured, include it so the remote PHP node
+        # can wake us via POST /v1/wake when it has queued packets.
+        # This switches the transport model from poll-driven to wake-driven,
+        # though polling still runs as a low-frequency fallback.
+        if self.wake_url:
+            metadata['wake_url'] = self.wake_url
+
         body = {
             'name': f'RNS PostInterface ({self.name})',
             'bitrate': self.bitrate,
             'mtu': self.HW_MTU,
-            'metadata': {
-                'client': 'rns-post-interface',
-                'implementation': 'PostInterface',
-                'mode': self._rns_mode,
-                'transport': 'tcp-backbone-gateway' if self._rns_mode == RNS.Interfaces.Interface.Interface.MODE_GATEWAY else 'http-exchange',
-            },
+            'metadata': metadata,
         }
         resp = self._http_post(f"{self.node_url}/v1/interfaces/register", body)
         self._interface_id = resp.get('interface_id')
@@ -193,17 +212,28 @@ class PostInterface(Interface):
                 RNS.log(f"PostInterface OUT: {tname} dest={dest[:12]}... len={len(data)}", RNS.LOG_NOTICE)
 
     def _poll_loop(self):
-        """Background thread that periodically exchanges packets with the PHP node."""
+        """Background thread that periodically exchanges packets with the PHP node.
+
+        In poll mode (no wake_url), polls at the configured interval.
+        In wake mode (wake_url present), polls at a much lower frequency as a
+        fallback — the primary trigger is the remote waking us via POST /v1/wake.
+        """
         last_exchange = 0
-        # Minimum 3 second poll interval to avoid SQLite lock contention
         _min_interval = 3.0
+        # Wake-mode fallback poll interval: 60 seconds (the remote should wake us).
+        _wake_fallback_interval = 60.0
+
         while self._running:
             now = time.time()
-            # Use config poll_interval if set, else derive from server idle_ms
+            # Use config poll_interval if set, else derive from server idle_ms.
             if self._poll_interval is not None:
                 interval = max(self._poll_interval, _min_interval)
+            elif self.wake_url is not None:
+                # Wake mode: long fallback poll.
+                interval = _wake_fallback_interval
             else:
                 interval = max(self._idle_ms / 2000.0, _min_interval)
+
             if now - last_exchange < interval:
                 time.sleep(0.5)
                 continue

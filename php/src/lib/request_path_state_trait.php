@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace ReticulumPhp;
 
+use PDO;
+
 // Reticulum-php is request-operated. These path and announce state helpers
 // persist routing knowledge for later authenticated exchanges; they do not
 // create a second background transport channel.
@@ -15,16 +17,15 @@ trait RequestPathStateTrait
         $stmt = $this->db->prepare(
             'SELECT public_key_hex FROM known_destinations WHERE destination_hash_hex = :destination_hash_hex'
         );
-        $stmt->bindValue(':destination_hash_hex', $destinationHashHex, SQLITE3_TEXT);
-        $row = $stmt->execute()->fetchArray(SQLITE3_ASSOC);
+        $stmt->bindValue(':destination_hash_hex', $destinationHashHex, PDO::PARAM_STR);
+        $row = $stmt->execute(); $row = $stmt->fetch(PDO::FETCH_ASSOC);
 
         return is_array($row) ? (string) $row['public_key_hex'] : null;
     }
 
     private function rememberKnownDestination(string $destinationHashHex, string $packetHashHex, array $announce): void
     {
-        $stmt = $this->db->prepare(
-            'INSERT INTO known_destinations (
+        $sql = 'INSERT INTO known_destinations (
                 destination_hash_hex,
                 packet_hash_hex,
                 public_key_hex,
@@ -47,23 +48,24 @@ trait RequestPathStateTrait
                 identity_hash_hex = excluded.identity_hash_hex,
                 app_data_base64 = excluded.app_data_base64,
                 ratchet_hex = excluded.ratchet_hex,
-                updated_at = excluded.updated_at'
-        );
-        $stmt->bindValue(':destination_hash_hex', $destinationHashHex, SQLITE3_TEXT);
-        $stmt->bindValue(':packet_hash_hex', $packetHashHex, SQLITE3_TEXT);
-        $stmt->bindValue(':public_key_hex', (string) $announce['public_key_hex'], SQLITE3_TEXT);
-        $stmt->bindValue(':identity_hash_hex', (string) $announce['identity_hash_hex'], SQLITE3_TEXT);
-        $stmt->bindValue(':app_data_base64', $announce['app_data_base64'], $announce['app_data_base64'] === null ? SQLITE3_NULL : SQLITE3_TEXT);
-        $stmt->bindValue(':ratchet_hex', $announce['ratchet_hex'], $announce['ratchet_hex'] === null ? SQLITE3_NULL : SQLITE3_TEXT);
-        $stmt->bindValue(':updated_at', time(), SQLITE3_INTEGER);
+                updated_at = excluded.updated_at';
+        $sql = Database::upsertSql($sql, $this->backend);
+        $stmt = $this->db->prepare($sql);
+        $stmt->bindValue(':destination_hash_hex', $destinationHashHex, PDO::PARAM_STR);
+        $stmt->bindValue(':packet_hash_hex', $packetHashHex, PDO::PARAM_STR);
+        $stmt->bindValue(':public_key_hex', (string) $announce['public_key_hex'], PDO::PARAM_STR);
+        $stmt->bindValue(':identity_hash_hex', (string) $announce['identity_hash_hex'], PDO::PARAM_STR);
+        $stmt->bindValue(':app_data_base64', $announce['app_data_base64'], $announce['app_data_base64'] === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
+        $stmt->bindValue(':ratchet_hex', $announce['ratchet_hex'], $announce['ratchet_hex'] === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
+        $stmt->bindValue(':updated_at', time(), PDO::PARAM_INT);
         $stmt->execute();
     }
 
     private function pathEntry(string $destinationHashHex): ?array
     {
         $stmt = $this->db->prepare('SELECT * FROM path_entries WHERE destination_hash_hex = :destination_hash_hex');
-        $stmt->bindValue(':destination_hash_hex', $destinationHashHex, SQLITE3_TEXT);
-        $row = $stmt->execute()->fetchArray(SQLITE3_ASSOC);
+        $stmt->bindValue(':destination_hash_hex', $destinationHashHex, PDO::PARAM_STR);
+        $row = $stmt->execute(); $row = $stmt->fetch(PDO::FETCH_ASSOC);
 
         return is_array($row) ? $row : null;
     }
@@ -90,21 +92,21 @@ trait RequestPathStateTrait
     private function deletePathEntry(string $destinationHashHex): void
     {
         $stmt = $this->db->prepare('DELETE FROM path_entries WHERE destination_hash_hex = :destination_hash_hex');
-        $stmt->bindValue(':destination_hash_hex', $destinationHashHex, SQLITE3_TEXT);
+        $stmt->bindValue(':destination_hash_hex', $destinationHashHex, PDO::PARAM_STR);
         $stmt->execute();
     }
 
     private function rememberPathRequestTag(string $tagKeyHex): bool
     {
-        $stmt = $this->db->prepare(
+        $stmt = $this->db->prepare($this->insertOrSql(
             'INSERT OR IGNORE INTO path_request_tags (tag_key_hex, created_at)
              VALUES (:tag_key_hex, :created_at)'
-        );
-        $stmt->bindValue(':tag_key_hex', $tagKeyHex, SQLITE3_TEXT);
-        $stmt->bindValue(':created_at', time(), SQLITE3_INTEGER);
+        ));
+        $stmt->bindValue(':tag_key_hex', $tagKeyHex, PDO::PARAM_STR);
+        $stmt->bindValue(':created_at', time(), PDO::PARAM_INT);
         $stmt->execute();
 
-        return $this->db->changes() > 0;
+        return $stmt->rowCount() > 0;
     }
 
     private function pathRequestControlHashHex(): string
@@ -139,10 +141,10 @@ trait RequestPathStateTrait
              ORDER BY packet_record_id DESC
              LIMIT 1'
         );
-        $stmt->bindValue(':packet_hash_hex', $packetHashHex, SQLITE3_TEXT);
-        $stmt->bindValue(':status', 'parsed', SQLITE3_TEXT);
-        $stmt->bindValue(':packet_type', 1, SQLITE3_INTEGER);
-        $row = $stmt->execute()->fetchArray(SQLITE3_ASSOC);
+        $stmt->bindValue(':packet_hash_hex', $packetHashHex, PDO::PARAM_STR);
+        $stmt->bindValue(':status', 'parsed', PDO::PARAM_STR);
+        $stmt->bindValue(':packet_type', 1, PDO::PARAM_INT);
+        $row = $stmt->execute(); $row = $stmt->fetch(PDO::FETCH_ASSOC);
         return is_array($row) ? $row : null;
     }
 

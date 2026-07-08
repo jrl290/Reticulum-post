@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace ReticulumPhp;
 
+use PDO;
+
 // Reticulum-php is request-operated. These outbound batch helpers package and
 // acknowledge queued packets only within authenticated request exchanges; they
 // do not create a separate delivery path.
@@ -31,8 +33,8 @@ trait RequestOutboundBatchTrait
              ORDER BY packet_id DESC
              LIMIT 1'
         );
-        $stmt->bindValue(':packet_hash_hex', $packetHashHex, SQLITE3_TEXT);
-        $row = $stmt->execute()->fetchArray(SQLITE3_ASSOC);
+        $stmt->bindValue(':packet_hash_hex', $packetHashHex, PDO::PARAM_STR);
+        $row = $stmt->execute(); $row = $stmt->fetch(PDO::FETCH_ASSOC);
 
         return is_array($row) ? $row : null;
     }
@@ -109,9 +111,10 @@ trait RequestOutboundBatchTrait
             $select = $this->db->prepare(
                 'SELECT packet_ids_json, acked_at FROM outbound_batches WHERE interface_id = :interface_id AND batch_id = :batch_id'
             );
-            $select->bindValue(':interface_id', $interfaceId, SQLITE3_TEXT);
-            $select->bindValue(':batch_id', $batchId, SQLITE3_TEXT);
-            $batch = $select->execute()->fetchArray(SQLITE3_ASSOC);
+            $select->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
+            $select->bindValue(':batch_id', $batchId, PDO::PARAM_STR);
+            $select->execute();
+            $batch = $select->fetch(PDO::FETCH_ASSOC);
             if (!is_array($batch) || $batch['acked_at'] !== null) {
                 continue;
             }
@@ -122,9 +125,9 @@ trait RequestOutboundBatchTrait
             $updateBatch = $this->db->prepare(
                 'UPDATE outbound_batches SET acked_at = :acked_at WHERE interface_id = :interface_id AND batch_id = :batch_id'
             );
-            $updateBatch->bindValue(':acked_at', $now, SQLITE3_INTEGER);
-            $updateBatch->bindValue(':interface_id', $interfaceId, SQLITE3_TEXT);
-            $updateBatch->bindValue(':batch_id', $batchId, SQLITE3_TEXT);
+            $updateBatch->bindValue(':acked_at', $now, PDO::PARAM_INT);
+            $updateBatch->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
+            $updateBatch->bindValue(':batch_id', $batchId, PDO::PARAM_STR);
             $updateBatch->execute();
 
             foreach ($packetIds as $packetId) {
@@ -134,10 +137,10 @@ trait RequestOutboundBatchTrait
                          delivered_at = :delivered_at
                      WHERE packet_id = :packet_id AND interface_id = :interface_id'
                 );
-                $updatePacket->bindValue(':acked_at', $now, SQLITE3_INTEGER);
-                $updatePacket->bindValue(':delivered_at', $now, SQLITE3_INTEGER);
-                $updatePacket->bindValue(':packet_id', (int) $packetId, SQLITE3_INTEGER);
-                $updatePacket->bindValue(':interface_id', $interfaceId, SQLITE3_TEXT);
+                $updatePacket->bindValue(':acked_at', $now, PDO::PARAM_INT);
+                $updatePacket->bindValue(':delivered_at', $now, PDO::PARAM_INT);
+                $updatePacket->bindValue(':packet_id', (int) $packetId, PDO::PARAM_INT);
+                $updatePacket->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
                 $updatePacket->execute();
             }
 
@@ -184,10 +187,10 @@ trait RequestOutboundBatchTrait
             'INSERT INTO outbound_batches (interface_id, batch_id, packet_ids_json, created_at, acked_at)
              VALUES (:interface_id, :batch_id, :packet_ids_json, :created_at, NULL)'
         );
-        $insertBatch->bindValue(':interface_id', $interfaceId, SQLITE3_TEXT);
-        $insertBatch->bindValue(':batch_id', $batchId, SQLITE3_TEXT);
-        $insertBatch->bindValue(':packet_ids_json', self::encodeJson($packetIds), SQLITE3_TEXT);
-        $insertBatch->bindValue(':created_at', $now, SQLITE3_INTEGER);
+        $insertBatch->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
+        $insertBatch->bindValue(':batch_id', $batchId, PDO::PARAM_STR);
+        $insertBatch->bindValue(':packet_ids_json', self::encodeJson($packetIds), PDO::PARAM_STR);
+        $insertBatch->bindValue(':created_at', $now, PDO::PARAM_INT);
         $insertBatch->execute();
 
         $txBytes = 0;
@@ -214,12 +217,12 @@ trait RequestOutboundBatchTrait
                AND delivered_batch_id IS NULL
              ORDER BY packet_id ASC'
         );
-        $stmt->bindValue(':interface_id', $interfaceId, SQLITE3_TEXT);
-        $result = $stmt->execute();
+        $stmt->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
+        $stmt->execute();
 
         $packetIds = [];
         $packets = [];
-        while (($row = $result->fetchArray(SQLITE3_ASSOC)) !== false) {
+        while (($row = $stmt->fetch(PDO::FETCH_ASSOC)) !== false) {
             if (!is_array($row) || $this->shouldDeferPathlessRelayPacket($interfaceId, $row)) {
                 continue;
             }
@@ -237,6 +240,11 @@ trait RequestOutboundBatchTrait
 
     private function shouldDeferPathlessRelayPacket(string $interfaceId, array $packetRow): bool
     {
+        $metadata = $this->interfaceMetadata($interfaceId);
+        if ((string) ($metadata['transport'] ?? '') !== 'http-exchange') {
+            return false;
+        }
+
         if ((string) ($packetRow['queue_reason'] ?? '') !== 'relay') {
             return false;
         }
@@ -253,6 +261,11 @@ trait RequestOutboundBatchTrait
     {
         $packetBase64 = (string) ($packetRow['packet_base64'] ?? '');
         if ((string) ($packetRow['queue_reason'] ?? '') !== 'relay') {
+            return $packetBase64;
+        }
+
+        $metadata = $this->interfaceMetadata($interfaceId);
+        if ((string) ($metadata['transport'] ?? '') !== 'http-exchange') {
             return $packetBase64;
         }
 
@@ -314,13 +327,13 @@ trait RequestOutboundBatchTrait
                AND acked_at IS NULL
                AND delivered_batch_id IS NULL'
         );
-        $stmt->bindValue(':packet_hash_hex', (string) ($packet['packet_hash_hex'] ?? ''), SQLITE3_TEXT);
-        $stmt->bindValue(':proof_destination_hash_hex', (string) ($packet['truncated_hash_hex'] ?? ''), SQLITE3_TEXT);
-        $stmt->bindValue(':destination_hash_hex', $destinationHashHex, $destinationHashHex === '' ? SQLITE3_NULL : SQLITE3_TEXT);
-        $stmt->bindValue(':destination_public_key_hex', $destinationPublicKeyHex, $destinationPublicKeyHex === null ? SQLITE3_NULL : SQLITE3_TEXT);
-        $stmt->bindValue(':packet_base64', $packetBase64, SQLITE3_TEXT);
-        $stmt->bindValue(':packet_id', $packetId, SQLITE3_INTEGER);
-        $stmt->bindValue(':interface_id', $interfaceId, SQLITE3_TEXT);
+        $stmt->bindValue(':packet_hash_hex', (string) ($packet['packet_hash_hex'] ?? ''), PDO::PARAM_STR);
+        $stmt->bindValue(':proof_destination_hash_hex', (string) ($packet['truncated_hash_hex'] ?? ''), PDO::PARAM_STR);
+        $stmt->bindValue(':destination_hash_hex', $destinationHashHex, $destinationHashHex === '' ? PDO::PARAM_NULL : PDO::PARAM_STR);
+        $stmt->bindValue(':destination_public_key_hex', $destinationPublicKeyHex, $destinationPublicKeyHex === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
+        $stmt->bindValue(':packet_base64', $packetBase64, PDO::PARAM_STR);
+        $stmt->bindValue(':packet_id', $packetId, PDO::PARAM_INT);
+        $stmt->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
         $stmt->execute();
     }
 
@@ -341,8 +354,8 @@ trait RequestOutboundBatchTrait
              ORDER BY created_at ASC
              LIMIT 1'
         );
-        $stmt->bindValue(':interface_id', $interfaceId, SQLITE3_TEXT);
-        $row = $stmt->execute()->fetchArray(SQLITE3_ASSOC);
+        $stmt->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
+        $row = $stmt->execute(); $row = $stmt->fetch(PDO::FETCH_ASSOC);
 
         return is_array($row) ? $row : null;
     }
@@ -357,12 +370,12 @@ trait RequestOutboundBatchTrait
                AND acked_at IS NULL
              ORDER BY packet_id ASC'
         );
-        $stmt->bindValue(':interface_id', $interfaceId, SQLITE3_TEXT);
-        $stmt->bindValue(':batch_id', $batchId, SQLITE3_TEXT);
-        $result = $stmt->execute();
+        $stmt->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
+        $stmt->bindValue(':batch_id', $batchId, PDO::PARAM_STR);
+        $stmt->execute();
 
         $packetIds = [];
-        while (($row = $result->fetchArray(SQLITE3_ASSOC)) !== false) {
+        while (($row = $stmt->fetch(PDO::FETCH_ASSOC)) !== false) {
             if (!is_array($row)) {
                 continue;
             }
@@ -383,12 +396,12 @@ trait RequestOutboundBatchTrait
                AND acked_at IS NULL
              ORDER BY packet_id ASC'
         );
-        $stmt->bindValue(':interface_id', $interfaceId, SQLITE3_TEXT);
-        $stmt->bindValue(':batch_id', $batchId, SQLITE3_TEXT);
-        $result = $stmt->execute();
+        $stmt->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
+        $stmt->bindValue(':batch_id', $batchId, PDO::PARAM_STR);
+        $stmt->execute();
 
         $packets = [];
-        while (($row = $result->fetchArray(SQLITE3_ASSOC)) !== false) {
+        while (($row = $stmt->fetch(PDO::FETCH_ASSOC)) !== false) {
             if (!is_array($row)) {
                 continue;
             }
@@ -410,9 +423,9 @@ trait RequestOutboundBatchTrait
                    AND acked_at IS NULL
                    AND delivered_batch_id IS NULL'
             );
-            $update->bindValue(':delivered_batch_id', $batchId, SQLITE3_TEXT);
-            $update->bindValue(':packet_id', $packetId, SQLITE3_INTEGER);
-            $update->bindValue(':interface_id', $interfaceId, SQLITE3_TEXT);
+            $update->bindValue(':delivered_batch_id', $batchId, PDO::PARAM_STR);
+            $update->bindValue(':packet_id', $packetId, PDO::PARAM_INT);
+            $update->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
             $update->execute();
         }
     }
@@ -435,11 +448,11 @@ trait RequestOutboundBatchTrait
                  status = :status
              WHERE interface_id = :interface_id'
         );
-        $updateCounters->bindValue(':packet_count', count($packets), SQLITE3_INTEGER);
-        $updateCounters->bindValue(':byte_count', $txBytes, SQLITE3_INTEGER);
-        $updateCounters->bindValue(':last_seen_at', $now, SQLITE3_INTEGER);
-        $updateCounters->bindValue(':status', 'online', SQLITE3_TEXT);
-        $updateCounters->bindValue(':interface_id', $interfaceId, SQLITE3_TEXT);
+        $updateCounters->bindValue(':packet_count', count($packets), PDO::PARAM_INT);
+        $updateCounters->bindValue(':byte_count', $txBytes, PDO::PARAM_INT);
+        $updateCounters->bindValue(':last_seen_at', $now, PDO::PARAM_INT);
+        $updateCounters->bindValue(':status', 'online', PDO::PARAM_STR);
+        $updateCounters->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
         $updateCounters->execute();
     }
 
@@ -456,11 +469,11 @@ trait RequestOutboundBatchTrait
                AND proofed_at IS NULL
              ORDER BY packet_id ASC'
         );
-        $stmt->bindValue(':proof_destination_hash_hex', $proofDestinationHashHex, SQLITE3_TEXT);
-        $result = $stmt->execute();
+        $stmt->bindValue(':proof_destination_hash_hex', $proofDestinationHashHex, PDO::PARAM_STR);
+        $stmt->execute();
 
         $candidates = [];
-        while (($row = $result->fetchArray(SQLITE3_ASSOC)) !== false) {
+        while (($row = $stmt->fetch(PDO::FETCH_ASSOC)) !== false) {
             if (!is_array($row)) {
                 continue;
             }
@@ -514,8 +527,8 @@ trait RequestOutboundBatchTrait
              WHERE packet_id = :packet_id
                AND proofed_at IS NULL'
         );
-        $stmt->bindValue(':proofed_at', $proofedAt, SQLITE3_INTEGER);
-        $stmt->bindValue(':packet_id', $packetId, SQLITE3_INTEGER);
+        $stmt->bindValue(':proofed_at', $proofedAt, PDO::PARAM_INT);
+        $stmt->bindValue(':packet_id', $packetId, PDO::PARAM_INT);
         $stmt->execute();
     }
 }

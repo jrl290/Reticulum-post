@@ -4,12 +4,30 @@ declare(strict_types=1);
 
 namespace ReticulumPhp;
 
+use PDO;
+
 // Reticulum-php is request-operated. These wake dispatch helpers only claim,
 // materialize, and complete wake work for the next authenticated request; they
 // do not form an independent transport loop.
 
 trait RequestWakeDispatchTrait
 {
+    /**
+     * Read the wake_profile for a given wake event without claiming it.
+     * Used by the CLI wake-event router to dispatch to the correct handler.
+     */
+    public function wakeEventProfile(int $wakeEventId): ?string
+    {
+        $stmt = $this->db->prepare(
+            'SELECT wake_profile FROM wake_events WHERE wake_event_id = :wake_event_id LIMIT 1'
+        );
+        $stmt->bindValue(':wake_event_id', $wakeEventId, PDO::PARAM_INT);
+        $stmt->execute();
+        $row = $stmt->fetch(PDO::FETCH_ASSOC);
+
+        return is_array($row) ? ($row['wake_profile'] ?? null) : null;
+    }
+
     public function pendingWakeEventIdsForSpawn(int $limit): array
     {
         $stmt = $this->db->prepare(
@@ -21,11 +39,11 @@ trait RequestWakeDispatchTrait
              ORDER BY created_at ASC, wake_event_id ASC
              LIMIT :limit'
         );
-        $stmt->bindValue(':limit', $limit, SQLITE3_INTEGER);
-        $result = $stmt->execute();
+        $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
+        $stmt->execute();
 
         $wakeEventIds = [];
-        while (($row = $result->fetchArray(SQLITE3_ASSOC)) !== false) {
+        while (($row = $stmt->fetch(PDO::FETCH_ASSOC)) !== false) {
             if (!is_array($row)) {
                 continue;
             }
@@ -36,10 +54,6 @@ trait RequestWakeDispatchTrait
             }
 
             $wakeEventIds[] = $wakeEventId;
-        }
-
-        if ($result instanceof SQLite3Result) {
-            $result->finalize();
         }
 
         return $wakeEventIds;
@@ -70,8 +84,8 @@ trait RequestWakeDispatchTrait
                AND failed_at IS NULL
              LIMIT 1'
         );
-        $stmt->bindValue(':wake_event_id', $wakeEventId, SQLITE3_INTEGER);
-        $row = $stmt->execute()->fetchArray(SQLITE3_ASSOC);
+        $stmt->bindValue(':wake_event_id', $wakeEventId, PDO::PARAM_INT);
+        $row = $stmt->execute(); $row = $stmt->fetch(PDO::FETCH_ASSOC);
 
         if (!is_array($row)) {
             return [
@@ -114,8 +128,8 @@ trait RequestWakeDispatchTrait
              WHERE wake_event_id = :wake_event_id
              LIMIT 1'
         );
-        $select->bindValue(':wake_event_id', $wakeEventId, SQLITE3_INTEGER);
-        $row = $select->execute()->fetchArray(SQLITE3_ASSOC);
+        $select->bindValue(':wake_event_id', $wakeEventId, PDO::PARAM_INT);
+        $row = $select->execute(); $row = $select->fetch(PDO::FETCH_ASSOC);
         if (!is_array($row)) {
             return false;
         }
@@ -138,16 +152,16 @@ trait RequestWakeDispatchTrait
                AND failed_at IS NULL
                AND claimed_by_pid IS NULL'
         );
-        $claim->bindValue(':claimed_at', time(), SQLITE3_INTEGER);
-        $claim->bindValue(':claimed_by_pid', $runnerPid, SQLITE3_INTEGER);
-        $claim->bindValue(':wake_event_id', $wakeEventId, SQLITE3_INTEGER);
+        $claim->bindValue(':claimed_at', time(), PDO::PARAM_INT);
+        $claim->bindValue(':claimed_by_pid', $runnerPid, PDO::PARAM_INT);
+        $claim->bindValue(':wake_event_id', $wakeEventId, PDO::PARAM_INT);
         $claim->execute();
-        if ($this->db->changes() === 1) {
+        if ($claim->rowCount() === 1) {
             return true;
         }
 
-        $recheck = $select->execute()->fetchArray(SQLITE3_ASSOC);
-        return is_array($recheck) && (int) ($recheck['claimed_by_pid'] ?? 0) === $runnerPid;
+        $select->execute(); $row = $select->fetch(PDO::FETCH_ASSOC);
+        return is_array($row) && (int) ($row['claimed_by_pid'] ?? 0) === $runnerPid;
     }
 
     public function dispatchPendingWakeEvents(int $limit, WakeDispatcher $dispatcher): array
@@ -175,10 +189,10 @@ trait RequestWakeDispatchTrait
              ORDER BY created_at ASC, wake_event_id ASC
              LIMIT :limit'
         );
-        $stmt->bindValue(':limit', $limit, SQLITE3_INTEGER);
-        $result = $stmt->execute();
+        $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
+        $stmt->execute();
 
-        while (($row = $result->fetchArray(SQLITE3_ASSOC)) !== false) {
+        while (($row = $stmt->fetch(PDO::FETCH_ASSOC)) !== false) {
             if (is_array($row)) {
                 $rows[] = $row;
             }
@@ -235,9 +249,9 @@ trait RequestWakeDispatchTrait
                  dispatch_result_json = :dispatch_result_json
              WHERE wake_event_id = :wake_event_id'
         );
-        $stmt->bindValue(':dispatched_at', time(), SQLITE3_INTEGER);
-        $stmt->bindValue(':dispatch_result_json', self::encodeJson($dispatchResult), SQLITE3_TEXT);
-        $stmt->bindValue(':wake_event_id', $wakeEventId, SQLITE3_INTEGER);
+        $stmt->bindValue(':dispatched_at', time(), PDO::PARAM_INT);
+        $stmt->bindValue(':dispatch_result_json', self::encodeJson($dispatchResult), PDO::PARAM_STR);
+        $stmt->bindValue(':wake_event_id', $wakeEventId, PDO::PARAM_INT);
         $stmt->execute();
     }
 
@@ -251,9 +265,9 @@ trait RequestWakeDispatchTrait
                  failure_message = :failure_message
              WHERE wake_event_id = :wake_event_id'
         );
-        $stmt->bindValue(':failed_at', time(), SQLITE3_INTEGER);
-        $stmt->bindValue(':failure_message', $message, SQLITE3_TEXT);
-        $stmt->bindValue(':wake_event_id', $wakeEventId, SQLITE3_INTEGER);
+        $stmt->bindValue(':failed_at', time(), PDO::PARAM_INT);
+        $stmt->bindValue(':failure_message', $message, PDO::PARAM_STR);
+        $stmt->bindValue(':wake_event_id', $wakeEventId, PDO::PARAM_INT);
         $stmt->execute();
     }
 }

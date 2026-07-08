@@ -10,27 +10,50 @@ namespace ReticulumPhp;
 
 trait RequestHttpApiHelperTrait
 {
-    private function runInterfaceRequestPrelude(): void
+    /**
+     * Request prelude: maintenance, registration, and (by default) PostInterface exchange.
+     *
+     * @param bool $skipPostInterfaceExchange Set true in handlers that already
+     *   deliver packets inline (e.g. /v1/interfaces/exchange) to prevent
+     *   exchange→exchange→exchange cascades that exhaust cPanel entry processes.
+     */
+    private function runInterfaceRequestPrelude(bool $skipPostInterfaceExchange = false): void
     {
         $this->storage->runMaintenance(
             $this->maintenanceInt('interface_stale_after_seconds', 15),
             $this->maintenanceInt('batch_ttl_seconds', 86400),
         );
+
+        // Always register peers so they can recover from error status.
+        $this->storage->ensurePostInterfacePeersRegistered();
+
+        if (!$skipPostInterfaceExchange) {
+            $this->storage->exchangeWithAllPostInterfacePeers();
+        }
     }
 
+    /**
+     * Request epilogue: dispatch pending wake events (legacy PhpPeer, TCP bridge).
+     *
+     * PostInterface exchange is NOT run here — it belongs in the prelude.
+     * Running exchange in both prelude AND epilogue causes a double-cascade
+     * where each exchange request triggers two callbacks, which each trigger
+     * two more, exhausting cPanel entry process limits (508 errors).
+     */
     private function runInterfaceRequestEpilogue(): void
     {
-        $wakeEventIds = $this->storage->pendingWakeEventIdsForSpawn(
-            (int) ($this->config['wake']['dispatch_limit'] ?? 32),
-        );
-
-        foreach ($wakeEventIds as $wakeEventId) {
+        // Dispatch any remaining wake events (legacy PhpPeer, TCP bridge).
+        $limit = (int) ($this->config['wake']['dispatch_limit'] ?? 32);
+        $wakeIds = $this->storage->pendingWakeEventIdsForSpawn($limit);
+        foreach ($wakeIds as $wakeEventId) {
             try {
-                $this->spawnDetachedWakeRunner((int) $wakeEventId);
+                $this->storage->dispatchWakeEventById(
+                    $wakeEventId,
+                    (int) (getmypid() ?: 0),
+                    new WakeDispatcher($this->config),
+                );
             } catch (\Throwable $error) {
-                $message = 'failed to spawn wake runner: ' . $error->getMessage();
-                $this->storage->failWakeEvent((int) $wakeEventId, $message);
-                $this->log('error', 'Wake runner spawn failed for wake_event_id ' . $wakeEventId . ': ' . $error->getMessage());
+                $this->storage->failWakeEvent((int) $wakeEventId, $error->getMessage());
             }
         }
     }
@@ -233,10 +256,6 @@ trait RequestHttpApiHelperTrait
     {
         http_response_code($statusCode);
         header('Content-Type: application/json');
-        header('Access-Control-Allow-Origin: *');
-        header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
-        header('Access-Control-Allow-Headers: Content-Type, X-Interface-Id, X-Session-Token');
-        header('Access-Control-Max-Age: 86400');
         echo json_encode($payload, JSON_THROW_ON_ERROR);
         exit;
     }

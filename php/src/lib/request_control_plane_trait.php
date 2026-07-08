@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace ReticulumPhp;
 
+use PDO;
+
 // Reticulum-php is request-operated. These announce and control-plane helpers
 // validate state and queue responses for the next authenticated exchange;
 // they do not create a separate always-on transport path.
@@ -21,8 +23,10 @@ trait RequestControlPlaneTrait
                 $announce,
             );
 
-            // Path table alone determines routing — no separate local_destinations table.
-            // 0-hop entries are directly attached endpoints.
+            // Register as a local destination if the announce arrived on a non-relay interface
+            // (e.g. the browser's HTTP exchange interface, not a backbone-facing transport)
+            $this->registerLocalDestinationIfOwnInterface((string) $packet['destination_hash_hex'], $interfaceId);
+
             return $this->upsertPathFromAnnounce($interfaceId, $packet, $announce);
         } catch (\Throwable $error) {
             return ['invalid', $error->getMessage()];
@@ -69,22 +73,12 @@ trait RequestControlPlaneTrait
 
         $path = $this->usablePathEntry($destinationHashHex);
         if ($path === null) {
-            // If this destination is directly attached (0 hops), try to respond
-            // even if the path entry's interface is currently inactive.
-            // This ensures late-joining peers can discover directly-attached endpoints.
-            $directIface = $this->directlyAttachedInterface($destinationHashHex);
-            if ($directIface !== null) {
-                $path = $this->pathEntry($destinationHashHex);
+            $queued = $this->forwardPathRequestPacket($interfaceId, $rawBase64, $packet);
+            if ($queued > 0) {
+                return ['forwarded', 'unknown_destination_forwarded', $queued];
             }
 
-            if ($path === null) {
-                $queued = $this->forwardPathRequestPacket($interfaceId, $rawBase64, $packet);
-                if ($queued > 0) {
-                    return ['forwarded', 'unknown_destination_forwarded', $queued];
-                }
-
-                return ['ignored', 'unknown_destination_path', 0];
-            }
+            return ['ignored', 'unknown_destination_path', 0];
         }
 
         $nextHopHex = (string) $path['next_hop_hex'];
@@ -154,28 +148,44 @@ trait RequestControlPlaneTrait
         return true;
     }
 
-    /**
-     * Find the interface a destination is directly attached to (0 hops away).
-     * Replaces the separate local_destinations table — the path table IS the source of truth.
-     */
-    private function directlyAttachedInterface(string $destinationHashHex): ?string
+    private function registerLocalDestinationIfOwnInterface(string $destinationHashHex, string $interfaceId): void
     {
-        $path = $this->pathEntry($destinationHashHex);
-        if ($path === null) {
+        // Use the standard RNS interface mode to decide local-destination registration.
+        // Modes that represent foreign/transit destinations (gateway, access-point, boundary)
+        // must NOT be registered as local — their announces are for peers BEHIND them.
+        // Endpoint modes (full, point-to-point, roaming) register normally.
+        $metadata = $this->interfaceMetadata($interfaceId);
+        $mode = (int) ($metadata['mode'] ?? 1); // default MODE_FULL
+
+        // RNS mode constants: MODE_ACCESS_POINT=3, MODE_BOUNDARY=5, MODE_GATEWAY=6
+        if ($mode === 3 || $mode === 5 || $mode === 6) {
+            return; // Transit interface — announces represent remote peers, not local
+        }
+
+        $stmt = $this->db->prepare($this->insertOrSql(
+            'INSERT OR REPLACE INTO local_destinations (destination_hash_hex, interface_id, registered_at)
+             VALUES (:dest, :iface, :ts)'
+        ));
+        $stmt->bindValue(':dest', $destinationHashHex, PDO::PARAM_STR);
+        $stmt->bindValue(':iface', $interfaceId, PDO::PARAM_STR);
+        $stmt->bindValue(':ts', time(), PDO::PARAM_INT);
+        $stmt->execute();
+    }
+
+    private function localDestinationInterface(string $destinationHashHex): ?string
+    {
+        $stmt = $this->db->prepare(
+            'SELECT interface_id FROM local_destinations WHERE destination_hash_hex = :dest LIMIT 1'
+        );
+        $stmt->bindValue(':dest', $destinationHashHex, PDO::PARAM_STR);
+        $row = $stmt->execute(); $row = $stmt->fetch(PDO::FETCH_ASSOC);
+
+        if (!is_array($row)) {
             return null;
         }
 
-        // A destination is directly attached if it's 0 hops away
-        if ((int) ($path['hops'] ?? -1) !== 0) {
-            return null;
-        }
-
-        $ifaceId = (string) ($path['interface_id'] ?? '');
-        if ($ifaceId === '') {
-            return null;
-        }
-
-        // Verify the interface still exists (may have gone offline)
+        $ifaceId = (string) ($row['interface_id'] ?? '');
+        // Verify the interface still exists
         $metadata = $this->interfaceMetadata($ifaceId);
         if ($metadata === []) {
             return null;
@@ -234,6 +244,7 @@ trait RequestControlPlaneTrait
             $preserveTransportPath = $currentUsable
                 && $currentInterfaceId !== ''
                 && hash_equals($currentInterfaceId, $interfaceId)
+                && (string) ($metadata['transport'] ?? '') === 'http-exchange'
                 && $currentNextHopHex !== ''
                 && !hash_equals($currentNextHopHex, $normalizedDestinationHashHex)
                 && $incomingTransportIdHex === null
@@ -281,8 +292,7 @@ trait RequestControlPlaneTrait
         $nextHopHex = $packet['transport_id_hex'] === null ? $destinationHashHex : (string) $packet['transport_id_hex'];
         $expiresAt = $now + $this->pathExpirySeconds($interfaceId);
 
-        $stmt = $this->db->prepare(
-            'INSERT INTO path_entries (
+        $sql = 'INSERT INTO path_entries (
                 destination_hash_hex,
                 next_hop_hex,
                 hops,
@@ -311,17 +321,18 @@ trait RequestControlPlaneTrait
                 interface_id = excluded.interface_id,
                 packet_hash_hex = excluded.packet_hash_hex,
                 announce_emitted = excluded.announce_emitted,
-                updated_at = excluded.updated_at'
-        );
-        $stmt->bindValue(':destination_hash_hex', $destinationHashHex, SQLITE3_TEXT);
-        $stmt->bindValue(':next_hop_hex', $nextHopHex, SQLITE3_TEXT);
-        $stmt->bindValue(':hops', $hops, SQLITE3_INTEGER);
-        $stmt->bindValue(':expires_at', $expiresAt, SQLITE3_INTEGER);
-        $stmt->bindValue(':random_blobs_json', self::encodeJson($randomBlobs), SQLITE3_TEXT);
-        $stmt->bindValue(':interface_id', $interfaceId, SQLITE3_TEXT);
-        $stmt->bindValue(':packet_hash_hex', (string) $packet['packet_hash_hex'], SQLITE3_TEXT);
-        $stmt->bindValue(':announce_emitted', $announceEmitted, SQLITE3_INTEGER);
-        $stmt->bindValue(':updated_at', $now, SQLITE3_INTEGER);
+                updated_at = excluded.updated_at';
+        $sql = Database::upsertSql($sql, $this->backend);
+        $stmt = $this->db->prepare($sql);
+        $stmt->bindValue(':destination_hash_hex', $destinationHashHex, PDO::PARAM_STR);
+        $stmt->bindValue(':next_hop_hex', $nextHopHex, PDO::PARAM_STR);
+        $stmt->bindValue(':hops', $hops, PDO::PARAM_INT);
+        $stmt->bindValue(':expires_at', $expiresAt, PDO::PARAM_INT);
+        $stmt->bindValue(':random_blobs_json', self::encodeJson($randomBlobs), PDO::PARAM_STR);
+        $stmt->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
+        $stmt->bindValue(':packet_hash_hex', (string) $packet['packet_hash_hex'], PDO::PARAM_STR);
+        $stmt->bindValue(':announce_emitted', $announceEmitted, PDO::PARAM_INT);
+        $stmt->bindValue(':updated_at', $now, PDO::PARAM_INT);
         $stmt->execute();
 
         return ['path_updated', $reason];

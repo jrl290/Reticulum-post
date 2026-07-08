@@ -5,10 +5,10 @@ declare(strict_types=1);
 namespace ReticulumPhp;
 
 use RuntimeException;
-use PDO;
+use SQLite3;
+use SQLite3Result;
 
 require_once __DIR__ . '/lib/request_runtime.php';
-require_once __DIR__ . '/lib/database.php';
 require_once __DIR__ . '/lib/request_control_plane_trait.php';
 require_once __DIR__ . '/lib/request_debug_report_trait.php';
 require_once __DIR__ . '/lib/request_http_api_helper_trait.php';
@@ -25,7 +25,6 @@ require_once __DIR__ . '/lib/request_php_peer_session_trait.php';
 require_once __DIR__ . '/lib/request_relay_routing_trait.php';
 require_once __DIR__ . '/lib/request_schema_trait.php';
 require_once __DIR__ . '/lib/request_wake_dispatch_trait.php';
-require_once __DIR__ . '/lib/request_post_interface_trait.php';
 
 // Reticulum-php is request-operated. Queued transport bytes only move during
 // authenticated request/response exchanges. Wake and bridge helpers exist to
@@ -108,22 +107,13 @@ final class Config
     {
         return [
             'storage' => [
-                'backend' => 'mysql',
                 'sqlite_path' => $projectRoot . '/var/reticulum-php.sqlite',
-                'mysql_host' => '127.0.0.1',
-                'mysql_port' => 3306,
-                'mysql_dbname' => 'reticulum_php',
-                'mysql_user' => 'reticulum',
-                'mysql_pass' => '',
                 'log_path' => $projectRoot . '/var/router.log',
             ],
             'http' => [
                 'idle_exchange_interval_ms' => 1000,
                 'max_batch_packets' => 64,
                 'max_packet_bytes' => 512,
-            ],
-            'php' => [
-                'memory_limit' => '128M',
             ],
             'maintenance' => [
                 'interface_stale_after_seconds' => 15,
@@ -496,9 +486,7 @@ final class Config
         $config['wake'] = $wakeConfig;
 
         $config = self::normalizeTcpBridgeConfig($projectRoot, $config);
-        $config = self::normalizePhpPeerInterfaces($config);
-        $config = self::normalizePostInterfaceConfig($config);
-        return $config;
+        return self::normalizePhpPeerInterfaces($config);
     }
 
     private static function normalizeTcpBridgeConfig(string $projectRoot, array $config): array
@@ -703,60 +691,6 @@ final class Config
         if ($hostUrl !== '') {
             $config['host_url'] = $hostUrl;
         }
-        return $config;
-    }
-
-    private static function normalizePostInterfaceConfig(array $config): array
-    {
-        $interfaces = $config['interfaces'] ?? [];
-        if (!is_array($interfaces)) {
-            $config['post_interface_peers'] = [];
-            return $config;
-        }
-
-        $peers = [];
-        foreach ($interfaces as $interfaceName => $interfaceConfig) {
-            if (!is_array($interfaceConfig)) {
-                continue;
-            }
-
-            $type = self::optionalConfigString($interfaceConfig, 'type');
-            if ($type !== 'PostInterface') {
-                continue;
-            }
-
-            if (!self::interfaceEnabled($interfaceConfig)) {
-                continue;
-            }
-
-            $peerId = self::slugify((string) $interfaceName);
-            $nodeUrl = self::optionalConfigString($interfaceConfig, 'node_url');
-            if ($nodeUrl === null) {
-                throw new RuntimeException('interfaces.' . $interfaceName . '.node_url is required for PostInterface');
-            }
-
-            $peers[$peerId] = [
-                'name' => (string) $interfaceName,
-                'node_url' => rtrim($nodeUrl, '/'),
-                'bitrate' => self::positiveConfigIntOrDefault($interfaceConfig, 'bitrate', 'interfaces.' . $interfaceName . '.bitrate', 62500),
-                'mtu' => self::positiveConfigIntOrDefault($interfaceConfig, 'mtu', 'interfaces.' . $interfaceName . '.mtu', 500),
-                'max_batch_packets' => self::positiveConfigIntOrDefault($interfaceConfig, 'max_batch_packets', 'interfaces.' . $interfaceName . '.max_batch_packets', (int) ($config['http']['max_batch_packets'] ?? 64)),
-                'http_timeout_seconds' => self::positiveConfigIntOrDefault($interfaceConfig, 'http_timeout_seconds', 'interfaces.' . $interfaceName . '.http_timeout_seconds', 15),
-                'connect_timeout_seconds' => self::positiveConfigIntOrDefault($interfaceConfig, 'connect_timeout_seconds', 'interfaces.' . $interfaceName . '.connect_timeout_seconds', 5),
-            ];
-
-            $wakeUrl = self::optionalConfigString($interfaceConfig, 'wake_url');
-            if ($wakeUrl !== null) {
-                $peers[$peerId]['wake_url'] = rtrim($wakeUrl, '/');
-            }
-
-            $pollInterval = $interfaceConfig['poll_interval_seconds'] ?? null;
-            if ($pollInterval !== null) {
-                $peers[$peerId]['poll_interval_seconds'] = (float) $pollInterval;
-            }
-        }
-
-        $config['post_interface_peers'] = $peers;
         return $config;
     }
 
@@ -1248,18 +1182,6 @@ final class WakeConfig
 {
     public static function fromMetadata(array $metadata): ?array
     {
-        // Simple wake_url string — used by PostInterface and other modern clients.
-        $wakeUrl = $metadata['wake_url'] ?? null;
-        if (is_string($wakeUrl) && trim($wakeUrl) !== '') {
-            $wakeUrl = rtrim(trim($wakeUrl), '/');
-            return [
-                'profile' => '__http_wake__',
-                'target' => $wakeUrl,
-                'data' => ['wake_url' => $wakeUrl],
-            ];
-        }
-
-        // Legacy nested wake object — used by TcpBridge and PhpPeer.
         $wake = $metadata['wake'] ?? null;
         if ($wake === null) {
             return null;
@@ -1402,39 +1324,28 @@ final class HttpWakeProvider implements WakeProvider
 {
     public function dispatch(array $profile, array $event): array
     {
-        $wakeData = $event['wake_data'] ?? null;
-        $wakeData = is_array($wakeData) ? $wakeData : [];
-
-        // New model: wake_data contains wake_url (PostInterface, generic HTTP wake).
-        // POST {wake_url}/v1/wake with waker_url set to our host_url.
-        $wakeUrl = $wakeData['wake_url'] ?? null;
-        if (is_string($wakeUrl) && trim($wakeUrl) !== '') {
-            $url = rtrim(trim($wakeUrl), '/') . '/v1/wake';
-            $hostUrl = $profile['host_url'] ?? $wakeUrl;
-            $payload = [
-                'waker_url' => rtrim(trim((string) $hostUrl), '/'),
-                'queue_reason' => (string) ($event['queue_reason'] ?? ''),
-                'queued_packet_count' => (int) ($event['queued_packet_count'] ?? 0),
-            ];
-        } else {
-            // Old model: profile.url or wake_data.peer_url (PhpPeer).
-            $url = $profile['url'] ?? null;
-            if (!is_string($url) || trim($url) === '') {
-                $peerUrl = $wakeData['peer_url'] ?? null;
-                if (!is_string($peerUrl) || trim($peerUrl) === '') {
-                    throw new RuntimeException('http wake profile requires wake_data.wake_url or wake_data.peer_url');
-                }
-                $url = rtrim(trim($peerUrl), '/') . '/v1/php-peers/wake';
+        $url = $profile['url'] ?? null;
+        if (!is_string($url) || trim($url) === '') {
+            $wakeData = $event['wake_data'] ?? null;
+            if (!is_array($wakeData)) {
+                throw new RuntimeException('http wake profile requires wake_data.peer_url when url is not configured');
             }
 
-            $payload = [
-                'target' => (string) ($event['wake_target'] ?? ''),
-                'data' => $wakeData,
-                'queue_reason' => (string) ($event['queue_reason'] ?? ''),
-                'queued_packet_count' => (int) ($event['queued_packet_count'] ?? 0),
-                'wake_event_id' => (int) ($event['wake_event_id'] ?? 0),
-            ];
+            $peerUrl = $wakeData['peer_url'] ?? null;
+            if (!is_string($peerUrl) || trim($peerUrl) === '') {
+                throw new RuntimeException('http wake profile requires wake_data.peer_url when url is not configured');
+            }
+
+            $url = rtrim(trim($peerUrl), '/') . '/v1/php-peers/wake';
         }
+
+        $payload = [
+            'target' => (string) ($event['wake_target'] ?? ''),
+            'data' => is_array($event['wake_data'] ?? null) ? $event['wake_data'] : [],
+            'queue_reason' => (string) ($event['queue_reason'] ?? ''),
+            'queued_packet_count' => (int) ($event['queued_packet_count'] ?? 0),
+            'wake_event_id' => (int) ($event['wake_event_id'] ?? 0),
+        ];
 
         $response = $this->requestJson(
             trim($url),
@@ -1564,16 +1475,6 @@ final class WakeDispatcher
 
     private function profileConfig(string $profileName): array
     {
-        if ($profileName === '__http_wake__') {
-            $hostUrl = $this->config['host_url'] ?? ($this->config['http']['advertise_url'] ?? null);
-            return [
-                'type' => 'http',
-                'host_url' => is_string($hostUrl) ? rtrim(trim($hostUrl), '/') : null,
-                'http_timeout_seconds' => 5,
-                'connect_timeout_seconds' => 5,
-            ];
-        }
-
         if ($profileName === '') {
             throw new RuntimeException('wake profile name is required');
         }
@@ -1611,15 +1512,15 @@ final class Storage
     use RequestRelayRoutingTrait;
     use RequestSchemaTrait;
     use RequestWakeDispatchTrait;
-    use RequestPostInterfaceTrait;
 
-    private PDO $db;
-    private string $backend;
+    private SQLite3 $db;
 
     public function __construct(private readonly array $config)
     {
-        $this->backend = Database::backend($config);
-        $this->db = Database::connect($config);
+        $path = (string) $this->config['storage']['sqlite_path'];
+        $this->db = new SQLite3($path);
+        $this->db->enableExceptions(true);
+        $this->db->busyTimeout(5000);
     }
 
 }
@@ -1639,15 +1540,18 @@ final class HttpApi
         try {
             $path = $this->normalizedPath($uri, $server);
 
+            // Handle CORS preflight
+            if ($method === 'OPTIONS') {
+                $this->respond(204, []);
+            }
+
             if ($method === 'GET' && $path === '/health') {
                 $this->respond(200, [
                     'status' => 'ok',
                     'transport_basis' => requestTransportMechanism(),
                     'environment' => Environment::verify(),
                     'queues' => $this->storage->healthSummary(),
-                    'db_size' => $this->storage->healthDbSize(),
                     'php_interface_registry' => $this->storage->healthInterfaceRegistry(5),
-                    'post_interface_peers' => $this->storage->postInterfacePeerSummary(),
                 ]);
             }
 
@@ -1698,12 +1602,7 @@ final class HttpApi
                 $body = $this->readJsonBody();
                 [$interfaceId, $sessionToken] = $this->requireInterfaceCredentials($body);
                 $this->storage->authenticateInterface($interfaceId, $sessionToken);
-                // Skip PostInterface exchange in the exchange handler itself.
-                // The exchange response already carries delivery packets back
-                // to the caller.  Triggering another outbound exchange here
-                // creates an exchange→exchange→exchange cascade that burns
-                // cPanel entry processes (508 Resource Limit Reached).
-                $this->runInterfaceRequestPrelude(skipPostInterfaceExchange: true);
+                $this->runInterfaceRequestPrelude();
                 $ackBatchIds = $this->optionalStringArray($body, 'ack_batch_ids');
                 $requestedMaxPackets = $body['max_packets'] ?? (int) $this->config['http']['max_batch_packets'];
                 $maxPackets = min($this->requirePositiveIntValue($requestedMaxPackets, 'max_packets'), (int) $this->config['http']['max_batch_packets']);
@@ -1727,31 +1626,6 @@ final class HttpApi
                 }
 
                 $delivery = $this->storage->fetchOutboundBatch($interfaceId, $maxPackets);
-
-                // Also include packets from any PostInterface peer whose
-                // registered interface matches the authenticated one.
-                // This ensures the transport pipe flushes both ways.
-                foreach (($this->config['post_interface_peers'] ?? []) as $peerId => $peerConfig) {
-                    if (!is_array($peerConfig)) {
-                        continue;
-                    }
-                    $piLocalIface = $this->storage->postInterfaceLocalInterfaceId($peerId);
-                    if ($piLocalIface === $interfaceId) {
-                        continue; // already fetched above
-                    }
-                    $remaining = $maxPackets - count($delivery['packets']);
-                    if ($remaining <= 0) {
-                        break;
-                    }
-                    $piDelivery = $this->storage->fetchOutboundBatch($piLocalIface, $remaining);
-                    if (($piDelivery['packets'] ?? []) !== []) {
-                        $delivery['packets'] = array_merge($delivery['packets'], $piDelivery['packets']);
-                        if ($delivery['batch_id'] === null && $piDelivery['batch_id'] !== null) {
-                            $delivery['batch_id'] = $piDelivery['batch_id'];
-                        }
-                        $delivery['more'] = $delivery['more'] || ($piDelivery['more'] ?? false);
-                    }
-                }
                 $this->runInterfaceRequestEpilogue();
 
                 $this->respond(200, [
@@ -1896,35 +1770,6 @@ final class HttpApi
                 ]);
             }
 
-            if ($method === 'POST' && $path === '/v1/wake') {
-                $body = $this->readJsonBody();
-                $wakerUrl = $this->optionalNonEmptyString($body, 'waker_url');
-                if ($wakerUrl === null) {
-                    throw new ApiError(400, 'wake requires waker_url', ['error' => 'wake requires waker_url']);
-                }
-
-                $this->runInterfaceRequestPrelude();
-                // If the waker is a known PostInterface peer, queue an async
-                // wake event so the exchange happens in a separate process.
-                $peerId = $this->storage->postInterfacePeerIdForWakerUrl($wakerUrl);
-                $postInterfaceResult = ['status' => 'ignored', 'reason' => 'unknown_waker'];
-                if ($peerId !== null) {
-                    $this->storage->queuePostInterfaceWakeEvent($peerId, $wakerUrl);
-                    $postInterfaceResult = ['status' => 'queued', 'peer_id' => $peerId];
-                }
-                $this->runInterfaceRequestEpilogue();
-
-                $responsePayload = [
-                    'status' => 'awake',
-                    'waker_url' => $wakerUrl,
-                ];
-                if (($postInterfaceResult['status'] ?? '') !== 'ignored') {
-                    $responsePayload['post_interface_wake'] = $postInterfaceResult;
-                }
-
-                $this->respond(200, $responsePayload);
-            }
-
             throw new ApiError(404, 'Not found', ['error' => 'not found']);
         } catch (ApiError $error) {
             $payload = $error->payload;
@@ -1933,14 +1778,8 @@ final class HttpApi
             }
             $this->respond($error->statusCode, $payload);
         } catch (\Throwable $error) {
-            $this->log('error', 'Unhandled HTTP exception: ' . $error->getMessage() . ' in ' . $error->getFile() . ':' . $error->getLine());
-            $this->respond(500, [
-                'error' => 'internal error',
-                'detail' => $error->getMessage(),
-                'exception' => get_class($error),
-                'file' => basename($error->getFile()),
-                'line' => $error->getLine(),
-            ]);
+            $this->log('error', 'Unhandled HTTP exception: ' . $error->getMessage());
+            $this->respond(500, ['error' => 'internal error']);
         }
     }
 }
@@ -3392,13 +3231,6 @@ function wakeTcpBridge(string $projectRoot, ?string $statePath = null): int
 function initializeRuntime(string $projectRoot): array
 {
     $reticulumPhpConfig = Config::load($projectRoot);
-
-    // Enforce PHP memory limit from config (shared-hosting safety).
-    $phpMemoryLimit = (string) ($reticulumPhpConfig['php']['memory_limit'] ?? '128M');
-    if ($phpMemoryLimit !== '' && ini_set('memory_limit', $phpMemoryLimit) === false) {
-        error_log('Reticulum-php: unable to set memory_limit=' . $phpMemoryLimit);
-    }
-
     Config::ensureDirectories($reticulumPhpConfig);
     Environment::verify();
 
@@ -3445,21 +3277,11 @@ function runIndexCli(string $projectRoot, array $argv): int
             return 1;
         }
 
-        // Check profile first so we route to the correct handler.
-        $profile = $reticulumPhpStorage->wakeEventProfile($wakeEventId);
-        if ($profile === '__post_interface_wake__') {
-            $result = $reticulumPhpStorage->dispatchPostInterfaceWakeEvent($wakeEventId);
-            if ($result === null) {
-                $result = ['status' => 'noop', 'wake_event_id' => $wakeEventId, 'reason' => 'already_claimed_or_missing'];
-            }
-        } else {
-            $result = $reticulumPhpStorage->dispatchWakeEventById(
-                $wakeEventId,
-                (int) (getmypid() ?: 0),
-                new WakeDispatcher($reticulumPhpConfig),
-            );
-        }
-
+        $result = $reticulumPhpStorage->dispatchWakeEventById(
+            $wakeEventId,
+            (int) (getmypid() ?: 0),
+            new WakeDispatcher($reticulumPhpConfig),
+        );
         fwrite(STDOUT, json_encode($result, JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR) . PHP_EOL);
         return ($result['status'] ?? null) === 'failed' ? 1 : 0;
     }
@@ -3648,13 +3470,10 @@ if (realpath($_SERVER['SCRIPT_FILENAME'] ?? '') === __FILE__) {
 
         http_response_code(500);
         header('Content-Type: application/json');
-        echo json_encode([
-            'error' => 'internal error',
-            'detail' => $error->getMessage(),
-            'exception' => get_class($error),
-            'file' => basename($error->getFile()),
-            'line' => $error->getLine(),
-        ], JSON_THROW_ON_ERROR);
+        header('Access-Control-Allow-Origin: *');
+        header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
+        header('Access-Control-Allow-Headers: Content-Type, X-Interface-Id, X-Session-Token');
+        echo json_encode(['error' => 'internal error'], JSON_THROW_ON_ERROR);
         exit;
     }
 }

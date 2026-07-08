@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace ReticulumPhp;
 
+use PDO;
+
 // Reticulum-php is request-operated. These maintenance helpers only prune and
 // reconcile request-path state between exchanges; they do not add retries,
 // polling loops, or a second transport mechanism.
@@ -18,26 +20,27 @@ trait RequestMaintenanceTrait
         $packetHashTrimBefore = $now - $this->maintenanceInt('packet_hash_ttl_seconds', $batchTtlSeconds);
 
         $staleStmt = $this->db->prepare(
-            'UPDATE interfaces SET status = :status WHERE status != :status AND last_seen_at < :stale_before'
+            'UPDATE interfaces SET status = :new_status WHERE status != :current_status AND last_seen_at < :stale_before'
         );
-        $staleStmt->bindValue(':status', 'offline', SQLITE3_TEXT);
-        $staleStmt->bindValue(':stale_before', $staleBefore, SQLITE3_INTEGER);
+        $staleStmt->bindValue(':new_status', 'offline', PDO::PARAM_STR);
+        $staleStmt->bindValue(':current_status', 'offline', PDO::PARAM_STR);
+        $staleStmt->bindValue(':stale_before', $staleBefore, PDO::PARAM_INT);
         $staleStmt->execute();
-        $interfacesMarkedOffline = $this->db->changes();
+        $interfacesMarkedOffline = $staleStmt->rowCount();
 
         $deleteInbound = $this->db->prepare(
             'DELETE FROM inbound_batches WHERE created_at < :trim_before'
         );
-        $deleteInbound->bindValue(':trim_before', $trimBefore, SQLITE3_INTEGER);
+        $deleteInbound->bindValue(':trim_before', $trimBefore, PDO::PARAM_INT);
         $deleteInbound->execute();
-        $trimmedInboundBatches = $this->db->changes();
+        $trimmedInboundBatches = $deleteInbound->rowCount();
 
         $deleteOutboundBatches = $this->db->prepare(
             'DELETE FROM outbound_batches WHERE acked_at IS NOT NULL AND acked_at < :trim_before'
         );
-        $deleteOutboundBatches->bindValue(':trim_before', $trimBefore, SQLITE3_INTEGER);
+        $deleteOutboundBatches->bindValue(':trim_before', $trimBefore, PDO::PARAM_INT);
         $deleteOutboundBatches->execute();
-        $trimmedOutboundBatches = $this->db->changes();
+        $trimmedOutboundBatches = $deleteOutboundBatches->rowCount();
 
         $deleteOfflineOutboundBatches = $this->db->prepare(
             "DELETE FROM outbound_batches
@@ -45,14 +48,14 @@ trait RequestMaintenanceTrait
                AND interface_id IN (SELECT interface_id FROM interfaces WHERE status != 'online')"
         );
         $deleteOfflineOutboundBatches->execute();
-        $trimmedOutboundBatches += $this->db->changes();
+        $trimmedOutboundBatches += $deleteOfflineOutboundBatches->rowCount();
 
         $deleteOutboundPackets = $this->db->prepare(
             'DELETE FROM outbound_packets WHERE acked_at IS NOT NULL AND acked_at < :trim_before'
         );
-        $deleteOutboundPackets->bindValue(':trim_before', $trimBefore, SQLITE3_INTEGER);
+        $deleteOutboundPackets->bindValue(':trim_before', $trimBefore, PDO::PARAM_INT);
         $deleteOutboundPackets->execute();
-        $trimmedOutboundPackets = $this->db->changes();
+        $trimmedOutboundPackets = $deleteOutboundPackets->rowCount();
 
         $deleteOfflineOutboundPackets = $this->db->prepare(
             "DELETE FROM outbound_packets
@@ -60,32 +63,32 @@ trait RequestMaintenanceTrait
                AND interface_id IN (SELECT interface_id FROM interfaces WHERE status != 'online')"
         );
         $deleteOfflineOutboundPackets->execute();
-        $trimmedOutboundPackets += $this->db->changes();
+        $trimmedOutboundPackets += $deleteOfflineOutboundPackets->rowCount();
 
         $deleteWakeEvents = $this->db->prepare(
             'DELETE FROM wake_events
              WHERE created_at < :trim_before
                AND (dispatched_at IS NOT NULL OR failed_at IS NOT NULL)'
         );
-        $deleteWakeEvents->bindValue(':trim_before', $trimBefore, SQLITE3_INTEGER);
+        $deleteWakeEvents->bindValue(':trim_before', $trimBefore, PDO::PARAM_INT);
         $deleteWakeEvents->execute();
-        $trimmedWakeEvents = $this->db->changes();
+        $trimmedWakeEvents = $deleteWakeEvents->rowCount();
 
         $failedOrphanedWakeClaims = $this->failOrphanedClaimedWakeEvents();
 
         $deletePacketHashes = $this->db->prepare(
             'DELETE FROM packet_hashes WHERE first_seen_at < :trim_before'
         );
-        $deletePacketHashes->bindValue(':trim_before', $packetHashTrimBefore, SQLITE3_INTEGER);
+        $deletePacketHashes->bindValue(':trim_before', $packetHashTrimBefore, PDO::PARAM_INT);
         $deletePacketHashes->execute();
-        $trimmedPacketHashes = $this->db->changes();
+        $trimmedPacketHashes = $deletePacketHashes->rowCount();
 
         $deleteExpiredPaths = $this->db->prepare(
             'DELETE FROM path_entries WHERE expires_at < :expires_before'
         );
-        $deleteExpiredPaths->bindValue(':expires_before', $now, SQLITE3_INTEGER);
+        $deleteExpiredPaths->bindValue(':expires_before', $now, PDO::PARAM_INT);
         $deleteExpiredPaths->execute();
-        $trimmedExpiredPaths = $this->db->changes();
+        $trimmedExpiredPaths = $deleteExpiredPaths->rowCount();
 
         $deletePathRequestTags = $this->db->prepare(
             'DELETE FROM path_request_tags WHERE created_at < :trim_before'
@@ -93,10 +96,10 @@ trait RequestMaintenanceTrait
         $deletePathRequestTags->bindValue(
             ':trim_before',
             $now - $this->maintenanceInt('path_request_tag_ttl_seconds', $batchTtlSeconds),
-            SQLITE3_INTEGER
+            PDO::PARAM_INT
         );
         $deletePathRequestTags->execute();
-        $trimmedPathRequestTags = $this->db->changes();
+        $trimmedPathRequestTags = $deletePathRequestTags->rowCount();
 
         $deleteReversePaths = $this->db->prepare(
             'DELETE FROM reverse_path_entries WHERE created_at < :trim_before'
@@ -104,10 +107,10 @@ trait RequestMaintenanceTrait
         $deleteReversePaths->bindValue(
             ':trim_before',
             $now - $this->maintenanceInt('reverse_path_ttl_seconds', 480),
-            SQLITE3_INTEGER
+            PDO::PARAM_INT
         );
         $deleteReversePaths->execute();
-        $trimmedReversePaths = $this->db->changes();
+        $trimmedReversePaths = $deleteReversePaths->rowCount();
 
         $deleteOfflineReversePaths = $this->db->prepare(
             "DELETE FROM reverse_path_entries
@@ -115,7 +118,7 @@ trait RequestMaintenanceTrait
                 OR outbound_interface_id IN (SELECT interface_id FROM interfaces WHERE status != 'online')"
         );
         $deleteOfflineReversePaths->execute();
-        $trimmedReversePaths += $this->db->changes();
+        $trimmedReversePaths += $deleteOfflineReversePaths->rowCount();
 
         $deleteOfflineLinkTransport = $this->db->prepare(
             "DELETE FROM link_transport_entries
@@ -123,7 +126,7 @@ trait RequestMaintenanceTrait
                 OR outbound_interface_id IN (SELECT interface_id FROM interfaces WHERE status != 'online')"
         );
         $deleteOfflineLinkTransport->execute();
-        $trimmedLinkTransport = $this->db->changes();
+        $trimmedLinkTransport = $deleteOfflineLinkTransport->rowCount();
 
         $validatedLinkActiveAfter = $now - $this->maintenanceInt('link_transport_ttl_seconds', 900);
         $invalidatedPaths = $this->invalidatePathsForExpiredPendingLinks($now, $validatedLinkActiveAfter);
@@ -136,19 +139,19 @@ trait RequestMaintenanceTrait
                  OR (proof_expires_at IS NULL AND updated_at < :active_after)
                )'
         );
-        $deleteExpiredPendingLinkTransport->bindValue(':now', $now, SQLITE3_INTEGER);
-        $deleteExpiredPendingLinkTransport->bindValue(':active_after', $validatedLinkActiveAfter, SQLITE3_INTEGER);
+        $deleteExpiredPendingLinkTransport->bindValue(':now', $now, PDO::PARAM_INT);
+        $deleteExpiredPendingLinkTransport->bindValue(':active_after', $validatedLinkActiveAfter, PDO::PARAM_INT);
         $deleteExpiredPendingLinkTransport->execute();
-        $trimmedLinkTransport += $this->db->changes();
+        $trimmedLinkTransport += $deleteExpiredPendingLinkTransport->rowCount();
 
         $deleteInactiveValidatedLinkTransport = $this->db->prepare(
             'DELETE FROM link_transport_entries
              WHERE validated = 1
                AND updated_at < :active_after'
         );
-        $deleteInactiveValidatedLinkTransport->bindValue(':active_after', $validatedLinkActiveAfter, SQLITE3_INTEGER);
+        $deleteInactiveValidatedLinkTransport->bindValue(':active_after', $validatedLinkActiveAfter, PDO::PARAM_INT);
         $deleteInactiveValidatedLinkTransport->execute();
-        $trimmedLinkTransport += $this->db->changes();
+        $trimmedLinkTransport += $deleteInactiveValidatedLinkTransport->rowCount();
 
         return [
             'interfaces_marked_offline' => $interfacesMarkedOffline,
@@ -176,17 +179,13 @@ trait RequestMaintenanceTrait
                AND claimed_at IS NOT NULL
                AND claimed_by_pid IS NOT NULL'
         );
-        $result = $stmt->execute();
-        $rows = [];
+        $stmt->execute();
 
-        while (($row = $result->fetchArray(SQLITE3_ASSOC)) !== false) {
+        $rows = [];
+        while (($row = $stmt->fetch(PDO::FETCH_ASSOC)) !== false) {
             if (is_array($row)) {
                 $rows[] = $row;
             }
-        }
-
-        if ($result instanceof SQLite3Result) {
-            $result->finalize();
         }
 
         $failedClaims = 0;

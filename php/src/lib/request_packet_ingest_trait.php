@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace ReticulumPhp;
 
+use PDO;
+
 // Reticulum-php is request-operated. These inbound packet helpers classify and
 // persist packets during authenticated exchanges; they do not introduce a
 // second transport path outside the request/response flow.
@@ -71,20 +73,20 @@ trait RequestPacketIngestTrait
     private function packetHashExists(string $packetHashHex): bool
     {
         $stmt = $this->db->prepare('SELECT 1 FROM packet_hashes WHERE packet_hash_hex = :packet_hash_hex');
-        $stmt->bindValue(':packet_hash_hex', $packetHashHex, SQLITE3_TEXT);
-        $row = $stmt->execute()->fetchArray(SQLITE3_NUM);
+        $stmt->bindValue(':packet_hash_hex', $packetHashHex, PDO::PARAM_STR);
+        $row = $stmt->execute(); $row = $stmt->fetch(PDO::FETCH_NUM);
 
         return $row !== false;
     }
 
     private function rememberPacketHash(string $packetHashHex): void
     {
-        $stmt = $this->db->prepare(
+        $stmt = $this->db->prepare($this->insertOrSql(
             'INSERT OR IGNORE INTO packet_hashes (packet_hash_hex, first_seen_at)
              VALUES (:packet_hash_hex, :first_seen_at)'
-        );
-        $stmt->bindValue(':packet_hash_hex', $packetHashHex, SQLITE3_TEXT);
-        $stmt->bindValue(':first_seen_at', time(), SQLITE3_INTEGER);
+        ));
+        $stmt->bindValue(':packet_hash_hex', $packetHashHex, PDO::PARAM_STR);
+        $stmt->bindValue(':first_seen_at', time(), PDO::PARAM_INT);
         $stmt->execute();
     }
 
@@ -97,7 +99,7 @@ trait RequestPacketIngestTrait
         array $packet,
         ?string $errorMessage
     ): void {
-        $stmt = $this->db->prepare(
+        $stmt = $this->db->prepare($this->insertOrSql(
             'INSERT OR REPLACE INTO inbound_packets (
                 interface_id,
                 batch_id,
@@ -151,32 +153,32 @@ trait RequestPacketIngestTrait
                 :announce_reason,
                 :created_at
             )'
-        );
-        $stmt->bindValue(':interface_id', $interfaceId, SQLITE3_TEXT);
-        $stmt->bindValue(':batch_id', $batchId, SQLITE3_TEXT);
-        $stmt->bindValue(':packet_index', $packetIndex, SQLITE3_INTEGER);
-        $stmt->bindValue(':status', $status, SQLITE3_TEXT);
-        $stmt->bindValue(':error_message', $errorMessage, $errorMessage === null ? SQLITE3_NULL : SQLITE3_TEXT);
-        $stmt->bindValue(':packet_hash_hex', $packet['packet_hash_hex'], $packet['packet_hash_hex'] === null ? SQLITE3_NULL : SQLITE3_TEXT);
-        $stmt->bindValue(':truncated_hash_hex', $packet['truncated_hash_hex'], $packet['truncated_hash_hex'] === null ? SQLITE3_NULL : SQLITE3_TEXT);
-        $stmt->bindValue(':raw_base64', $rawBase64, SQLITE3_TEXT);
-        $stmt->bindValue(':packet_size', (int) $packet['packet_size'], SQLITE3_INTEGER);
-        $stmt->bindValue(':ifac_flag', (int) $packet['ifac_flag'], SQLITE3_INTEGER);
-        $stmt->bindValue(':header_type', $packet['header_type'], $packet['header_type'] === null ? SQLITE3_NULL : SQLITE3_INTEGER);
-        $stmt->bindValue(':transport_type', $packet['transport_type'], $packet['transport_type'] === null ? SQLITE3_NULL : SQLITE3_INTEGER);
-        $stmt->bindValue(':destination_type', $packet['destination_type'], $packet['destination_type'] === null ? SQLITE3_NULL : SQLITE3_INTEGER);
-        $stmt->bindValue(':packet_type', $packet['packet_type'], $packet['packet_type'] === null ? SQLITE3_NULL : SQLITE3_INTEGER);
-        $stmt->bindValue(':context_flag', $packet['context_flag'], $packet['context_flag'] === null ? SQLITE3_NULL : SQLITE3_INTEGER);
-        $stmt->bindValue(':hops', $packet['hops'], $packet['hops'] === null ? SQLITE3_NULL : SQLITE3_INTEGER);
-        $stmt->bindValue(':context', $packet['context'], $packet['context'] === null ? SQLITE3_NULL : SQLITE3_INTEGER);
-        $stmt->bindValue(':transport_id_hex', $packet['transport_id_hex'], $packet['transport_id_hex'] === null ? SQLITE3_NULL : SQLITE3_TEXT);
-        $stmt->bindValue(':destination_hash_hex', $packet['destination_hash_hex'], $packet['destination_hash_hex'] === null ? SQLITE3_NULL : SQLITE3_TEXT);
-        $stmt->bindValue(':payload_base64', $packet['payload_base64'], $packet['payload_base64'] === null ? SQLITE3_NULL : SQLITE3_TEXT);
-        $stmt->bindValue(':filter_status', $packet['filter_status'], $packet['filter_status'] === null ? SQLITE3_NULL : SQLITE3_TEXT);
-        $stmt->bindValue(':filter_reason', $packet['filter_reason'], $packet['filter_reason'] === null ? SQLITE3_NULL : SQLITE3_TEXT);
-        $stmt->bindValue(':announce_status', $packet['announce_status'], $packet['announce_status'] === null ? SQLITE3_NULL : SQLITE3_TEXT);
-        $stmt->bindValue(':announce_reason', $packet['announce_reason'], $packet['announce_reason'] === null ? SQLITE3_NULL : SQLITE3_TEXT);
-        $stmt->bindValue(':created_at', time(), SQLITE3_INTEGER);
+        ));
+        $stmt->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
+        $stmt->bindValue(':batch_id', $batchId, PDO::PARAM_STR);
+        $stmt->bindValue(':packet_index', $packetIndex, PDO::PARAM_INT);
+        $stmt->bindValue(':status', $status, PDO::PARAM_STR);
+        $stmt->bindValue(':error_message', $errorMessage, $errorMessage === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
+        $stmt->bindValue(':packet_hash_hex', $packet['packet_hash_hex'], $packet['packet_hash_hex'] === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
+        $stmt->bindValue(':truncated_hash_hex', $packet['truncated_hash_hex'], $packet['truncated_hash_hex'] === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
+        $stmt->bindValue(':raw_base64', $rawBase64, PDO::PARAM_STR);
+        $stmt->bindValue(':packet_size', (int) $packet['packet_size'], PDO::PARAM_INT);
+        $stmt->bindValue(':ifac_flag', (int) $packet['ifac_flag'], PDO::PARAM_INT);
+        $stmt->bindValue(':header_type', $packet['header_type'], $packet['header_type'] === null ? PDO::PARAM_NULL : PDO::PARAM_INT);
+        $stmt->bindValue(':transport_type', $packet['transport_type'], $packet['transport_type'] === null ? PDO::PARAM_NULL : PDO::PARAM_INT);
+        $stmt->bindValue(':destination_type', $packet['destination_type'], $packet['destination_type'] === null ? PDO::PARAM_NULL : PDO::PARAM_INT);
+        $stmt->bindValue(':packet_type', $packet['packet_type'], $packet['packet_type'] === null ? PDO::PARAM_NULL : PDO::PARAM_INT);
+        $stmt->bindValue(':context_flag', $packet['context_flag'], $packet['context_flag'] === null ? PDO::PARAM_NULL : PDO::PARAM_INT);
+        $stmt->bindValue(':hops', $packet['hops'], $packet['hops'] === null ? PDO::PARAM_NULL : PDO::PARAM_INT);
+        $stmt->bindValue(':context', $packet['context'], $packet['context'] === null ? PDO::PARAM_NULL : PDO::PARAM_INT);
+        $stmt->bindValue(':transport_id_hex', $packet['transport_id_hex'], $packet['transport_id_hex'] === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
+        $stmt->bindValue(':destination_hash_hex', $packet['destination_hash_hex'], $packet['destination_hash_hex'] === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
+        $stmt->bindValue(':payload_base64', $packet['payload_base64'], $packet['payload_base64'] === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
+        $stmt->bindValue(':filter_status', $packet['filter_status'], $packet['filter_status'] === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
+        $stmt->bindValue(':filter_reason', $packet['filter_reason'], $packet['filter_reason'] === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
+        $stmt->bindValue(':announce_status', $packet['announce_status'], $packet['announce_status'] === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
+        $stmt->bindValue(':announce_reason', $packet['announce_reason'], $packet['announce_reason'] === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
+        $stmt->bindValue(':created_at', time(), PDO::PARAM_INT);
         $stmt->execute();
     }
 }

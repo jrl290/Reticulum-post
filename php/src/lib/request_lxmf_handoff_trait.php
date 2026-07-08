@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace ReticulumPhp;
 
+use PDO;
+
 // Reticulum-php is request-operated. These LXMF handoff helpers turn queued
 // application payloads into normal Reticulum packets during a request; they do
 // not add a second transport path outside authenticated exchanges.
@@ -82,8 +84,8 @@ trait RequestLxmfHandoffTrait
         $stmt = $this->db->prepare(
             'SELECT name FROM interfaces WHERE interface_id = :interface_id LIMIT 1'
         );
-        $stmt->bindValue(':interface_id', $interfaceId, SQLITE3_TEXT);
-        $row = $stmt->execute()->fetchArray(SQLITE3_ASSOC);
+        $stmt->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
+        $row = $stmt->execute(); $row = $stmt->fetch(PDO::FETCH_ASSOC);
 
         return is_array($row) ? (string) ($row['name'] ?? '') : null;
     }
@@ -96,15 +98,41 @@ trait RequestLxmfHandoffTrait
              WHERE destination_hash_hex = :destination_hash_hex
              LIMIT 1'
         );
-        $stmt->bindValue(':destination_hash_hex', $destinationHashHex, SQLITE3_TEXT);
-        $row = $stmt->execute()->fetchArray(SQLITE3_ASSOC);
+        $stmt->bindValue(':destination_hash_hex', $destinationHashHex, PDO::PARAM_STR);
+        $row = $stmt->execute(); $row = $stmt->fetch(PDO::FETCH_ASSOC);
 
         return is_array($row) ? $row : null;
     }
 
     private function usableLxmfOutboxPathEntry(string $destinationHashHex): ?array
     {
-        return $this->usablePathEntry($destinationHashHex);
+        $path = $this->usablePathEntry($destinationHashHex);
+        if ($path === null) {
+            return null;
+        }
+
+        $interfaceId = (string) ($path['interface_id'] ?? '');
+        if ($interfaceId === '') {
+            return null;
+        }
+
+        $metadata = $this->interfaceMetadata($interfaceId);
+        if ((string) ($metadata['transport'] ?? '') !== 'php-peer-exchange') {
+            return $path;
+        }
+
+        foreach ($this->activePeerInterfaceIds('') as $candidateInterfaceId) {
+            if ($candidateInterfaceId === $interfaceId) {
+                continue;
+            }
+
+            $candidateMetadata = $this->interfaceMetadata($candidateInterfaceId);
+            if ((string) ($candidateMetadata['transport'] ?? '') === 'http-exchange') {
+                return null;
+            }
+        }
+
+        return $path;
     }
 
     private function knownRatchetMaxAgeSeconds(): int
@@ -221,6 +249,11 @@ trait RequestLxmfHandoffTrait
     ): string
     {
         if ($path === null || $interfaceId === null) {
+            return $packetRaw;
+        }
+
+        $metadata = $this->interfaceMetadata($interfaceId);
+        if ((string) ($metadata['transport'] ?? '') !== 'http-exchange') {
             return $packetRaw;
         }
 

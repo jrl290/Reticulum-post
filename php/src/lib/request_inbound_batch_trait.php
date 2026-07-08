@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace ReticulumPhp;
 
+use PDO;
+
 // Reticulum-php is request-operated. These inbound batch helpers accept,
 // process, and summarize packets only during authenticated request exchanges;
 // they do not create a second transport path.
@@ -15,9 +17,9 @@ trait RequestInboundBatchTrait
         $duplicateCheck = $this->db->prepare(
             'SELECT packet_count, byte_count FROM inbound_batches WHERE interface_id = :interface_id AND batch_id = :batch_id'
         );
-        $duplicateCheck->bindValue(':interface_id', $interfaceId, SQLITE3_TEXT);
-        $duplicateCheck->bindValue(':batch_id', $batchId, SQLITE3_TEXT);
-        $existing = $duplicateCheck->execute()->fetchArray(SQLITE3_ASSOC);
+        $duplicateCheck->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
+        $duplicateCheck->bindValue(':batch_id', $batchId, PDO::PARAM_STR);
+        $existing = $duplicateCheck->execute(); $row = $duplicateCheck->fetch(PDO::FETCH_ASSOC);
 
         if (is_array($existing)) {
             return [
@@ -39,12 +41,12 @@ trait RequestInboundBatchTrait
                 :payload_json, :created_at, NULL, NULL
             )'
         );
-        $stmt->bindValue(':interface_id', $interfaceId, SQLITE3_TEXT);
-        $stmt->bindValue(':batch_id', $batchId, SQLITE3_TEXT);
-        $stmt->bindValue(':packet_count', count($packets), SQLITE3_INTEGER);
-        $stmt->bindValue(':byte_count', $byteCount, SQLITE3_INTEGER);
-        $stmt->bindValue(':payload_json', self::encodeJson($packets), SQLITE3_TEXT);
-        $stmt->bindValue(':created_at', time(), SQLITE3_INTEGER);
+        $stmt->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
+        $stmt->bindValue(':batch_id', $batchId, PDO::PARAM_STR);
+        $stmt->bindValue(':packet_count', count($packets), PDO::PARAM_INT);
+        $stmt->bindValue(':byte_count', $byteCount, PDO::PARAM_INT);
+        $stmt->bindValue(':payload_json', self::encodeJson($packets), PDO::PARAM_STR);
+        $stmt->bindValue(':created_at', time(), PDO::PARAM_INT);
         $stmt->execute();
 
         $this->incrementInterfaceRxCounters($interfaceId, count($packets), $byteCount);
@@ -61,9 +63,9 @@ trait RequestInboundBatchTrait
         $duplicateCheck = $this->db->prepare(
             'SELECT packet_count, byte_count FROM inbound_batches WHERE interface_id = :interface_id AND batch_id = :batch_id'
         );
-        $duplicateCheck->bindValue(':interface_id', $interfaceId, SQLITE3_TEXT);
-        $duplicateCheck->bindValue(':batch_id', $batchId, SQLITE3_TEXT);
-        $existing = $duplicateCheck->execute()->fetchArray(SQLITE3_ASSOC);
+        $duplicateCheck->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
+        $duplicateCheck->bindValue(':batch_id', $batchId, PDO::PARAM_STR);
+        $existing = $duplicateCheck->execute(); $row = $duplicateCheck->fetch(PDO::FETCH_ASSOC);
 
         if (is_array($existing)) {
             return [
@@ -86,13 +88,13 @@ trait RequestInboundBatchTrait
                 :payload_json, :created_at, :processed_at, NULL
             )'
         );
-        $claim->bindValue(':interface_id', $interfaceId, SQLITE3_TEXT);
-        $claim->bindValue(':batch_id', $batchId, SQLITE3_TEXT);
-        $claim->bindValue(':packet_count', count($packets), SQLITE3_INTEGER);
-        $claim->bindValue(':byte_count', $byteCount, SQLITE3_INTEGER);
-        $claim->bindValue(':payload_json', self::encodeJson([]), SQLITE3_TEXT);
-        $claim->bindValue(':created_at', $now, SQLITE3_INTEGER);
-        $claim->bindValue(':processed_at', 0, SQLITE3_INTEGER);
+        $claim->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
+        $claim->bindValue(':batch_id', $batchId, PDO::PARAM_STR);
+        $claim->bindValue(':packet_count', count($packets), PDO::PARAM_INT);
+        $claim->bindValue(':byte_count', $byteCount, PDO::PARAM_INT);
+        $claim->bindValue(':payload_json', self::encodeJson([]), PDO::PARAM_STR);
+        $claim->bindValue(':created_at', $now, PDO::PARAM_INT);
+        $claim->bindValue(':processed_at', 0, PDO::PARAM_INT);
         $claim->execute();
 
         $this->incrementInterfaceRxCounters($interfaceId, count($packets), $byteCount);
@@ -123,10 +125,10 @@ trait RequestInboundBatchTrait
              ORDER BY created_at ASC
              LIMIT :limit'
         );
-        $stmt->bindValue(':limit', $limit, SQLITE3_INTEGER);
-        $result = $stmt->execute();
+        $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
+        $stmt->execute();
 
-        while (($row = $result->fetchArray(SQLITE3_ASSOC)) !== false) {
+        while (($row = $stmt->fetch(PDO::FETCH_ASSOC)) !== false) {
             if (!is_array($row)) {
                 continue;
             }
@@ -148,9 +150,9 @@ trait RequestInboundBatchTrait
                AND processed_at IS NULL
              LIMIT 1'
         );
-        $stmt->bindValue(':interface_id', $interfaceId, SQLITE3_TEXT);
-        $stmt->bindValue(':batch_id', $batchId, SQLITE3_TEXT);
-        $row = $stmt->execute()->fetchArray(SQLITE3_ASSOC);
+        $stmt->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
+        $stmt->bindValue(':batch_id', $batchId, PDO::PARAM_STR);
+        $row = $stmt->execute(); $row = $stmt->fetch(PDO::FETCH_ASSOC);
 
         if (!is_array($row)) {
             return $summary;
@@ -184,35 +186,21 @@ trait RequestInboundBatchTrait
         ];
     }
 
-    /**
-     * Deliver a packet directly if the destination is 0 hops away via some interface.
-     * Uses the path table — no separate local_destinations table needed.
-     */
-    private function deliverIfDirectlyAttached(string $sourceInterfaceId, string $rawBase64, array $packet): bool
+    private function deliverLocallyIfKnown(string $sourceInterfaceId, string $rawBase64, array $packet): bool
     {
         $destHash = (string) ($packet['destination_hash_hex'] ?? '');
         if ($destHash === '') {
             return false;
         }
 
-        $targetIface = $this->directlyAttachedInterface($destHash);
-        if ($targetIface === null || $targetIface === $sourceInterfaceId) {
+        $localIface = $this->localDestinationInterface($destHash);
+        if ($localIface === null || $localIface === $sourceInterfaceId) {
             return false;
         }
 
-        $queueReason = 'direct_delivery';
-        $this->queueOutboundPacket($targetIface, $rawBase64, $queueReason, $sourceInterfaceId);
-
-        // Remember reverse path so return PROOFs can be routed back
-        $truncatedHashHex = (string) ($packet['truncated_hash_hex'] ?? '');
-        if ($truncatedHashHex !== '') {
-            $this->rememberReversePath($truncatedHashHex, $sourceInterfaceId, $targetIface);
-        }
-
-        // Remember link transport entry for LINKREQUEST so LRPROOFs can be routed back
-        if ((int) ($packet['packet_type'] ?? -1) === 2) {
-            $this->rememberLinkTransportRelay($sourceInterfaceId, $targetIface, $rawBase64, $packet);
-        }
+        // Queue the packet as-is (no hop increment) for local delivery
+        $queueReason = 'local_delivery';
+        $this->queueOutboundPacket($localIface, $rawBase64, $queueReason, $sourceInterfaceId);
 
         return true;
     }
@@ -305,18 +293,18 @@ trait RequestInboundBatchTrait
                     }
                 }
 
-                $deliveredDirectly = false;
+                $deliveredLocally = false;
                 if ($filterStatus === 'accepted'
                     && in_array((int) ($packet['packet_type'] ?? -1), [0, 2], true)
                     && (int) ($packet['destination_type'] ?? -1) !== 3
                 ) {
-                    $deliveredDirectly = $this->deliverIfDirectlyAttached($interfaceId, $normalizedRawBase64, $packet);
-                    if ($deliveredDirectly) {
+                    $deliveredLocally = $this->deliverLocallyIfKnown($interfaceId, $normalizedRawBase64, $packet);
+                    if ($deliveredLocally) {
                         $summary['local_deliveries']++;
                     }
                 }
 
-                if (!$deliveredDirectly) {
+                if (!$deliveredLocally) {
                     if ($filterStatus === 'accepted' && $this->shouldTransportLinkRequestProofPacket($packet)) {
                         $summary['relay_packets_queued'] += $this->relayLinkRequestProofPacket($interfaceId, $normalizedRawBase64, $packet);
                     } elseif ($filterStatus === 'accepted' && $this->shouldRelayLinkTransportPacket($packet)) {
@@ -386,10 +374,10 @@ trait RequestInboundBatchTrait
              SET processed_at = :processed_at, processing_summary_json = :processing_summary_json
              WHERE interface_id = :interface_id AND batch_id = :batch_id'
         );
-        $update->bindValue(':processed_at', time(), SQLITE3_INTEGER);
-        $update->bindValue(':processing_summary_json', self::encodeJson($batchSummary), SQLITE3_TEXT);
-        $update->bindValue(':interface_id', $interfaceId, SQLITE3_TEXT);
-        $update->bindValue(':batch_id', $batchId, SQLITE3_TEXT);
+        $update->bindValue(':processed_at', time(), PDO::PARAM_INT);
+        $update->bindValue(':processing_summary_json', self::encodeJson($batchSummary), PDO::PARAM_STR);
+        $update->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
+        $update->bindValue(':batch_id', $batchId, PDO::PARAM_STR);
         $update->execute();
     }
 
@@ -413,11 +401,11 @@ trait RequestInboundBatchTrait
                  status = :status
              WHERE interface_id = :interface_id'
         );
-        $counterStmt->bindValue(':packet_count', $packetCount, SQLITE3_INTEGER);
-        $counterStmt->bindValue(':byte_count', $byteCount, SQLITE3_INTEGER);
-        $counterStmt->bindValue(':last_seen_at', time(), SQLITE3_INTEGER);
-        $counterStmt->bindValue(':status', 'online', SQLITE3_TEXT);
-        $counterStmt->bindValue(':interface_id', $interfaceId, SQLITE3_TEXT);
+        $counterStmt->bindValue(':packet_count', $packetCount, PDO::PARAM_INT);
+        $counterStmt->bindValue(':byte_count', $byteCount, PDO::PARAM_INT);
+        $counterStmt->bindValue(':last_seen_at', time(), PDO::PARAM_INT);
+        $counterStmt->bindValue(':status', 'online', PDO::PARAM_STR);
+        $counterStmt->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
         $counterStmt->execute();
     }
 }
