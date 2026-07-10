@@ -10,50 +10,27 @@ namespace ReticulumPhp;
 
 trait RequestHttpApiHelperTrait
 {
-    /**
-     * Request prelude: maintenance, registration, and (by default) PostInterface exchange.
-     *
-     * @param bool $skipPostInterfaceExchange Set true in handlers that already
-     *   deliver packets inline (e.g. /v1/interfaces/exchange) to prevent
-     *   exchange→exchange→exchange cascades that exhaust cPanel entry processes.
-     */
-    private function runInterfaceRequestPrelude(bool $skipPostInterfaceExchange = false): void
+    private function runInterfaceRequestPrelude(): void
     {
         $this->storage->runMaintenance(
             $this->maintenanceInt('interface_stale_after_seconds', 15),
             $this->maintenanceInt('batch_ttl_seconds', 86400),
         );
-
-        // Always register peers so they can recover from error status.
-        $this->storage->ensurePostInterfacePeersRegistered();
-
-        if (!$skipPostInterfaceExchange) {
-            $this->storage->exchangeWithAllPostInterfacePeers();
-        }
     }
 
-    /**
-     * Request epilogue: dispatch pending wake events (legacy PhpPeer, TCP bridge).
-     *
-     * PostInterface exchange is NOT run here — it belongs in the prelude.
-     * Running exchange in both prelude AND epilogue causes a double-cascade
-     * where each exchange request triggers two callbacks, which each trigger
-     * two more, exhausting cPanel entry process limits (508 errors).
-     */
     private function runInterfaceRequestEpilogue(): void
     {
-        // Dispatch any remaining wake events (legacy PhpPeer, TCP bridge).
-        $limit = (int) ($this->config['wake']['dispatch_limit'] ?? 32);
-        $wakeIds = $this->storage->pendingWakeEventIdsForSpawn($limit);
-        foreach ($wakeIds as $wakeEventId) {
+        $wakeEventIds = $this->storage->pendingWakeEventIdsForSpawn(
+            (int) ($this->config['wake']['dispatch_limit'] ?? 32),
+        );
+
+        foreach ($wakeEventIds as $wakeEventId) {
             try {
-                $this->storage->dispatchWakeEventById(
-                    $wakeEventId,
-                    (int) (getmypid() ?: 0),
-                    new WakeDispatcher($this->config),
-                );
+                $this->spawnDetachedWakeRunner((int) $wakeEventId);
             } catch (\Throwable $error) {
-                $this->storage->failWakeEvent((int) $wakeEventId, $error->getMessage());
+                $message = 'failed to spawn wake runner: ' . $error->getMessage();
+                $this->storage->failWakeEvent((int) $wakeEventId, $message);
+                $this->log('error', 'Wake runner spawn failed for wake_event_id ' . $wakeEventId . ': ' . $error->getMessage());
             }
         }
 
@@ -61,7 +38,7 @@ trait RequestHttpApiHelperTrait
         try {
             $this->storage->dispatchWakes();
         } catch (\Throwable $error) {
-            $this->log('error', 'PhpPeer wake dispatch failed: ' . $error->getMessage());
+            $this->log('error', 'Wake dispatch failed: ' . $error->getMessage());
         }
     }
 
@@ -263,6 +240,10 @@ trait RequestHttpApiHelperTrait
     {
         http_response_code($statusCode);
         header('Content-Type: application/json');
+        header('Access-Control-Allow-Origin: *');
+        header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
+        header('Access-Control-Allow-Headers: Content-Type, X-Interface-Id, X-Session-Token');
+        header('Access-Control-Max-Age: 86400');
         echo json_encode($payload, JSON_THROW_ON_ERROR);
         exit;
     }
@@ -273,7 +254,7 @@ trait RequestHttpApiHelperTrait
         file_put_contents((string) $this->config['storage']['log_path'], $line, FILE_APPEND | LOCK_EX);
     }
 
-    private function renderMonitorPage(): never
+    public function renderMonitorPage(): never
     {
         $data = $this->storage->monitorData();
         $interfaces = $data['interfaces'] ?? [];
@@ -283,8 +264,8 @@ trait RequestHttpApiHelperTrait
         $hostUrl = $this->config['host_url'] ?? ($this->config['http']['advertise_url'] ?? '');
         $now = date('Y-m-d H:i:s');
 
-        $ifaceRows = '';
         $peerRows = '';
+        $ifaceRows = '';
         foreach ($interfaces as $iface) {
             $name = htmlspecialchars((string) ($iface['name'] ?? ''), ENT_QUOTES);
             $status = htmlspecialchars((string) ($iface['status'] ?? ''), ENT_QUOTES);
@@ -306,8 +287,8 @@ trait RequestHttpApiHelperTrait
             $name = htmlspecialchars((string) ($ob['name'] ?? ''), ENT_QUOTES);
             $pending = (int) ($ob['pending'] ?? 0);
             $oldest = isset($ob['oldest_queued_at']) ? date('H:i:s', (int) $ob['oldest_queued_at']) : '-';
-            $peer = htmlspecialchars((string) ($ob['peer_url'] ?? ''), ENT_QUOTES);
-            $outboundRows .= "<tr><td>{$name}</td><td class=\"mono\">{$peer}</td><td class=\"count\">{$pending}</td><td>{$oldest}</td></tr>";
+            $op = htmlspecialchars((string) ($ob['peer_url'] ?? ''), ENT_QUOTES);
+            $outboundRows .= "<tr><td>{$name}</td><td class=\"mono\">{$op}</td><td class=\"count\">{$pending}</td><td>{$oldest}</td></tr>";
         }
 
         $packetRows = '';
@@ -316,10 +297,10 @@ trait RequestHttpApiHelperTrait
             $pktType = (int) ($pkt['packet_type'] ?? -1);
             $typeName = $typeNames[$pktType] ?? "?{$pktType}";
             $destHash = htmlspecialchars(substr((string) ($pkt['destination_hash_hex'] ?? ''), 0, 12), ENT_QUOTES);
-            $status = htmlspecialchars((string) ($pkt['filter_status'] ?? ($pkt['status'] ?? '')), ENT_QUOTES);
+            $st = htmlspecialchars((string) ($pkt['filter_status'] ?? ($pkt['status'] ?? '')), ENT_QUOTES);
             $size = (int) ($pkt['packet_size'] ?? 0);
             $ts = isset($pkt['created_at']) ? date('H:i:s', (int) $pkt['created_at']) : '-';
-            $packetRows .= "<tr><td class=\"mono\">{$typeName}</td><td class=\"mono\">{$destHash}</td><td>{$status}</td><td>{$size}</td><td>{$ts}</td></tr>";
+            $packetRows .= "<tr><td class=\"mono\">{$typeName}</td><td class=\"mono\">{$destHash}</td><td>{$st}</td><td>{$size}</td><td>{$ts}</td></tr>";
         }
 
         $outPktRows = '';
@@ -354,8 +335,6 @@ trait RequestHttpApiHelperTrait
   th { text-align: left; padding: 6px 8px; border-bottom: 2px solid #333; color: #888; font-size: 11px; text-transform: uppercase; }
   td { padding: 5px 8px; border-bottom: 1px solid #222; }
   .mono { font-family: 'SF Mono', monospace; font-size: 12px; }
-  .online { color: #5f5; }
-  .offline { color: #f55; }
   .count { text-align: right; font-weight: bold; }
   h2 { font-size: 14px; color: #888; margin: 20px 0 8px; text-transform: uppercase; }
   .refresh { font-size: 10px; color: #555; }
@@ -393,15 +372,6 @@ setTimeout(function(){ location.reload(); }, 5000);
 </html>
 HTML;
 
-        exit;
-    }
-
-    private function respondHtml(string $html): never
-    {
-        http_response_code(200);
-        header('Content-Type: text/html; charset=utf-8');
-        header('Access-Control-Allow-Origin: *');
-        echo $html;
         exit;
     }
 }

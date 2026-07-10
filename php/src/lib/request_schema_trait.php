@@ -89,9 +89,21 @@ trait RequestSchemaTrait
                 rx_packets INTEGER NOT NULL DEFAULT 0,
                 rx_bytes INTEGER NOT NULL DEFAULT 0,
                 tx_packets INTEGER NOT NULL DEFAULT 0,
-                tx_bytes INTEGER NOT NULL DEFAULT 0
+                tx_bytes INTEGER NOT NULL DEFAULT 0,
+                peer_url TEXT,
+                peer_interface_id TEXT,
+                peer_session_token TEXT,
+                last_wake_sent_at INTEGER,
+                pending_ack_batch_ids_json TEXT
             )'
         );
+        // Peer columns for existing installations (idempotent).
+        $this->ensureColumn('interfaces', 'peer_url', 'TEXT');
+        $this->ensureColumn('interfaces', 'peer_interface_id', 'TEXT');
+        $this->ensureColumn('interfaces', 'peer_session_token', 'TEXT');
+        $this->ensureColumn('interfaces', 'last_wake_sent_at', 'INTEGER');
+        $this->ensureColumn('interfaces', 'pending_ack_batch_ids_json', 'TEXT');
+        $this->ensureIndex('CREATE INDEX IF NOT EXISTS idx_interfaces_peer_url ON interfaces(peer_url)');
 
         // inbound_batches
         $this->execDdl(
