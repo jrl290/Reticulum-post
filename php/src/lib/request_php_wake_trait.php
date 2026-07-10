@@ -68,13 +68,13 @@ trait RequestPhpWakeTrait
             return;
         }
 
-        curl_setopt($curl, CURLOPT_RETURNTRANSFER, false);
+        curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
         curl_setopt($curl, CURLOPT_CUSTOMREQUEST, 'POST');
         curl_setopt($curl, CURLOPT_HTTPHEADER, ['Content-Type: application/json']);
         curl_setopt($curl, CURLOPT_POSTFIELDS, $body);
         curl_setopt($curl, CURLOPT_TIMEOUT_MS, $timeoutMs);
         curl_setopt($curl, CURLOPT_CONNECTTIMEOUT_MS, min($timeoutMs, 500));
-        // Don't wait for response — fire and drop.
+        // Fire and drop — we don't care about the response.
         curl_exec($curl);
         curl_close($curl);
     }
