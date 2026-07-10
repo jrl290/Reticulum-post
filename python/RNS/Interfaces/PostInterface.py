@@ -4,6 +4,13 @@ PostInterface — HTTP POST-based interface for Reticulum.
 Connects a Reticulum transport node to a remote Reticulum-php node
 via HTTP exchange (the same protocol as rns_transport.php).
 
+Supports two modes:
+  - Poll mode (no wake_url): polls the PHP node on a timer
+  - Wake mode (wake_url set): bidirectional peer connection. The bridge
+    runs a lightweight HTTP server to receive /v1/wake calls from the
+    PHP node, triggering immediate exchange. Polling runs as a low-frequency
+    fallback.
+
 Place this file in ~/.reticulum/interfaces/ and add to config:
 
   [[PostInterface]]
@@ -11,14 +18,20 @@ Place this file in ~/.reticulum/interfaces/ and add to config:
     enabled = yes
     node_url = https://selectivesubconscious.com/reticulum
     name = PHP Node Bridge
+    wake_url = https://my-bridge.example.com/wake   # URL the PHP node calls to wake us
+    wake_listen_host = 0.0.0.0                       # bind address for wake server
+    wake_listen_port = 8080                          # port for wake server
 """
 
 import threading
 import time
 import base64
 import json
+import os
+import secrets
 import urllib.request
 import urllib.error
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from RNS.Interfaces.Interface import Interface
 import RNS
@@ -32,12 +45,20 @@ class PostInterface(Interface):
     owner = None
     node_url = None
     wake_url = None
+    wake_listen_host = "127.0.0.1"
+    wake_listen_port = 8080
     online = False
     _interface_id = None
     _session_token = None
+    _peer_interface_id = None   # pre-generated for PHP node to call us
+    _peer_session_token = None  # pre-generated for PHP node to call us
     _max_batch = 64
     _idle_ms = 1000
     _poll_thread = None
+    _wake_server = None
+    _wake_server_thread = None
+    _pending_wake = False
+    _wake_lock = threading.Lock()
     _running = False
     _outgoing_queue = []
     _queue_lock = threading.Lock()
@@ -57,14 +78,16 @@ class PostInterface(Interface):
             raise ValueError(f"No node_url specified for {self}")
         self.node_url = node_url.rstrip('/')
 
-        # wake_url: when present, the remote PHP node will POST /v1/wake to
-        # this URL when it has queued packets for us. This is the primary
-        # trigger for exchange in wake mode (polling serves as a fallback).
+        # wake_url: when present, enables bidirectional wake-driven mode.
+        # The bridge runs an HTTP server to receive /v1/wake from the PHP node.
         wake_url = ifconf.get("wake_url")
         if wake_url:
             self.wake_url = str(wake_url).rstrip('/')
         else:
             self.wake_url = None
+
+        self.wake_listen_host = str(ifconf.get("wake_listen_host", "127.0.0.1"))
+        self.wake_listen_port = int(ifconf.get("wake_listen_port", 8080))
 
         # Read optional config with proper defaults
         self.HW_MTU = 500
@@ -131,24 +154,53 @@ class PostInterface(Interface):
         self.online = True
         self._poll_thread = threading.Thread(target=self._poll_loop, daemon=True)
         self._poll_thread.start()
+
+        # Start wake HTTP server if in wake mode
+        if self.wake_url:
+            self._start_wake_server()
+
         poll_info = f"poll_interval={self._poll_interval}s" if self._poll_interval is not None else f"idle_ms={self._idle_ms}"
-        RNS.log(f"PostInterface[{self.name}]: Online and polling ({poll_info})", RNS.LOG_NOTICE)
+        mode_info = "wake" if self.wake_url else "poll"
+        RNS.log(f"PostInterface[{self.name}]: Online ({mode_info} mode, {poll_info})", RNS.LOG_NOTICE)
 
     def _register(self):
-        """Register this interface with the PHP node."""
+        """Register this interface with the PHP node.
+
+        In poll mode: registers as a regular client (rns-post-interface).
+        In wake mode: registers as a PHP peer (reticulum-php) with
+        pre-generated credentials so the remote node can call us back
+        via /v1/wake and /v1/interfaces/exchange.
+        """
         metadata = {
-            'client': 'rns-post-interface',
-            'implementation': 'PostInterface',
             'mode': self._rns_mode,
-            'transport': 'tcp-backbone-gateway' if self._rns_mode == RNS.Interfaces.Interface.Interface.MODE_GATEWAY else 'http-exchange',
         }
 
-        # When wake_url is configured, include it so the remote PHP node
-        # can wake us via POST /v1/wake when it has queued packets.
-        # This switches the transport model from poll-driven to wake-driven,
-        # though polling still runs as a low-frequency fallback.
         if self.wake_url:
-            metadata['wake_url'] = self.wake_url
+            # Bidirectional peer mode: pre-generate credentials for the PHP
+            # node to call us back, and send them in the register handshake.
+            self._peer_interface_id = secrets.token_hex(16)
+            self._peer_session_token = secrets.token_hex(32)
+
+            # peer_url must be the base URL — the PHP node appends /v1/wake.
+            peer_url = self.wake_url.rstrip('/')
+            if peer_url.endswith('/v1/wake'):
+                peer_url = peer_url[:-len('/v1/wake')]
+
+            metadata.update({
+                'client': 'reticulum-php',
+                'implementation': 'PostInterface',
+                'peer_url': peer_url,
+                'peer_interface_id': self._peer_interface_id,
+                'peer_session_token': self._peer_session_token,
+            })
+            RNS.log(f"PostInterface[{self.name}]: Registering as PHP peer (wake mode)", RNS.LOG_NOTICE)
+        else:
+            # Poll mode: regular client.
+            metadata.update({
+                'client': 'rns-post-interface',
+                'implementation': 'PostInterface',
+                'transport': 'tcp-backbone-gateway' if self._rns_mode == RNS.Interfaces.Interface.Interface.MODE_GATEWAY else 'http-exchange',
+            })
 
         body = {
             'name': f'RNS PostInterface ({self.name})',
@@ -163,6 +215,14 @@ class PostInterface(Interface):
         self._idle_ms = int(resp.get('idle_exchange_interval_ms', 1000))
         if not self._interface_id or not self._session_token:
             raise RuntimeError("Registration did not return credentials")
+
+        if self.wake_url:
+            RNS.log(
+                f"PostInterface[{self.name}]: Peer handshake complete — "
+                f"we call them via {self._interface_id[:8]}..., "
+                f"they call us via {self._peer_interface_id[:8]}...",
+                RNS.LOG_NOTICE
+            )
 
     def _http_post(self, url, body):
         """Make an HTTP POST request."""
@@ -208,82 +268,149 @@ class PostInterface(Interface):
                 pkt_type = data[0] & 0x03 if data else -1
                 types = {0:'DATA',1:'ANNOUNCE',2:'LINK',3:'PROOF'}
                 tname = types.get(pkt_type, str(pkt_type))
-                # Use NOTICE level so we can see it
                 RNS.log(f"PostInterface OUT: {tname} dest={dest[:12]}... len={len(data)}", RNS.LOG_NOTICE)
+
+    # ---- Wake HTTP server ----
+
+    def _start_wake_server(self):
+        """Start a lightweight HTTP server to receive /v1/wake from the PHP node."""
+        iface = self  # capture for the handler
+
+        class WakeHandler(BaseHTTPRequestHandler):
+            def log_message(self, format, *args):
+                pass  # suppress access logs
+
+            def do_POST(self):
+                if self.path != '/v1/wake':
+                    self.send_error(404)
+                    return
+
+                try:
+                    length = int(self.headers.get('Content-Length', 0))
+                    body = json.loads(self.rfile.read(length))
+                    waker_url = body.get('waker_url', '')
+
+                    # Security: only accept wakes from our configured PHP node.
+                    if not waker_url or not waker_url.startswith(iface.node_url):
+                        self.send_error(403)
+                        return
+
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/json')
+                    self.end_headers()
+                    self.wfile.write(json.dumps({'status': 'ok'}).encode())
+
+                    # Trigger an immediate exchange from the poll loop.
+                    with iface._wake_lock:
+                        iface._pending_wake = True
+                    RNS.log(f"PostInterface[{iface.name}]: Wake received from {waker_url}", RNS.LOG_DEBUG)
+
+                except Exception as e:
+                    self.send_error(400)
+
+            def do_GET(self):
+                if self.path == '/health':
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/json')
+                    self.end_headers()
+                    self.wfile.write(json.dumps({'status': 'ok', 'mode': 'wake'}).encode())
+                else:
+                    self.send_error(404)
+
+        try:
+            self._wake_server = HTTPServer((self.wake_listen_host, self.wake_listen_port), WakeHandler)
+            self._wake_server_thread = threading.Thread(
+                target=self._wake_server.serve_forever, daemon=True
+            )
+            self._wake_server_thread.start()
+            RNS.log(
+                f"PostInterface[{self.name}]: Wake server listening on "
+                f"{self.wake_listen_host}:{self.wake_listen_port}",
+                RNS.LOG_NOTICE
+            )
+        except Exception as e:
+            RNS.log(f"PostInterface[{self.name}]: Wake server failed to start: {e}", RNS.LOG_ERROR)
+
+    # ---- Exchange loop ----
 
     def _poll_loop(self):
         """Background thread that periodically exchanges packets with the PHP node.
 
-        In poll mode (no wake_url), polls at the configured interval.
-        In wake mode (wake_url present), polls at a much lower frequency as a
-        fallback — the primary trigger is the remote waking us via POST /v1/wake.
+        In poll mode (no wake_url): polls at the configured interval.
+        In wake mode (wake_url set): polls at a much lower frequency as a
+        fallback. The primary trigger is the PHP node waking us via /v1/wake,
+        which sets _pending_wake for immediate exchange.
         """
         last_exchange = 0
         _min_interval = 3.0
-        # Wake-mode fallback poll interval: 60 seconds (the remote should wake us).
         _wake_fallback_interval = 60.0
 
         while self._running:
             now = time.time()
-            # Use config poll_interval if set, else derive from server idle_ms.
-            if self._poll_interval is not None:
-                interval = max(self._poll_interval, _min_interval)
-            elif self.wake_url is not None:
-                # Wake mode: long fallback poll.
-                interval = _wake_fallback_interval
-            else:
-                interval = max(self._idle_ms / 2000.0, _min_interval)
 
-            if now - last_exchange < interval:
-                time.sleep(0.5)
-                continue
+            # Check for pending wake — trigger immediate exchange.
+            with self._wake_lock:
+                triggered = self._pending_wake
+                self._pending_wake = False
+
+            if not triggered:
+                # Determine poll interval.
+                if self._poll_interval is not None:
+                    interval = max(self._poll_interval, _min_interval)
+                elif self.wake_url is not None:
+                    interval = _wake_fallback_interval
+                else:
+                    interval = max(self._idle_ms / 2000.0, _min_interval)
+
+                if now - last_exchange < interval:
+                    time.sleep(0.5)
+                    continue
 
             try:
-                # Collect queued outgoing packets
-                with self._queue_lock:
-                    packets = self._outgoing_queue[:self._max_batch]
-                    self._outgoing_queue = self._outgoing_queue[self._max_batch:]
-                    ack_ids = list(self._ack_ids)
-                    self._ack_ids = []
-
-                body = {
-                    'interface_id': self._interface_id,
-                    'session_token': self._session_token,
-                    'ack_batch_ids': ack_ids,
-                    'max_packets': self._max_batch,
-                    'packets': [base64.b64encode(p).decode('ascii') for p in packets],
-                }
-                if packets:
-                    self._batch_seq += 1
-                    body['batch_id'] = f'rns-post-{int(time.time()*1000)}-{self._batch_seq}'
-
-                resp = self._http_post(f"{self.node_url}/v1/interfaces/exchange", body)
-
-                # Process delivery packets → send them as incoming
-                delivery = resp.get('delivery_packets', [])
-                delivery_batch = resp.get('delivery_batch_id')
-
-                for pkt_b64 in delivery:
-                    if not isinstance(pkt_b64, str) or not pkt_b64:
-                        continue
-                    try:
-                        raw = base64.b64decode(pkt_b64)
-                        self.process_incoming(raw)
-                    except Exception as e:
-                        RNS.log(f"PostInterface[{self.name}]: Failed to decode delivery packet: {e}", RNS.LOG_WARNING)
-
-                if isinstance(delivery_batch, str) and delivery_batch:
-                    self._ack_ids.append(delivery_batch)
-
+                self._do_exchange()
                 last_exchange = now
-
             except Exception as e:
                 RNS.log(f"PostInterface[{self.name}]: Exchange error: {e}", RNS.LOG_WARNING)
-                # Re-queue packets on failure
-                if packets:
-                    with self._queue_lock:
-                        self._outgoing_queue = packets + self._outgoing_queue
                 time.sleep(1)
+
+    def _do_exchange(self):
+        """Perform a single exchange with the PHP node."""
+        with self._queue_lock:
+            packets = self._outgoing_queue[:self._max_batch]
+            self._outgoing_queue = self._outgoing_queue[self._max_batch:]
+            ack_ids = list(self._ack_ids)
+            self._ack_ids = []
+
+        body = {
+            'interface_id': self._interface_id,
+            'session_token': self._session_token,
+            'ack_batch_ids': ack_ids,
+            'max_packets': self._max_batch,
+            'packets': [base64.b64encode(p).decode('ascii') for p in packets],
+        }
+        if packets:
+            self._batch_seq += 1
+            body['batch_id'] = f'rns-post-{int(time.time()*1000)}-{self._batch_seq}'
+
+        resp = self._http_post(f"{self.node_url}/v1/interfaces/exchange", body)
+
+        # Process delivery packets → send them as incoming.
+        delivery = resp.get('delivery_packets', [])
+        delivery_batch = resp.get('delivery_batch_id')
+
+        for pkt_b64 in delivery:
+            if not isinstance(pkt_b64, str) or not pkt_b64:
+                continue
+            try:
+                raw = base64.b64decode(pkt_b64)
+                self.process_incoming(raw)
+            except Exception as e:
+                RNS.log(f"PostInterface[{self.name}]: Failed to decode delivery packet: {e}", RNS.LOG_WARNING)
+
+        if isinstance(delivery_batch, str) and delivery_batch:
+            self._ack_ids.append(delivery_batch)
+
+        return resp
 
     def should_ingress_limit(self):
         return False

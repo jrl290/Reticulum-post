@@ -35,7 +35,12 @@ trait RequestPhpWakeTrait
 
     private function fireAndForgetWake(string $peerUrl, int $timeoutMs): void
     {
-        $wakeUrl = $peerUrl . '/v1/wake';
+        // peerUrl is the base URL. Append /v1/wake unless already present.
+        $peerUrl = rtrim($peerUrl, '/');
+        if (!str_ends_with($peerUrl, '/v1/wake')) {
+            $peerUrl .= '/v1/wake';
+        }
+
         $hostUrl = $this->config['host_url'] ?? ($this->config['http']['advertise_url'] ?? null);
         if (!is_string($hostUrl) || trim($hostUrl) === '') {
             return;
@@ -48,9 +53,9 @@ trait RequestPhpWakeTrait
 
         // Fire-and-forget: short timeout, ignore response.
         if (function_exists('curl_init')) {
-            $this->fireAndForgetWakeWithCurl($wakeUrl, $body, $timeoutMs);
+            $this->fireAndForgetWakeWithCurl($peerUrl, $body, $timeoutMs);
         } else {
-            $this->fireAndForgetWakeWithStream($wakeUrl, $body, $timeoutMs);
+            $this->fireAndForgetWakeWithStream($peerUrl, $body, $timeoutMs);
         }
     }
 
