@@ -5,10 +5,10 @@ declare(strict_types=1);
 namespace ReticulumPhp;
 
 use RuntimeException;
-use PDO;
+use SQLite3;
+use SQLite3Result;
 
 require_once __DIR__ . '/lib/request_runtime.php';
-require_once __DIR__ . '/lib/database.php';
 require_once __DIR__ . '/lib/request_control_plane_trait.php';
 require_once __DIR__ . '/lib/request_debug_report_trait.php';
 require_once __DIR__ . '/lib/request_http_api_helper_trait.php';
@@ -21,11 +21,10 @@ require_once __DIR__ . '/lib/request_maintenance_trait.php';
 require_once __DIR__ . '/lib/request_outbound_batch_trait.php';
 require_once __DIR__ . '/lib/request_packet_ingest_trait.php';
 require_once __DIR__ . '/lib/request_path_state_trait.php';
-require_once __DIR__ . '/lib/request_php_peer_session_trait.php';
 require_once __DIR__ . '/lib/request_relay_routing_trait.php';
 require_once __DIR__ . '/lib/request_schema_trait.php';
 require_once __DIR__ . '/lib/request_wake_dispatch_trait.php';
-require_once __DIR__ . '/lib/request_post_interface_trait.php';
+require_once __DIR__ . '/lib/request_php_wake_trait.php';
 
 // Reticulum-php is request-operated. Queued transport bytes only move during
 // authenticated request/response exchanges. Wake and bridge helpers exist to
@@ -108,22 +107,15 @@ final class Config
     {
         return [
             'storage' => [
-                'backend' => 'mysql',
                 'sqlite_path' => $projectRoot . '/var/reticulum-php.sqlite',
-                'mysql_host' => '127.0.0.1',
-                'mysql_port' => 3306,
-                'mysql_dbname' => 'reticulum_php',
-                'mysql_user' => 'reticulum',
-                'mysql_pass' => '',
                 'log_path' => $projectRoot . '/var/router.log',
             ],
             'http' => [
                 'idle_exchange_interval_ms' => 1000,
                 'max_batch_packets' => 64,
                 'max_packet_bytes' => 512,
-            ],
-            'php' => [
-                'memory_limit' => '128M',
+                'min_wake_interval_ms' => 1000,
+                'wake_timeout_ms' => 500,
             ],
             'maintenance' => [
                 'interface_stale_after_seconds' => 15,
@@ -496,8 +488,6 @@ final class Config
         $config['wake'] = $wakeConfig;
 
         $config = self::normalizeTcpBridgeConfig($projectRoot, $config);
-        $config = self::normalizePhpPeerInterfaces($config);
-        $config = self::normalizePostInterfaceConfig($config);
         return $config;
     }
 
@@ -609,155 +599,6 @@ final class Config
             'wake_profile' => '__tcp_bridge_local__' . $bridgeSlug,
             'wake_target' => $bridgeName,
         ];
-    }
-
-    private static function normalizePhpPeerInterfaces(array $config): array
-    {
-        $interfaces = $config['interfaces'] ?? [];
-        if (!is_array($interfaces)) {
-            throw new RuntimeException('interfaces configuration must be an object');
-        }
-
-        $hostUrl = rtrim(
-            self::optionalConfigString($config, 'host_url')
-                ?? self::optionalConfigString($config['http'] ?? [], 'advertise_url')
-                ?? '',
-            '/'
-        );
-
-        foreach ($interfaces as $interfaceName => $interfaceConfig) {
-            if (!is_array($interfaceConfig)) {
-                throw new RuntimeException('interfaces.' . $interfaceName . ' must be an object');
-            }
-
-            if (self::optionalConfigString($interfaceConfig, 'type') !== 'PhpPeerInterface') {
-                continue;
-            }
-
-            if (!self::interfaceEnabled($interfaceConfig)) {
-                continue;
-            }
-
-            $configPathPrefix = 'interfaces.' . $interfaceName . '.';
-            $interfaceSlug = self::slugify((string) $interfaceName);
-            if ($hostUrl === '') {
-                throw new RuntimeException('host_url is required when PhpPeerInterface is enabled');
-            }
-
-            $targetUrl = rtrim(
-                self::optionalConfigString($interfaceConfig, 'target_url')
-                    ?? self::optionalConfigString($interfaceConfig, 'base_url')
-                    ?? '',
-                '/'
-            );
-            if ($targetUrl === '') {
-                $targetUrl = null;
-            }
-
-            $wakeProfile = self::optionalConfigString($interfaceConfig, 'wake_profile')
-                ?? '__php_peer_http__' . $interfaceSlug;
-            $wakeTarget = self::optionalConfigString($interfaceConfig, 'wake_target')
-                ?? (string) $interfaceName;
-
-            if ($targetUrl !== null) {
-                $interfaceConfig['target_url'] = $targetUrl;
-            } else {
-                unset($interfaceConfig['target_url']);
-            }
-
-            unset($interfaceConfig['base_url'], $interfaceConfig['advertise_url']);
-            $interfaceConfig['wake_profile'] = $wakeProfile;
-            $interfaceConfig['wake_target'] = $wakeTarget;
-            $interfaceConfig['max_batch_packets'] = self::positiveConfigIntOrDefault(
-                $interfaceConfig,
-                'max_batch_packets',
-                $configPathPrefix . 'max_batch_packets',
-                (int) ($config['http']['max_batch_packets'] ?? 64),
-            );
-            $interfaceConfig['http_timeout_seconds'] = self::positiveConfigIntOrDefault(
-                $interfaceConfig,
-                'http_timeout_seconds',
-                $configPathPrefix . 'http_timeout_seconds',
-                5,
-            );
-            $interfaceConfig['connect_timeout_seconds'] = self::positiveConfigIntOrDefault(
-                $interfaceConfig,
-                'connect_timeout_seconds',
-                $configPathPrefix . 'connect_timeout_seconds',
-                5,
-            );
-            $interfaces[(string) $interfaceName] = $interfaceConfig;
-
-            if (isset($config['wake']['profiles'][$wakeProfile])) {
-                continue;
-            }
-
-            $config['wake']['profiles'][$wakeProfile] = [
-                'type' => 'http',
-                'http_timeout_seconds' => (int) $interfaceConfig['http_timeout_seconds'],
-                'connect_timeout_seconds' => (int) $interfaceConfig['connect_timeout_seconds'],
-            ];
-        }
-
-        $config['interfaces'] = $interfaces;
-        if ($hostUrl !== '') {
-            $config['host_url'] = $hostUrl;
-        }
-        return $config;
-    }
-
-    private static function normalizePostInterfaceConfig(array $config): array
-    {
-        $interfaces = $config['interfaces'] ?? [];
-        if (!is_array($interfaces)) {
-            $config['post_interface_peers'] = [];
-            return $config;
-        }
-
-        $peers = [];
-        foreach ($interfaces as $interfaceName => $interfaceConfig) {
-            if (!is_array($interfaceConfig)) {
-                continue;
-            }
-
-            $type = self::optionalConfigString($interfaceConfig, 'type');
-            if ($type !== 'PostInterface') {
-                continue;
-            }
-
-            if (!self::interfaceEnabled($interfaceConfig)) {
-                continue;
-            }
-
-            $peerId = self::slugify((string) $interfaceName);
-            $nodeUrl = self::optionalConfigString($interfaceConfig, 'node_url');
-            if ($nodeUrl === null) {
-                throw new RuntimeException('interfaces.' . $interfaceName . '.node_url is required for PostInterface');
-            }
-
-            $peers[$peerId] = [
-                'name' => (string) $interfaceName,
-                'node_url' => rtrim($nodeUrl, '/'),
-                'bitrate' => self::positiveConfigIntOrDefault($interfaceConfig, 'bitrate', 'interfaces.' . $interfaceName . '.bitrate', 62500),
-                'mtu' => self::positiveConfigIntOrDefault($interfaceConfig, 'mtu', 'interfaces.' . $interfaceName . '.mtu', 500),
-                'max_batch_packets' => self::positiveConfigIntOrDefault($interfaceConfig, 'max_batch_packets', 'interfaces.' . $interfaceName . '.max_batch_packets', (int) ($config['http']['max_batch_packets'] ?? 64)),
-                'http_timeout_seconds' => self::positiveConfigIntOrDefault($interfaceConfig, 'http_timeout_seconds', 'interfaces.' . $interfaceName . '.http_timeout_seconds', 15),
-                'connect_timeout_seconds' => self::positiveConfigIntOrDefault($interfaceConfig, 'connect_timeout_seconds', 'interfaces.' . $interfaceName . '.connect_timeout_seconds', 5),
-            ];
-
-            $wakeUrl = self::optionalConfigString($interfaceConfig, 'wake_url');
-            if ($wakeUrl !== null) {
-                $peers[$peerId]['wake_url'] = rtrim($wakeUrl, '/');
-            }
-
-            $pollInterval = $interfaceConfig['poll_interval_seconds'] ?? null;
-            if ($pollInterval !== null) {
-                $peers[$peerId]['poll_interval_seconds'] = (float) $pollInterval;
-            }
-        }
-
-        $config['post_interface_peers'] = $peers;
-        return $config;
     }
 
     private static function configBoolOrDefault(array $config, string $field, string $label, bool $default): bool
@@ -1248,46 +1089,16 @@ final class WakeConfig
 {
     public static function fromMetadata(array $metadata): ?array
     {
-        // Simple wake_url string — used by PostInterface and other modern clients.
         $wakeUrl = $metadata['wake_url'] ?? null;
-        if (is_string($wakeUrl) && trim($wakeUrl) !== '') {
-            $wakeUrl = rtrim(trim($wakeUrl), '/');
-            return [
-                'profile' => '__http_wake__',
-                'target' => $wakeUrl,
-                'data' => ['wake_url' => $wakeUrl],
-            ];
-        }
-
-        // Legacy nested wake object — used by TcpBridge and PhpPeer.
-        $wake = $metadata['wake'] ?? null;
-        if ($wake === null) {
+        if (!is_string($wakeUrl) || trim($wakeUrl) === '') {
             return null;
         }
 
-        if (!is_array($wake)) {
-            throw new RuntimeException('wake metadata must be an object');
-        }
-
-        $profile = $wake['profile'] ?? null;
-        if (!is_string($profile) || trim($profile) === '') {
-            throw new RuntimeException('wake metadata requires a non-empty profile');
-        }
-
-        $target = $wake['target'] ?? null;
-        if (!is_string($target) || trim($target) === '') {
-            throw new RuntimeException('wake metadata requires a non-empty target');
-        }
-
-        $data = $wake['data'] ?? [];
-        if (!is_array($data)) {
-            throw new RuntimeException('wake metadata data field must be an object');
-        }
-
+        $wakeUrl = rtrim(trim($wakeUrl), '/');
         return [
-            'profile' => trim($profile),
-            'target' => trim($target),
-            'data' => $data,
+            'profile' => '__http_wake__',
+            'target' => $wakeUrl,
+            'data' => ['wake_url' => $wakeUrl],
         ];
     }
 }
@@ -1403,38 +1214,27 @@ final class HttpWakeProvider implements WakeProvider
     public function dispatch(array $profile, array $event): array
     {
         $wakeData = $event['wake_data'] ?? null;
-        $wakeData = is_array($wakeData) ? $wakeData : [];
-
-        // New model: wake_data contains wake_url (PostInterface, generic HTTP wake).
-        // POST {wake_url}/v1/wake with waker_url set to our host_url.
-        $wakeUrl = $wakeData['wake_url'] ?? null;
-        if (is_string($wakeUrl) && trim($wakeUrl) !== '') {
-            $url = rtrim(trim($wakeUrl), '/') . '/v1/wake';
-            $hostUrl = $profile['host_url'] ?? $wakeUrl;
-            $payload = [
-                'waker_url' => rtrim(trim((string) $hostUrl), '/'),
-                'queue_reason' => (string) ($event['queue_reason'] ?? ''),
-                'queued_packet_count' => (int) ($event['queued_packet_count'] ?? 0),
-            ];
-        } else {
-            // Old model: profile.url or wake_data.peer_url (PhpPeer).
-            $url = $profile['url'] ?? null;
-            if (!is_string($url) || trim($url) === '') {
-                $peerUrl = $wakeData['peer_url'] ?? null;
-                if (!is_string($peerUrl) || trim($peerUrl) === '') {
-                    throw new RuntimeException('http wake profile requires wake_data.wake_url or wake_data.peer_url');
-                }
-                $url = rtrim(trim($peerUrl), '/') . '/v1/php-peers/wake';
-            }
-
-            $payload = [
-                'target' => (string) ($event['wake_target'] ?? ''),
-                'data' => $wakeData,
-                'queue_reason' => (string) ($event['queue_reason'] ?? ''),
-                'queued_packet_count' => (int) ($event['queued_packet_count'] ?? 0),
-                'wake_event_id' => (int) ($event['wake_event_id'] ?? 0),
-            ];
+        if (!is_array($wakeData)) {
+            throw new RuntimeException('http wake requires wake_data with wake_url');
         }
+
+        $wakeUrl = $wakeData['wake_url'] ?? null;
+        if (!is_string($wakeUrl) || trim($wakeUrl) === '') {
+            throw new RuntimeException('http wake requires wake_data.wake_url');
+        }
+
+        $url = rtrim(trim($wakeUrl), '/') . '/v1/wake';
+
+        $hostUrl = $profile['host_url'] ?? null;
+        if (!is_string($hostUrl) || trim($hostUrl) === '') {
+            $hostUrl = $wakeData['host_url'] ?? $wakeUrl;
+        }
+
+        $payload = [
+            'waker_url' => rtrim(trim((string) $hostUrl), '/'),
+            'queue_reason' => (string) ($event['queue_reason'] ?? ''),
+            'queued_packet_count' => (int) ($event['queued_packet_count'] ?? 0),
+        ];
 
         $response = $this->requestJson(
             trim($url),
@@ -1546,13 +1346,13 @@ final class WakeDispatcher
             return null;
         }
 
-        (new self($config))->profileConfig((string) $wakeConfig['profile']);
         return $wakeConfig;
     }
 
     public function dispatch(array $event): array
     {
-        $profile = $this->profileConfig((string) ($event['wake_profile'] ?? ''));
+        $profileName = (string) ($event['wake_profile'] ?? '');
+        $profile = $this->profileConfig($profileName);
 
         return match ($profile['type']) {
             'log' => (new LogWakeProvider())->dispatch($profile, $event),
@@ -1607,19 +1407,19 @@ final class Storage
     use RequestOutboundBatchTrait;
     use RequestPacketIngestTrait;
     use RequestPathStateTrait;
-    use RequestPhpPeerSessionTrait;
     use RequestRelayRoutingTrait;
     use RequestSchemaTrait;
     use RequestWakeDispatchTrait;
-    use RequestPostInterfaceTrait;
+    use RequestPhpWakeTrait;
 
-    private PDO $db;
-    private string $backend;
+    private SQLite3 $db;
 
     public function __construct(private readonly array $config)
     {
-        $this->backend = Database::backend($config);
-        $this->db = Database::connect($config);
+        $path = (string) $this->config['storage']['sqlite_path'];
+        $this->db = new SQLite3($path);
+        $this->db->enableExceptions(true);
+        $this->db->busyTimeout(5000);
     }
 
 }
@@ -1639,15 +1439,37 @@ final class HttpApi
         try {
             $path = $this->normalizedPath($uri, $server);
 
+            // Handle CORS preflight
+            if ($method === 'OPTIONS') {
+                $this->respond(204, []);
+            }
+
+            if ($method === 'GET' && $path === '/v1/initialize') {
+                $summary = $this->storage->initializeNode();
+
+                // Clear opcache so the new code is picked up.
+                if (function_exists('opcache_reset')) {
+                    opcache_reset();
+                }
+
+                $this->respond(200, $summary);
+            }
+
+            if ($method === 'GET' && $path === '/v1/monitor') {
+                $this->renderMonitorPage();
+            }
+
+            if ($method === 'GET' && ($path === '/v1/monitor/data' || $path === '/v1/monitor/json')) {
+                $this->respond(200, $this->storage->monitorData());
+            }
+
             if ($method === 'GET' && $path === '/health') {
                 $this->respond(200, [
                     'status' => 'ok',
                     'transport_basis' => requestTransportMechanism(),
                     'environment' => Environment::verify(),
                     'queues' => $this->storage->healthSummary(),
-                    'db_size' => $this->storage->healthDbSize(),
                     'php_interface_registry' => $this->storage->healthInterfaceRegistry(5),
-                    'post_interface_peers' => $this->storage->postInterfacePeerSummary(),
                 ]);
             }
 
@@ -1676,34 +1498,44 @@ final class HttpApi
                 $bitrate = $this->requirePositiveInt($body, 'bitrate');
                 $mtu = $this->requirePositiveInt($body, 'mtu');
                 $metadata = $this->optionalArray($body, 'metadata');
-                try {
+                $isPhpPeer = ($metadata['client'] ?? null) === 'reticulum-php';
+
+                if (!$isPhpPeer) {
+                    try {
+                        $maxPacketBytes = $this->storage->maxPacketBytesForMetadata($metadata);
+                        WakeDispatcher::validateMetadata($metadata, $this->config);
+                    } catch (RuntimeException $error) {
+                        throw new ApiError(400, $error->getMessage(), ['error' => $error->getMessage()]);
+                    }
+                } else {
                     $maxPacketBytes = $this->storage->maxPacketBytesForMetadata($metadata);
-                    WakeDispatcher::validateMetadata($metadata, $this->config);
-                } catch (RuntimeException $error) {
-                    throw new ApiError(400, $error->getMessage(), ['error' => $error->getMessage()]);
                 }
 
                 $registration = $this->storage->registerInterface($name, $bitrate, $mtu, $metadata);
-                $this->respond(200, [
+                $response = [
                     'status' => 'registered',
                     'interface_id' => $registration['interface_id'],
                     'session_token' => $registration['session_token'],
                     'idle_exchange_interval_ms' => $this->idleExchangeIntervalMs(),
                     'max_batch_packets' => (int) $this->config['http']['max_batch_packets'],
                     'max_packet_bytes' => $maxPacketBytes,
-                ]);
+                ];
+
+                if (isset($registration['peer_interface_id'])) {
+                    $response['peer_interface_id'] = $registration['peer_interface_id'];
+                }
+                if (isset($registration['peer_session_token'])) {
+                    $response['peer_session_token'] = $registration['peer_session_token'];
+                }
+
+                $this->respond(200, $response);
             }
 
             if ($method === 'POST' && ($path === '/v1/interfaces/exchange' || $path === '/v1/interfaces/tx')) {
                 $body = $this->readJsonBody();
                 [$interfaceId, $sessionToken] = $this->requireInterfaceCredentials($body);
                 $this->storage->authenticateInterface($interfaceId, $sessionToken);
-                // Skip PostInterface exchange in the exchange handler itself.
-                // The exchange response already carries delivery packets back
-                // to the caller.  Triggering another outbound exchange here
-                // creates an exchange→exchange→exchange cascade that burns
-                // cPanel entry processes (508 Resource Limit Reached).
-                $this->runInterfaceRequestPrelude(skipPostInterfaceExchange: true);
+                $this->runInterfaceRequestPrelude();
                 $ackBatchIds = $this->optionalStringArray($body, 'ack_batch_ids');
                 $requestedMaxPackets = $body['max_packets'] ?? (int) $this->config['http']['max_batch_packets'];
                 $maxPackets = min($this->requirePositiveIntValue($requestedMaxPackets, 'max_packets'), (int) $this->config['http']['max_batch_packets']);
@@ -1727,31 +1559,6 @@ final class HttpApi
                 }
 
                 $delivery = $this->storage->fetchOutboundBatch($interfaceId, $maxPackets);
-
-                // Also include packets from any PostInterface peer whose
-                // registered interface matches the authenticated one.
-                // This ensures the transport pipe flushes both ways.
-                foreach (($this->config['post_interface_peers'] ?? []) as $peerId => $peerConfig) {
-                    if (!is_array($peerConfig)) {
-                        continue;
-                    }
-                    $piLocalIface = $this->storage->postInterfaceLocalInterfaceId($peerId);
-                    if ($piLocalIface === $interfaceId) {
-                        continue; // already fetched above
-                    }
-                    $remaining = $maxPackets - count($delivery['packets']);
-                    if ($remaining <= 0) {
-                        break;
-                    }
-                    $piDelivery = $this->storage->fetchOutboundBatch($piLocalIface, $remaining);
-                    if (($piDelivery['packets'] ?? []) !== []) {
-                        $delivery['packets'] = array_merge($delivery['packets'], $piDelivery['packets']);
-                        if ($delivery['batch_id'] === null && $piDelivery['batch_id'] !== null) {
-                            $delivery['batch_id'] = $piDelivery['batch_id'];
-                        }
-                        $delivery['more'] = $delivery['more'] || ($piDelivery['more'] ?? false);
-                    }
-                }
                 $this->runInterfaceRequestEpilogue();
 
                 $this->respond(200, [
@@ -1770,107 +1577,21 @@ final class HttpApi
                 ]);
             }
 
-            if ($method === 'POST' && $path === '/v1/php-peers/negotiate') {
+            if ($method === 'POST' && $path === '/v1/wake') {
                 $body = $this->readJsonBody();
-                $peerUrl = rtrim($this->requireNonEmptyString($body, 'peer_url'), '/');
-                $peerName = $this->optionalNonEmptyString($body, 'peer_name');
-                $resolvedPeer = resolvePhpPeerInboundSession($this->config, $this->storage, $peerUrl, $peerName);
-                if ($resolvedPeer === null) {
-                    throw new ApiError(404, 'unknown PHP peer remote url: ' . $peerUrl, [
-                        'error' => 'unknown PHP peer remote url',
-                        'remote_url' => $peerUrl,
-                    ]);
+                $wakerUrl = $this->optionalNonEmptyString($body, 'waker_url');
+                if ($wakerUrl === null) {
+                    throw new ApiError(400, 'wake requires waker_url', ['error' => 'wake requires waker_url']);
                 }
 
-                /** @var PhpPeerConfig $peerConfig */
-                $peerConfig = $resolvedPeer['config'];
-                /** @var array{local_interface_id:string,local_session_token:string,peer_name:string,remote_url:?string} $localSession */
-                $localSession = $resolvedPeer['session'];
-
-                $this->runInterfaceRequestPrelude();
-                $ackBatchIds = $this->optionalStringArray($body, 'ack_batch_ids');
-                $requestedMaxPackets = $body['max_packets'] ?? $peerConfig->maxBatchPackets;
-                $maxPackets = min($this->requirePositiveIntValue($requestedMaxPackets, 'max_packets'), $peerConfig->maxBatchPackets);
-                $packets = $this->requirePacketArray($body, 'packets', (string) $localSession['local_interface_id']);
-                $batchId = $packets === []
-                    ? $this->optionalNonEmptyString($body, 'batch_id')
-                    : $this->requireNonEmptyString($body, 'batch_id');
-                $acked = $this->storage->acknowledgeOutboundBatches((string) $localSession['local_interface_id'], $ackBatchIds);
-                $processing = null;
-                $processedInline = false;
-                $tx = [
-                    'duplicate_batch' => false,
-                    'accepted_packets' => 0,
-                    'accepted_bytes' => 0,
-                ];
-
-                if ($packets !== []) {
-                    $tx = $this->storage->ingestInboundBatchInline(
-                        (string) $localSession['local_interface_id'],
-                        (string) $batchId,
-                        $packets,
-                    );
-                    $processing = $tx['processing'];
-                    $processedInline = $tx['duplicate_batch'] !== true;
-                }
-
-                $delivery = $this->storage->fetchOutboundBatch((string) $localSession['local_interface_id'], $maxPackets);
-                $this->runInterfaceRequestEpilogue();
+                // The wake caller has already dropped the connection.
+                // We call the peer's exchange endpoint inline to pull any pending packets.
+                $result = $this->storage->exchangeWithPhpPeer($wakerUrl);
 
                 $this->respond(200, [
-                    'status' => 'negotiated',
-                    'interface_id' => $localSession['local_interface_id'],
-                    'session_token' => $localSession['local_session_token'],
-                    'peer_url' => $peerConfig->hostUrl,
-                    'idle_exchange_interval_ms' => $this->idleExchangeIntervalMs(),
-                    'max_batch_packets' => $peerConfig->maxBatchPackets,
-                    'max_packet_bytes' => $this->storage->maxPacketBytesForInterface((string) $localSession['local_interface_id']),
-                    'batch_id' => $batchId,
-                    'duplicate_batch' => $tx['duplicate_batch'],
-                    'accepted_packets' => $tx['accepted_packets'],
-                    'accepted_bytes' => $tx['accepted_bytes'],
-                    'processed_inline' => $processedInline,
-                    'processing' => $processing,
-                    'acked_batches' => $acked,
-                    'delivery_batch_id' => $delivery['batch_id'],
-                    'delivery_packets' => $delivery['packets'],
-                    'delivery_more' => $delivery['more'],
-                ]);
-            }
-
-            if ($method === 'POST' && $path === '/v1/php-peers/wake') {
-                $body = $this->readJsonBody();
-                $wakeData = $this->optionalArray($body, 'data');
-                $callerUrl = $wakeData['local_url'] ?? null;
-                if (!is_string($callerUrl) || trim($callerUrl) === '') {
-                    throw new ApiError(400, 'wake data requires local_url', ['error' => 'wake data requires local_url']);
-                }
-
-                $callerUrl = rtrim(trim($callerUrl), '/');
-                $peerName = is_string($wakeData['peer_name'] ?? null) && trim((string) $wakeData['peer_name']) !== ''
-                    ? trim((string) $wakeData['peer_name'])
-                    : null;
-                $resolvedPeer = resolvePhpPeerInboundSession($this->config, $this->storage, $callerUrl, $peerName);
-                if ($resolvedPeer === null) {
-                    throw new ApiError(404, 'unknown PHP peer remote url: ' . $callerUrl, [
-                        'error' => 'unknown PHP peer remote url',
-                        'remote_url' => $callerUrl,
-                    ]);
-                }
-
-                /** @var PhpPeerConfig $peerConfig */
-                $peerConfig = $resolvedPeer['config'];
-                /** @var array{local_interface_id:string,local_session_token:string,peer_name:string,remote_url:?string} $localSession */
-                $localSession = $resolvedPeer['session'];
-
-                $this->runInterfaceRequestPrelude();
-                $sync = (new PhpPeerSync($this->config, $peerConfig, $this->storage, (string) $localSession['local_interface_id']))->run();
-                $this->runInterfaceRequestEpilogue();
-
-                $this->respond(200, [
-                    'status' => 'synced',
-                    'peer' => $peerConfig->name,
-                    'sync' => $sync,
+                    'status' => 'ok',
+                    'waker_url' => $wakerUrl,
+                    'exchange' => $result,
                 ]);
             }
 
@@ -1896,35 +1617,6 @@ final class HttpApi
                 ]);
             }
 
-            if ($method === 'POST' && $path === '/v1/wake') {
-                $body = $this->readJsonBody();
-                $wakerUrl = $this->optionalNonEmptyString($body, 'waker_url');
-                if ($wakerUrl === null) {
-                    throw new ApiError(400, 'wake requires waker_url', ['error' => 'wake requires waker_url']);
-                }
-
-                $this->runInterfaceRequestPrelude();
-                // If the waker is a known PostInterface peer, queue an async
-                // wake event so the exchange happens in a separate process.
-                $peerId = $this->storage->postInterfacePeerIdForWakerUrl($wakerUrl);
-                $postInterfaceResult = ['status' => 'ignored', 'reason' => 'unknown_waker'];
-                if ($peerId !== null) {
-                    $this->storage->queuePostInterfaceWakeEvent($peerId, $wakerUrl);
-                    $postInterfaceResult = ['status' => 'queued', 'peer_id' => $peerId];
-                }
-                $this->runInterfaceRequestEpilogue();
-
-                $responsePayload = [
-                    'status' => 'awake',
-                    'waker_url' => $wakerUrl,
-                ];
-                if (($postInterfaceResult['status'] ?? '') !== 'ignored') {
-                    $responsePayload['post_interface_wake'] = $postInterfaceResult;
-                }
-
-                $this->respond(200, $responsePayload);
-            }
-
             throw new ApiError(404, 'Not found', ['error' => 'not found']);
         } catch (ApiError $error) {
             $payload = $error->payload;
@@ -1933,652 +1625,9 @@ final class HttpApi
             }
             $this->respond($error->statusCode, $payload);
         } catch (\Throwable $error) {
-            $this->log('error', 'Unhandled HTTP exception: ' . $error->getMessage() . ' in ' . $error->getFile() . ':' . $error->getLine());
-            $this->respond(500, [
-                'error' => 'internal error',
-                'detail' => $error->getMessage(),
-                'exception' => get_class($error),
-                'file' => basename($error->getFile()),
-                'line' => $error->getLine(),
-            ]);
+            $this->log('error', 'Unhandled HTTP exception: ' . $error->getMessage());
+            $this->respond(500, ['error' => 'internal error']);
         }
-    }
-}
-
-final class PhpPeerConfig
-{
-    public function __construct(
-        public readonly string $name,
-        public readonly ?string $targetUrl,
-        public readonly string $hostUrl,
-        public readonly int $bitrate,
-        public readonly int $mtu,
-        public readonly int $maxBatchPackets,
-        public readonly int $httpTimeoutSeconds,
-        public readonly int $connectTimeoutSeconds,
-        public readonly string $wakeProfile,
-        public readonly string $wakeTarget,
-    ) {
-    }
-
-    /** @return array<string, self> */
-    public static function all(array $config): array
-    {
-        $interfaces = $config['interfaces'] ?? [];
-        if (!is_array($interfaces)) {
-            throw new RuntimeException('interfaces configuration must be an object');
-        }
-
-        $peers = [];
-        $hostUrl = null;
-        foreach ($interfaces as $interfaceName => $interfaceConfig) {
-            if (!is_array($interfaceConfig)) {
-                throw new RuntimeException('interfaces.' . $interfaceName . ' must be an object');
-            }
-
-            if (self::optionalString($interfaceConfig, 'type') !== 'PhpPeerInterface') {
-                continue;
-            }
-
-            if (!self::interfaceEnabled($interfaceConfig)) {
-                continue;
-            }
-
-            if ($hostUrl === null) {
-                $hostUrl = self::normalizedHostUrl($config);
-            }
-
-            $targetUrl = self::optionalString($interfaceConfig, 'target_url')
-                ?? self::optionalString($interfaceConfig, 'base_url');
-
-            $peers[(string) $interfaceName] = new self(
-                (string) $interfaceName,
-                $targetUrl === null ? null : self::normalizeUrl($targetUrl),
-                $hostUrl,
-                self::positiveIntOrDefault($interfaceConfig, 'bitrate', 62500, $interfaceName),
-                self::positiveIntOrDefault($interfaceConfig, 'mtu', 500, $interfaceName),
-                self::positiveIntOrDefault($interfaceConfig, 'max_batch_packets', (int) ($config['http']['max_batch_packets'] ?? 64), $interfaceName),
-                self::positiveIntOrDefault($interfaceConfig, 'http_timeout_seconds', 5, $interfaceName),
-                self::positiveIntOrDefault($interfaceConfig, 'connect_timeout_seconds', 5, $interfaceName),
-                self::optionalString($interfaceConfig, 'wake_profile') ?? '__php_peer_http__' . self::slugify((string) $interfaceName),
-                self::optionalString($interfaceConfig, 'wake_target') ?? (string) $interfaceName,
-            );
-        }
-
-        return $peers;
-    }
-
-    public static function requireByName(array $config, string $peerName): self
-    {
-        $peers = self::all($config);
-        if (!isset($peers[$peerName])) {
-            throw new RuntimeException('unknown PHP peer: ' . $peerName);
-        }
-
-        return $peers[$peerName];
-    }
-
-    public static function requireByRemoteUrl(array $config, Storage $storage, string $remoteUrl): self
-    {
-        $peerConfig = self::findByRemoteUrl($config, $storage, $remoteUrl);
-        if ($peerConfig !== null) {
-            return $peerConfig;
-        }
-
-        throw new RuntimeException('unknown PHP peer remote url: ' . $remoteUrl);
-    }
-
-    public static function findByRemoteUrl(array $config, Storage $storage, string $remoteUrl): ?self
-    {
-        $remoteUrl = self::normalizeUrl($remoteUrl);
-        foreach (self::all($config) as $peerConfig) {
-            if ($peerConfig->targetUrl !== null && self::normalizeUrl($peerConfig->targetUrl) === $remoteUrl) {
-                return $peerConfig;
-            }
-
-            $knownRemoteUrl = $storage->phpPeerRemoteUrl($peerConfig->name);
-            if ($knownRemoteUrl !== null && self::normalizeUrl($knownRemoteUrl) === $remoteUrl) {
-                return $peerConfig;
-            }
-        }
-
-        return null;
-    }
-
-    public static function resolveInboundPeer(array $config, Storage $storage, string $remoteUrl, ?string $peerName): ?self
-    {
-        $matchedPeer = self::findByRemoteUrl($config, $storage, $remoteUrl);
-        if ($matchedPeer !== null) {
-            return $matchedPeer;
-        }
-
-        $requestedPeerName = $peerName === null ? null : trim($peerName);
-        $openPeers = [];
-
-        foreach (self::all($config) as $peerConfig) {
-            if ($peerConfig->targetUrl !== null) {
-                continue;
-            }
-
-            if ($requestedPeerName !== null && $requestedPeerName !== '' && $peerConfig->name === $requestedPeerName) {
-                return $peerConfig;
-            }
-
-            $openPeers[] = $peerConfig;
-        }
-
-        return count($openPeers) === 1 ? $openPeers[0] : null;
-    }
-
-    public static function fromInterfaceMetadata(array $metadata, ?string $fallbackName = null): ?self
-    {
-        $phpPeer = $metadata['php_peer'] ?? null;
-        if (!is_array($phpPeer)) {
-            return null;
-        }
-
-        $name = self::optionalString($phpPeer, 'peer_name');
-        if ($name === null) {
-            $name = $fallbackName === null ? null : trim($fallbackName);
-        }
-        $peerUrl = self::optionalString($phpPeer, 'peer_url');
-        $hostUrl = self::optionalString($phpPeer, 'host_url');
-        if ($name === null || $peerUrl === null || $hostUrl === null) {
-            return null;
-        }
-
-        return new self(
-            $name,
-            self::normalizeUrl($peerUrl),
-            self::normalizeUrl($hostUrl),
-            self::positiveIntOrDefault($phpPeer, 'bitrate', 62500, $name),
-            self::positiveIntOrDefault($phpPeer, 'mtu', 500, $name),
-            self::positiveIntOrDefault($phpPeer, 'max_batch_packets', 64, $name),
-            self::positiveIntOrDefault($phpPeer, 'http_timeout_seconds', 5, $name),
-            self::positiveIntOrDefault($phpPeer, 'connect_timeout_seconds', 5, $name),
-            self::optionalString($phpPeer, 'wake_profile') ?? '__php_peer_http__' . self::slugify($name),
-            self::optionalString($phpPeer, 'wake_target') ?? $name,
-        );
-    }
-
-    public function interfaceMetadata(string $peerUrl): array
-    {
-        $peerUrl = self::normalizeUrl($peerUrl);
-        return [
-            'client' => 'reticulum-php',
-            'transport' => 'php-peer-exchange',
-            'implementation' => 'PhpPeerInterface',
-            'mode' => 'full',
-            'php_peer' => [
-                'peer_name' => $this->name,
-                'peer_url' => $peerUrl,
-                'host_url' => $this->hostUrl,
-                'bitrate' => $this->bitrate,
-                'mtu' => $this->mtu,
-                'max_batch_packets' => $this->maxBatchPackets,
-                'http_timeout_seconds' => $this->httpTimeoutSeconds,
-                'connect_timeout_seconds' => $this->connectTimeoutSeconds,
-                'wake_profile' => $this->wakeProfile,
-                'wake_target' => $this->wakeTarget,
-            ],
-            'wake' => [
-                'profile' => $this->wakeProfile,
-                'target' => $this->wakeTarget,
-                'data' => [
-                    'peer_name' => $this->name,
-                    'peer_url' => $peerUrl,
-                    'local_url' => $this->hostUrl,
-                ],
-            ],
-        ];
-    }
-
-    public function interfaceNameForRemote(string $peerUrl): string
-    {
-        $peerUrl = self::normalizeUrl($peerUrl);
-        if ($this->targetUrl !== null && self::normalizeUrl($this->targetUrl) === $peerUrl) {
-            return $this->name;
-        }
-
-        $host = parse_url($peerUrl, PHP_URL_HOST);
-        $suffix = substr(hash('sha256', $peerUrl), 0, 8);
-        if (is_string($host) && $host !== '') {
-            return $this->name . ' (' . $host . ' ' . $suffix . ')';
-        }
-
-        return $this->name . ' (' . $suffix . ')';
-    }
-
-    private static function requireString(array $config, string $field, string $interfaceName): string
-    {
-        $value = self::optionalString($config, $field);
-        if ($value === null) {
-            throw new RuntimeException('interfaces.' . $interfaceName . '.' . $field . ' is required');
-        }
-
-        return $value;
-    }
-
-    private static function optionalString(array $config, string $field): ?string
-    {
-        $value = $config[$field] ?? null;
-        if ($value === null) {
-            return null;
-        }
-
-        if (!is_string($value)) {
-            throw new RuntimeException('interfaces.' . $field . ' must be a string');
-        }
-
-        $value = trim($value);
-        return $value === '' ? null : $value;
-    }
-
-    private static function positiveIntOrDefault(array $config, string $field, int $default, string $interfaceName): int
-    {
-        if (!array_key_exists($field, $config)) {
-            return $default;
-        }
-
-        $value = $config[$field] ?? null;
-        if (!is_int($value) && !is_string($value) && !is_float($value)) {
-            throw new RuntimeException('interfaces.' . $interfaceName . '.' . $field . ' must be numeric');
-        }
-
-        $value = (int) $value;
-        if ($value <= 0) {
-            throw new RuntimeException('interfaces.' . $interfaceName . '.' . $field . ' must be positive');
-        }
-
-        return $value;
-    }
-
-    private static function interfaceEnabled(array $config): bool
-    {
-        if (!array_key_exists('enabled', $config)) {
-            return true;
-        }
-
-        $value = $config['enabled'];
-        if (is_bool($value)) {
-            return $value;
-        }
-
-        if (is_int($value) || is_float($value)) {
-            return (int) $value !== 0;
-        }
-
-        if (is_string($value)) {
-            $normalized = strtolower(trim($value));
-            return !in_array($normalized, ['', '0', 'false', 'no', 'off'], true);
-        }
-
-        throw new RuntimeException('interfaces.enabled must be a boolean-like value');
-    }
-
-    private static function slugify(string $value): string
-    {
-        $slug = preg_replace('/[^a-z0-9]+/i', '-', strtolower($value)) ?? '';
-        $slug = trim($slug, '-');
-        return $slug === '' ? 'php-peer' : $slug;
-    }
-
-    public static function normalizeUrl(string $value): string
-    {
-        return rtrim(trim($value), '/');
-    }
-
-    private static function normalizedHostUrl(array $config): string
-    {
-        $hostUrl = $config['host_url'] ?? (($config['http']['advertise_url'] ?? null));
-        if (!is_string($hostUrl) || trim($hostUrl) === '') {
-            throw new RuntimeException('host_url is required when PhpPeerInterface is enabled');
-        }
-
-        return self::normalizeUrl($hostUrl);
-    }
-}
-
-final class PhpPeerRemoteClient
-{
-    private int $batchSequence = 0;
-    private ?string $remoteInterfaceId = null;
-    private ?string $remoteSessionToken = null;
-    private string $remoteBaseUrl;
-    private int $maxBatchPackets;
-
-    public function __construct(private readonly PhpPeerConfig $config)
-    {
-        $this->remoteBaseUrl = $config->targetUrl ?? '';
-        $this->maxBatchPackets = $config->maxBatchPackets;
-    }
-
-    public function negotiate(array $packets = [], array $ackBatchIds = []): array
-    {
-        if ($this->config->targetUrl === null || $this->config->targetUrl === '') {
-            throw new RuntimeException('PHP peer negotiation requires a known remote target_url');
-        }
-
-        $payload = [
-            'peer_name' => $this->config->name,
-            'peer_url' => $this->config->hostUrl,
-            'ack_batch_ids' => array_values($ackBatchIds),
-            'max_packets' => $this->maxBatchPackets,
-            'packets' => array_values($packets),
-        ];
-        if ($packets !== []) {
-            $payload['batch_id'] = $this->nextBatchId();
-        }
-
-        $response = $this->requestJson('POST', '/v1/php-peers/negotiate', $payload, $this->config->targetUrl);
-
-        $this->remoteInterfaceId = $this->requireResponseString($response, 'interface_id');
-        $this->remoteSessionToken = $this->requireResponseString($response, 'session_token');
-
-        $peerUrl = $response['peer_url'] ?? $this->config->targetUrl;
-        if (!is_string($peerUrl) || trim($peerUrl) === '') {
-            throw new RuntimeException('PHP peer negotiation response is missing peer_url');
-        }
-
-        $this->remoteBaseUrl = rtrim(trim($peerUrl), '/');
-        $this->maxBatchPackets = max(1, min($this->config->maxBatchPackets, (int) ($response['max_batch_packets'] ?? $this->maxBatchPackets)));
-
-        return $response;
-    }
-
-    public function exchange(array $packets, array $ackBatchIds): array
-    {
-        if ($this->remoteInterfaceId === null || $this->remoteSessionToken === null) {
-            throw new RuntimeException('PHP peer session has not been negotiated');
-        }
-
-        $payload = [
-            'interface_id' => $this->remoteInterfaceId,
-            'session_token' => $this->remoteSessionToken,
-            'ack_batch_ids' => array_values($ackBatchIds),
-            'max_packets' => $this->maxBatchPackets,
-            'packets' => array_values($packets),
-        ];
-        if ($packets !== []) {
-            $payload['batch_id'] = $this->nextBatchId();
-        }
-
-        return $this->requestJson('POST', '/v1/interfaces/exchange', $payload);
-    }
-
-    private function nextBatchId(): string
-    {
-        $this->batchSequence++;
-        return sprintf('php-peer-%d-%08x', (int) (microtime(true) * 1000), $this->batchSequence);
-    }
-
-    public function remoteBaseUrl(): string
-    {
-        return $this->remoteBaseUrl;
-    }
-
-    private function requireResponseString(array $response, string $field): string
-    {
-        $value = $response[$field] ?? null;
-        if (!is_string($value) || trim($value) === '') {
-            throw new RuntimeException('PHP peer negotiation response is missing ' . $field);
-        }
-
-        return trim($value);
-    }
-
-    private function requestJson(string $method, string $path, array $payload, ?string $baseUrl = null): array
-    {
-        $url = ($baseUrl ?? $this->remoteBaseUrl) . $path;
-        $headers = ['Content-Type: application/json'];
-        $body = json_encode($payload, JSON_THROW_ON_ERROR);
-
-        if (function_exists('curl_init')) {
-            return $this->requestJsonWithCurl($url, $method, $headers, $body);
-        }
-
-        return $this->requestJsonWithStreams($url, $method, $headers, $body);
-    }
-
-    private function requestJsonWithCurl(string $url, string $method, array $headers, string $body): array
-    {
-        $curl = curl_init($url);
-        if ($curl === false) {
-            throw new RuntimeException('Unable to initialise cURL for PHP peer request');
-        }
-
-        curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
-        curl_setopt($curl, CURLOPT_CUSTOMREQUEST, $method);
-        curl_setopt($curl, CURLOPT_HTTPHEADER, $headers);
-        curl_setopt($curl, CURLOPT_TIMEOUT, $this->config->httpTimeoutSeconds);
-        curl_setopt($curl, CURLOPT_CONNECTTIMEOUT, $this->config->connectTimeoutSeconds);
-        curl_setopt($curl, CURLOPT_POSTFIELDS, $body);
-
-        $responseBody = curl_exec($curl);
-        if ($responseBody === false) {
-            $error = curl_error($curl);
-            throw new RuntimeException('PHP peer request failed: ' . $error);
-        }
-
-        $statusCode = (int) curl_getinfo($curl, CURLINFO_RESPONSE_CODE);
-
-        if ($statusCode < 200 || $statusCode >= 300) {
-            throw new RuntimeException('PHP peer request returned ' . $statusCode . ': ' . $responseBody);
-        }
-
-        $decoded = json_decode($responseBody, true, flags: JSON_THROW_ON_ERROR);
-        if (!is_array($decoded)) {
-            throw new RuntimeException('PHP peer response was not a JSON object');
-        }
-
-        return $decoded;
-    }
-
-    private function requestJsonWithStreams(string $url, string $method, array $headers, string $body): array
-    {
-        $context = stream_context_create([
-            'http' => [
-                'method' => $method,
-                'header' => implode("\r\n", $headers),
-                'content' => $body,
-                'timeout' => $this->config->httpTimeoutSeconds,
-                'ignore_errors' => true,
-            ],
-        ]);
-
-        $responseBody = @file_get_contents($url, false, $context);
-        if ($responseBody === false) {
-            $error = error_get_last();
-            throw new RuntimeException('PHP peer request failed: ' . ($error['message'] ?? 'unknown error'));
-        }
-
-        $headersResponse = $http_response_header ?? [];
-        $statusCode = 0;
-        if (isset($headersResponse[0]) && preg_match('/\s(\d{3})\s/', $headersResponse[0], $matches) === 1) {
-            $statusCode = (int) $matches[1];
-        }
-
-        if ($statusCode < 200 || $statusCode >= 300) {
-            throw new RuntimeException('PHP peer request returned ' . $statusCode . ': ' . $responseBody);
-        }
-
-        $decoded = json_decode($responseBody, true, flags: JSON_THROW_ON_ERROR);
-        if (!is_array($decoded)) {
-            throw new RuntimeException('PHP peer response was not a JSON object');
-        }
-
-        return $decoded;
-    }
-}
-
-final class PhpPeerSync
-{
-    public function __construct(
-        private readonly array $runtimeConfig,
-        private readonly PhpPeerConfig $config,
-        private readonly Storage $storage,
-        private readonly string $localInterfaceId,
-    ) {
-    }
-
-    public function run(): array
-    {
-        return $this->runWithBudget(64, false);
-    }
-
-    public function runPartial(int $maxRequests): array
-    {
-        return $this->runWithBudget(max(1, $maxRequests), true);
-    }
-
-    private function runWithBudget(int $maxRequests, bool $allowPartial): array
-    {
-        $client = new PhpPeerRemoteClient($this->config);
-        $pendingAckBatchIds = [];
-        $summary = [
-            'peer' => $this->config->name,
-            'negotiated_peer_url' => null,
-            'requests' => 0,
-            'outbound_batches' => 0,
-            'outbound_packets' => 0,
-            'acked_batches' => 0,
-            'delivery_batches' => 0,
-            'delivery_packets' => 0,
-            'accepted_packets' => 0,
-            'accepted_bytes' => 0,
-            'processing' => [],
-        ];
-
-        $outbound = $this->storage->fetchOutboundBatch($this->localInterfaceId, $this->config->maxBatchPackets);
-        $outboundBatchId = is_string($outbound['batch_id'] ?? null) ? (string) $outbound['batch_id'] : null;
-        $packets = $this->packetStrings($outbound['packets'] ?? []);
-        $hadLocalMore = (bool) ($outbound['more'] ?? false);
-        if ($packets !== []) {
-            $summary['outbound_batches']++;
-            $summary['outbound_packets'] += count($packets);
-        }
-
-        $response = $client->negotiate($packets, $pendingAckBatchIds);
-        $remoteBaseUrl = $client->remoteBaseUrl();
-        $this->storage->setPhpPeerRemoteUrlByInterfaceId($this->localInterfaceId, $remoteBaseUrl);
-        $localSession = $this->storage->phpPeerSessionByInterfaceId($this->localInterfaceId);
-        if ($localSession !== null) {
-            upsertPhpPeerInterface($this->storage, $this->config, $localSession, $remoteBaseUrl);
-        }
-        syncConfiguredPhpPeerInterfaces($this->runtimeConfig, $this->storage);
-        $summary['negotiated_peer_url'] = $remoteBaseUrl;
-        $summary['requests']++;
-
-        $initialResult = $this->applyResponse($response, $packets, $outboundBatchId, $summary);
-        $pendingAckBatchIds = $initialResult['pending_ack_batch_ids'];
-        $hadInboundDelivery = $initialResult['had_inbound_delivery'];
-        $hadRemoteMore = $initialResult['had_remote_more'];
-
-        if (!$hadLocalMore && !$hadRemoteMore && $pendingAckBatchIds === [] && !$hadInboundDelivery) {
-            return $summary;
-        }
-
-        for ($attempt = 1; $attempt < $maxRequests; $attempt++) {
-            $outbound = $this->storage->fetchOutboundBatch($this->localInterfaceId, $this->config->maxBatchPackets);
-            $outboundBatchId = is_string($outbound['batch_id'] ?? null) ? (string) $outbound['batch_id'] : null;
-            $packets = $this->packetStrings($outbound['packets'] ?? []);
-            $hadLocalMore = (bool) ($outbound['more'] ?? false);
-            if ($packets !== []) {
-                $summary['outbound_batches']++;
-                $summary['outbound_packets'] += count($packets);
-            }
-
-            $response = $client->exchange($packets, $pendingAckBatchIds);
-            $summary['requests']++;
-            $result = $this->applyResponse($response, $packets, $outboundBatchId, $summary);
-            $pendingAckBatchIds = $result['pending_ack_batch_ids'];
-            $hadInboundDelivery = $result['had_inbound_delivery'];
-            $hadRemoteMore = $result['had_remote_more'];
-            if (!$hadLocalMore && !$hadRemoteMore && $pendingAckBatchIds === [] && !$hadInboundDelivery) {
-                return $summary;
-            }
-        }
-
-        if ($allowPartial) {
-            $summary['partial'] = true;
-            $summary['remaining_local_more'] = $hadLocalMore;
-            $summary['remaining_remote_more'] = $hadRemoteMore;
-            $summary['pending_ack_batches'] = count($pendingAckBatchIds);
-            $summary['pending_inbound_delivery'] = $hadInboundDelivery;
-            return $summary;
-        }
-
-        throw new RuntimeException('PHP peer sync exceeded ' . $maxRequests . ' exchange requests');
-    }
-
-    private function packetStrings(mixed $packets): array
-    {
-        if (!is_array($packets)) {
-            throw new RuntimeException('PHP peer packet list must be an array');
-        }
-
-        $normalized = [];
-        foreach ($packets as $packet) {
-            if (!is_string($packet) || $packet === '') {
-                throw new RuntimeException('PHP peer packet entries must be non-empty strings');
-            }
-
-            $normalized[] = $packet;
-        }
-
-        return $normalized;
-    }
-
-    private function applyResponse(array $response, array $packets, ?string $outboundBatchId, array &$summary): array
-    {
-        $pendingAckBatchIds = [];
-        $summary['acked_batches'] += (int) ($response['acked_batches'] ?? 0);
-
-        if ($packets !== [] && (bool) ($response['duplicate_batch'] ?? false)) {
-            throw new RuntimeException('PHP peer unexpectedly reused an outbound batch id');
-        }
-
-        if ($packets !== []) {
-            if ($outboundBatchId === null || $outboundBatchId === '') {
-                throw new RuntimeException('PHP peer outbound packets require a batch id');
-            }
-
-            // A successful authenticated response means the remote accepted this outbound batch.
-            $this->storage->acknowledgeOutboundBatches($this->localInterfaceId, [$outboundBatchId]);
-        }
-
-        $deliveryPackets = $this->packetStrings($response['delivery_packets'] ?? []);
-        $deliveryBatchId = $response['delivery_batch_id'] ?? null;
-        $hadInboundDelivery = false;
-        if ($deliveryPackets !== []) {
-            if (!is_string($deliveryBatchId) || $deliveryBatchId === '') {
-                throw new RuntimeException('PHP peer response with delivery_packets requires delivery_batch_id');
-            }
-
-            $ingest = $this->storage->ingestInboundBatchInline(
-                $this->localInterfaceId,
-                'php-peer:' . $deliveryBatchId,
-                $deliveryPackets,
-            );
-            $summary['delivery_batches']++;
-            $summary['delivery_packets'] += count($deliveryPackets);
-            $summary['accepted_packets'] += (int) ($ingest['accepted_packets'] ?? 0);
-            $summary['accepted_bytes'] += (int) ($ingest['accepted_bytes'] ?? 0);
-            if (is_array($ingest['processing'] ?? null)) {
-                $summary['processing'][] = $ingest['processing'];
-            }
-
-            $pendingAckBatchIds[] = $deliveryBatchId;
-            $hadInboundDelivery = true;
-        } elseif ($deliveryBatchId !== null && (!is_string($deliveryBatchId) || $deliveryBatchId === '')) {
-            throw new RuntimeException('PHP peer response delivery_batch_id is malformed');
-        }
-
-        return [
-            'pending_ack_batch_ids' => $pendingAckBatchIds,
-            'had_inbound_delivery' => $hadInboundDelivery,
-            'had_remote_more' => (bool) ($response['delivery_more'] ?? false),
-        ];
     }
 }
 
@@ -2643,7 +1692,6 @@ final class TcpBridgeConfig
     {
         return [
             'client' => 'reticulum-php',
-            'transport' => 'tcp-bridge',
             'implementation' => 'TcpBridge',
             'mode' => 'full',
             'wake' => [
@@ -3392,19 +2440,11 @@ function wakeTcpBridge(string $projectRoot, ?string $statePath = null): int
 function initializeRuntime(string $projectRoot): array
 {
     $reticulumPhpConfig = Config::load($projectRoot);
-
-    // Enforce PHP memory limit from config (shared-hosting safety).
-    $phpMemoryLimit = (string) ($reticulumPhpConfig['php']['memory_limit'] ?? '128M');
-    if ($phpMemoryLimit !== '' && ini_set('memory_limit', $phpMemoryLimit) === false) {
-        error_log('Reticulum-php: unable to set memory_limit=' . $phpMemoryLimit);
-    }
-
     Config::ensureDirectories($reticulumPhpConfig);
     Environment::verify();
 
     $reticulumPhpStorage = new Storage($reticulumPhpConfig);
     $reticulumPhpStorage->migrate();
-    syncConfiguredPhpPeerInterfaces($reticulumPhpConfig, $reticulumPhpStorage);
 
     return [$reticulumPhpConfig, $reticulumPhpStorage];
 }
@@ -3445,179 +2485,17 @@ function runIndexCli(string $projectRoot, array $argv): int
             return 1;
         }
 
-        // Check profile first so we route to the correct handler.
-        $profile = $reticulumPhpStorage->wakeEventProfile($wakeEventId);
-        if ($profile === '__post_interface_wake__') {
-            $result = $reticulumPhpStorage->dispatchPostInterfaceWakeEvent($wakeEventId);
-            if ($result === null) {
-                $result = ['status' => 'noop', 'wake_event_id' => $wakeEventId, 'reason' => 'already_claimed_or_missing'];
-            }
-        } else {
-            $result = $reticulumPhpStorage->dispatchWakeEventById(
-                $wakeEventId,
-                (int) (getmypid() ?: 0),
-                new WakeDispatcher($reticulumPhpConfig),
-            );
-        }
-
+        $result = $reticulumPhpStorage->dispatchWakeEventById(
+            $wakeEventId,
+            (int) (getmypid() ?: 0),
+            new WakeDispatcher($reticulumPhpConfig),
+        );
         fwrite(STDOUT, json_encode($result, JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR) . PHP_EOL);
         return ($result['status'] ?? null) === 'failed' ? 1 : 0;
     }
 
-    if ($mode === 'sync-peer') {
-        $peerName = isset($argv[2]) ? trim((string) $argv[2]) : '';
-        if ($peerName === '') {
-            fwrite(STDERR, "sync-peer mode requires a PHP peer name\n");
-            return 1;
-        }
-
-        syncConfiguredPhpPeerInterfaces($reticulumPhpConfig, $reticulumPhpStorage);
-        $peerConfig = PhpPeerConfig::requireByName($reticulumPhpConfig, $peerName);
-        $localSession = $reticulumPhpStorage->phpPeerSession($peerConfig->name)
-            ?? $reticulumPhpStorage->ensurePhpPeerLocalSession($peerConfig->name);
-        $remoteUrl = $localSession['remote_url'] ?? $peerConfig->targetUrl;
-        if (!is_string($remoteUrl) || trim($remoteUrl) === '') {
-            throw new RuntimeException('sync-peer mode requires target_url or a negotiated remote_url for ' . $peerName);
-        }
-
-        upsertPhpPeerInterface($reticulumPhpStorage, $peerConfig, $localSession, $remoteUrl);
-
-        $result = (new PhpPeerSync(
-            $reticulumPhpConfig,
-            $peerConfig,
-            $reticulumPhpStorage,
-            (string) $localSession['local_interface_id'],
-        ))->run();
-        fwrite(STDOUT, json_encode(['status' => 'synced', 'sync' => $result], JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR) . PHP_EOL);
-        return 0;
-    }
-
     fwrite(STDERR, "Unsupported index mode: {$mode}\n");
     return 1;
-}
-
-function upsertPhpPeerInterface(Storage $storage, PhpPeerConfig $peerConfig, array $localSession, string $remoteUrl): void
-{
-    $storage->upsertConfiguredInterface(
-        (string) $localSession['local_interface_id'],
-        $peerConfig->interfaceNameForRemote($remoteUrl),
-        (string) $localSession['local_session_token'],
-        $peerConfig->bitrate,
-        $peerConfig->mtu,
-        $peerConfig->interfaceMetadata($remoteUrl),
-    );
-}
-
-function resolvePhpPeerInboundSession(array $config, Storage $storage, string $remoteUrl, ?string $peerName): ?array
-{
-    $remoteUrl = PhpPeerConfig::normalizeUrl($remoteUrl);
-    $existingSession = $storage->phpPeerSessionByRemoteUrl($remoteUrl);
-    if ($existingSession !== null) {
-        $interfaceId = (string) $existingSession['local_interface_id'];
-        $interfaceName = $storage->interfaceName($interfaceId);
-        $peerConfig = PhpPeerConfig::fromInterfaceMetadata(
-            $storage->interfaceMetadataForInterface($interfaceId),
-            is_string($interfaceName) && trim($interfaceName) !== '' ? trim($interfaceName) : null,
-        );
-        if ($peerConfig !== null) {
-            upsertPhpPeerInterface($storage, $peerConfig, $existingSession, $remoteUrl);
-            return [
-                'config' => $peerConfig,
-                'session' => $existingSession,
-            ];
-        }
-    }
-
-    $peerConfig = PhpPeerConfig::resolveInboundPeer($config, $storage, $remoteUrl, $peerName);
-    if ($peerConfig === null) {
-        return null;
-    }
-
-    if ($peerConfig->targetUrl !== null && PhpPeerConfig::normalizeUrl($peerConfig->targetUrl) === $remoteUrl) {
-        $localSession = $storage->ensurePhpPeerLocalSession($peerConfig->name);
-        $storage->setPhpPeerRemoteUrl($peerConfig->name, $remoteUrl);
-        $localSession = $storage->phpPeerSession($peerConfig->name) ?? $localSession;
-    } else {
-        $localSession = $storage->ensurePhpPeerRemoteSession($remoteUrl);
-    }
-
-    upsertPhpPeerInterface($storage, $peerConfig, $localSession, $remoteUrl);
-    return [
-        'config' => $peerConfig,
-        'session' => $localSession,
-    ];
-}
-
-function syncConfiguredPhpPeerInterfaces(array $config, Storage $storage): void
-{
-    foreach (PhpPeerConfig::all($config) as $peerConfig) {
-        $remoteUrl = $storage->phpPeerRemoteUrl($peerConfig->name) ?? $peerConfig->targetUrl;
-        if ($remoteUrl === null || trim($remoteUrl) === '') {
-            continue;
-        }
-
-        $localSession = $storage->ensurePhpPeerLocalSession($peerConfig->name);
-        upsertPhpPeerInterface($storage, $peerConfig, $localSession, $remoteUrl);
-    }
-}
-
-function phpPeerConfigForInterface(array $config, Storage $storage, string $interfaceId): ?PhpPeerConfig
-{
-    $interfaceName = $storage->interfaceName($interfaceId);
-    $peerConfig = PhpPeerConfig::fromInterfaceMetadata(
-        $storage->interfaceMetadataForInterface($interfaceId),
-        is_string($interfaceName) && $interfaceName !== '' ? $interfaceName : null,
-    );
-    if ($peerConfig !== null) {
-        return $peerConfig;
-    }
-
-    if (!is_string($interfaceName) || $interfaceName === '') {
-        return null;
-    }
-
-    $peers = PhpPeerConfig::all($config);
-    return $peers[$interfaceName] ?? null;
-}
-
-function syncPhpPeerInterfaces(array $config, Storage $storage, array $interfaceIds, ?int $maxRequests = null): array
-{
-    $results = [];
-    $seenInterfaces = [];
-
-    foreach ($interfaceIds as $interfaceId) {
-        if (!is_string($interfaceId) || $interfaceId === '') {
-            continue;
-        }
-
-        if (isset($seenInterfaces[$interfaceId])) {
-            continue;
-        }
-        $seenInterfaces[$interfaceId] = true;
-
-        $peerConfig = phpPeerConfigForInterface($config, $storage, $interfaceId);
-        if ($peerConfig === null) {
-            continue;
-        }
-
-        $resultKey = $storage->interfaceName($interfaceId);
-        if (!is_string($resultKey) || $resultKey === '' || isset($results[$resultKey])) {
-            $resultKey = $interfaceId;
-        }
-
-        $sync = new PhpPeerSync(
-            $config,
-            $peerConfig,
-            $storage,
-            $interfaceId,
-        );
-
-        $results[$resultKey] = $maxRequests === null
-            ? $sync->run()
-            : $sync->runPartial($maxRequests);
-    }
-
-    return $results;
 }
 
 function runIndexHttp(string $projectRoot): never
@@ -3648,13 +2526,10 @@ if (realpath($_SERVER['SCRIPT_FILENAME'] ?? '') === __FILE__) {
 
         http_response_code(500);
         header('Content-Type: application/json');
-        echo json_encode([
-            'error' => 'internal error',
-            'detail' => $error->getMessage(),
-            'exception' => get_class($error),
-            'file' => basename($error->getFile()),
-            'line' => $error->getLine(),
-        ], JSON_THROW_ON_ERROR);
+        header('Access-Control-Allow-Origin: *');
+        header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
+        header('Access-Control-Allow-Headers: Content-Type, X-Interface-Id, X-Session-Token');
+        echo json_encode(['error' => 'internal error'], JSON_THROW_ON_ERROR);
         exit;
     }
 }

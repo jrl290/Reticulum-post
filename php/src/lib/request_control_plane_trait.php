@@ -133,15 +133,16 @@ trait RequestControlPlaneTrait
 
     private function shouldRelayAcceptedPacket(array $packet): bool
     {
-        if ((int) ($packet['packet_type'] ?? -1) === 1 && (string) ($packet['announce_status'] ?? '') === 'invalid') {
+        // Announces always flood — they are the transport discovery mechanism.
+        if ((int) ($packet['packet_type'] ?? -1) === 1) {
+            return (string) ($packet['announce_status'] ?? '') !== 'invalid';
+        }
+
+        if ((int) ($packet['destination_type'] ?? -1) === 3) {
             return false;
         }
 
         if ($this->isPathRequestPacket($packet)) {
-            return false;
-        }
-
-        if ((int) ($packet['destination_type'] ?? -1) === 3) {
             return false;
         }
 
@@ -196,22 +197,21 @@ trait RequestControlPlaneTrait
 
     private function relayTargetsForAcceptedPacket(string $sourceInterfaceId, array $packet): array
     {
-        $activeTargets = $this->activePeerInterfaceIds($sourceInterfaceId);
-        if ($activeTargets === []) {
-            return [];
+        // Standard RNS: relay announces to all other interfaces.
+        if ((int) ($packet['packet_type'] ?? -1) === 1) {
+            return $this->allOtherInterfaceIds($sourceInterfaceId);
         }
 
-        if ((int) ($packet['packet_type'] ?? -1) !== 1) {
-            $path = $this->usablePathEntry((string) ($packet['destination_hash_hex'] ?? ''));
-            if ($path !== null) {
-                $targetInterfaceId = (string) ($path['interface_id'] ?? '');
-                if ($targetInterfaceId !== '' && in_array($targetInterfaceId, $activeTargets, true)) {
-                    return [$targetInterfaceId];
-                }
+        // Non-announce: follow the path table to the next-hop interface.
+        $path = $this->usablePathEntry((string) ($packet['destination_hash_hex'] ?? ''));
+        if ($path !== null) {
+            $targetInterfaceId = (string) ($path['interface_id'] ?? '');
+            if ($targetInterfaceId !== '' && $targetInterfaceId !== $sourceInterfaceId) {
+                return [$targetInterfaceId];
             }
         }
 
-        return $activeTargets;
+        return [];
     }
 
     private function upsertPathFromAnnounce(string $interfaceId, array $packet, array $announce): array

@@ -56,6 +56,13 @@ trait RequestHttpApiHelperTrait
                 $this->storage->failWakeEvent((int) $wakeEventId, $error->getMessage());
             }
         }
+
+        // Fire-and-forget wakes to PHP peer nodes with pending outbound packets.
+        try {
+            $this->storage->dispatchWakes();
+        } catch (\Throwable $error) {
+            $this->log('error', 'PhpPeer wake dispatch failed: ' . $error->getMessage());
+        }
     }
 
     private function spawnDetachedWakeRunner(int $wakeEventId): void
@@ -264,5 +271,137 @@ trait RequestHttpApiHelperTrait
     {
         $line = sprintf("[%s] [%s] %s\n", date('Y-m-d H:i:s'), strtoupper($level), $message);
         file_put_contents((string) $this->config['storage']['log_path'], $line, FILE_APPEND | LOCK_EX);
+    }
+
+    private function renderMonitorPage(): never
+    {
+        $data = $this->storage->monitorData();
+        $interfaces = $data['interfaces'] ?? [];
+        $outbound = $data['outbound_pending'] ?? [];
+        $packets = $data['recent_inbound'] ?? [];
+        $outboundPkts = $data['recent_outbound'] ?? [];
+        $hostUrl = $this->config['host_url'] ?? ($this->config['http']['advertise_url'] ?? '');
+        $now = date('Y-m-d H:i:s');
+
+        $ifaceRows = '';
+        $peerRows = '';
+        foreach ($interfaces as $iface) {
+            $name = htmlspecialchars((string) ($iface['name'] ?? ''), ENT_QUOTES);
+            $status = htmlspecialchars((string) ($iface['status'] ?? ''), ENT_QUOTES);
+            $peer = htmlspecialchars((string) ($iface['peer_url'] ?? ''), ENT_QUOTES);
+            $rx = (int) ($iface['rx_packets'] ?? 0);
+            $tx = (int) ($iface['tx_packets'] ?? 0);
+            $lastSeen = isset($iface['last_seen_at']) ? date('H:i:s', (int) $iface['last_seen_at']) : '-';
+            $isPhpPeer = $peer !== '';
+
+            if ($isPhpPeer) {
+                $peerRows .= "<tr><td>{$name}</td><td class=\"mono\">{$peer}</td><td>{$rx}</td><td>{$tx}</td><td>{$lastSeen}</td></tr>";
+            } elseif ($status === 'online') {
+                $ifaceRows .= "<tr><td>{$name}</td><td>{$rx}</td><td>{$tx}</td><td>{$lastSeen}</td></tr>";
+            }
+        }
+
+        $outboundRows = '';
+        foreach ($outbound as $ob) {
+            $name = htmlspecialchars((string) ($ob['name'] ?? ''), ENT_QUOTES);
+            $pending = (int) ($ob['pending'] ?? 0);
+            $oldest = isset($ob['oldest_queued_at']) ? date('H:i:s', (int) $ob['oldest_queued_at']) : '-';
+            $peer = htmlspecialchars((string) ($ob['peer_url'] ?? ''), ENT_QUOTES);
+            $outboundRows .= "<tr><td>{$name}</td><td class=\"mono\">{$peer}</td><td class=\"count\">{$pending}</td><td>{$oldest}</td></tr>";
+        }
+
+        $packetRows = '';
+        $typeNames = ['DATA', 'ANNOUNCE', 'LINK', 'PROOF'];
+        foreach ($packets as $pkt) {
+            $pktType = (int) ($pkt['packet_type'] ?? -1);
+            $typeName = $typeNames[$pktType] ?? "?{$pktType}";
+            $destHash = htmlspecialchars(substr((string) ($pkt['destination_hash_hex'] ?? ''), 0, 12), ENT_QUOTES);
+            $status = htmlspecialchars((string) ($pkt['filter_status'] ?? ($pkt['status'] ?? '')), ENT_QUOTES);
+            $size = (int) ($pkt['packet_size'] ?? 0);
+            $ts = isset($pkt['created_at']) ? date('H:i:s', (int) $pkt['created_at']) : '-';
+            $packetRows .= "<tr><td class=\"mono\">{$typeName}</td><td class=\"mono\">{$destHash}</td><td>{$status}</td><td>{$size}</td><td>{$ts}</td></tr>";
+        }
+
+        $outPktRows = '';
+        foreach ($outboundPkts as $pkt) {
+            $destHash = htmlspecialchars(substr((string) ($pkt['destination_hash_hex'] ?? ''), 0, 12), ENT_QUOTES);
+            $reason = htmlspecialchars((string) ($pkt['queue_reason'] ?? ''), ENT_QUOTES);
+            $acked = ($pkt['acked_at'] ?? null) !== null ? 'acked' : 'pending';
+            $ts = isset($pkt['queued_at']) ? date('H:i:s', (int) $pkt['queued_at']) : '-';
+            $outPktRows .= "<tr><td class=\"mono\">{$destHash}</td><td>{$reason}</td><td>{$acked}</td><td>{$ts}</td></tr>";
+        }
+
+        $totalPending = array_sum(array_column($outbound, 'pending'));
+        $ifaceCount = count($interfaces);
+        $pktCount = count($packets);
+
+        echo <<<HTML
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reticulum-php Monitor</title>
+<style>
+  body { font-family: -apple-system, system-ui, sans-serif; margin: 0; padding: 16px; background: #111; color: #ddd; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  .sub { color: #888; font-size: 12px; margin-bottom: 16px; }
+  .grid { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
+  .card { background: #1a1a1a; border: 1px solid #333; border-radius: 6px; padding: 10px 14px; min-width: 100px; }
+  .card .val { font-size: 24px; font-weight: bold; color: #4af; }
+  .card .lbl { font-size: 10px; color: #888; text-transform: uppercase; }
+  table { width: 100%; border-collapse: collapse; margin-bottom: 20px; font-size: 13px; }
+  th { text-align: left; padding: 6px 8px; border-bottom: 2px solid #333; color: #888; font-size: 11px; text-transform: uppercase; }
+  td { padding: 5px 8px; border-bottom: 1px solid #222; }
+  .mono { font-family: 'SF Mono', monospace; font-size: 12px; }
+  .online { color: #5f5; }
+  .offline { color: #f55; }
+  .count { text-align: right; font-weight: bold; }
+  h2 { font-size: 14px; color: #888; margin: 20px 0 8px; text-transform: uppercase; }
+  .refresh { font-size: 10px; color: #555; }
+</style>
+</head>
+<body>
+<h1>Reticulum-php</h1>
+<div class="sub">{$hostUrl} &mdash; {$now} <span class="refresh">(auto-refresh 5s)</span></div>
+
+<div class="grid">
+  <div class="card"><div class="val">{$totalPending}</div><div class="lbl">Pending Outbound</div></div>
+  <div class="card"><div class="val">{$ifaceCount}</div><div class="lbl">Interfaces</div></div>
+  <div class="card"><div class="val">{$pktCount}</div><div class="lbl">Recent Packets</div></div>
+</div>
+
+<h2>Connected Peers</h2>
+<table><thead><tr><th>Name</th><th>Peer URL</th><th>RX</th><th>TX</th><th>Last Seen</th></tr></thead><tbody>{$peerRows}</tbody></table>
+
+<h2>Active Clients</h2>
+<table><thead><tr><th>Name</th><th>RX</th><th>TX</th><th>Last Seen</th></tr></thead><tbody>{$ifaceRows}</tbody></table>
+
+<h2>Pending Outbound</h2>
+<table><thead><tr><th>Interface</th><th>Peer</th><th>Pending</th><th>Oldest</th></tr></thead><tbody>{$outboundRows}</tbody></table>
+
+<h2>Received</h2>
+<table><thead><tr><th>Type</th><th>Dest Hash</th><th>Status</th><th>Size</th><th>Time</th></tr></thead><tbody>{$packetRows}</tbody></table>
+
+<h2>Queued Outbound</h2>
+<table><thead><tr><th>Dest Hash</th><th>Reason</th><th>State</th><th>Queued</th></tr></thead><tbody>{$outPktRows}</tbody></table>
+
+<script>
+setTimeout(function(){ location.reload(); }, 5000);
+</script>
+</body>
+</html>
+HTML;
+
+        exit;
+    }
+
+    private function respondHtml(string $html): never
+    {
+        http_response_code(200);
+        header('Content-Type: text/html; charset=utf-8');
+        header('Access-Control-Allow-Origin: *');
+        echo $html;
+        exit;
     }
 }

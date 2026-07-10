@@ -177,7 +177,7 @@ trait RequestLxmfHandoffTrait
         $packetBase64 = base64_encode($raw);
         $interfaceIds = [];
 
-        foreach ($this->activePeerInterfaceIds('') as $interfaceId) {
+        foreach ($this->allOtherInterfaceIds('') as $interfaceId) {
             $this->queueOutboundPacket($interfaceId, $packetBase64, 'lxmf_path_request');
             $interfaceIds[] = $interfaceId;
         }
