@@ -103,7 +103,7 @@ trait RequestSchemaTrait
         $this->ensureColumn('interfaces', 'peer_session_token', 'TEXT');
         $this->ensureColumn('interfaces', 'last_wake_sent_at', 'INTEGER');
         $this->ensureColumn('interfaces', 'pending_ack_batch_ids_json', 'TEXT');
-        $this->ensureIndex('CREATE INDEX IF NOT EXISTS idx_interfaces_peer_url ON interfaces(peer_url)');
+        $this->ensureIndex('CREATE INDEX idx_interfaces_peer_url ON interfaces(peer_url)');
 
         // inbound_batches
         $this->execDdl(

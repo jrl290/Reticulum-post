@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace ReticulumPhp;
 
+use PDO;
+
 // Reticulum-php is request-operated. PHP peer wakes are fire-and-forget HTTP
 // calls that prompt a peer to call our /v1/interfaces/exchange. They do not
 // carry transport data and do not form a second transport path.
@@ -162,8 +164,9 @@ trait RequestPhpWakeTrait
         $stmt = $this->db->prepare(
             'SELECT pending_ack_batch_ids_json FROM interfaces WHERE interface_id = :interface_id'
         );
-        $stmt->bindValue(':interface_id', $peerInterfaceId, SQLITE3_TEXT);
-        $row = $stmt->execute()->fetchArray(SQLITE3_ASSOC);
+        $stmt->bindValue(':interface_id', $peerInterfaceId, PDO::PARAM_STR);
+        $stmt->execute();
+        $row = $stmt->fetch(PDO::FETCH_ASSOC);
 
         $json = is_array($row) ? (string) ($row['pending_ack_batch_ids_json'] ?? '') : '';
         $ids = $json !== '' ? self::decodeJson($json) : [];
@@ -175,8 +178,8 @@ trait RequestPhpWakeTrait
         $clear = $this->db->prepare(
             'UPDATE interfaces SET pending_ack_batch_ids_json = :empty WHERE interface_id = :interface_id'
         );
-        $clear->bindValue(':empty', self::encodeJson([]), SQLITE3_TEXT);
-        $clear->bindValue(':interface_id', $peerInterfaceId, SQLITE3_TEXT);
+        $clear->bindValue(':empty', self::encodeJson([]), PDO::PARAM_STR);
+        $clear->bindValue(':interface_id', $peerInterfaceId, PDO::PARAM_STR);
         $clear->execute();
 
         return $ids;
@@ -187,8 +190,9 @@ trait RequestPhpWakeTrait
         $stmt = $this->db->prepare(
             'SELECT pending_ack_batch_ids_json FROM interfaces WHERE interface_id = :interface_id'
         );
-        $stmt->bindValue(':interface_id', $peerInterfaceId, SQLITE3_TEXT);
-        $row = $stmt->execute()->fetchArray(SQLITE3_ASSOC);
+        $stmt->bindValue(':interface_id', $peerInterfaceId, PDO::PARAM_STR);
+        $stmt->execute();
+        $row = $stmt->fetch(PDO::FETCH_ASSOC);
 
         $ids = [];
         if (is_array($row)) {
@@ -211,8 +215,8 @@ trait RequestPhpWakeTrait
         $update = $this->db->prepare(
             'UPDATE interfaces SET pending_ack_batch_ids_json = :json WHERE interface_id = :interface_id'
         );
-        $update->bindValue(':json', self::encodeJson($ids), SQLITE3_TEXT);
-        $update->bindValue(':interface_id', $peerInterfaceId, SQLITE3_TEXT);
+        $update->bindValue(':json', self::encodeJson($ids), PDO::PARAM_STR);
+        $update->bindValue(':interface_id', $peerInterfaceId, PDO::PARAM_STR);
         $update->execute();
     }
 

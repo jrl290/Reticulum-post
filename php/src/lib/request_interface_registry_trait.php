@@ -70,7 +70,7 @@ trait RequestInterfaceRegistryTrait
     public function upsertConfiguredInterface(string $interfaceId, string $name, string $sessionToken, int $bitrate, int $mtu, array $metadata, ?string $peerUrl = null, ?string $peerInterfaceId = null, ?string $peerSessionToken = null): void
     {
         $now = time();
-        $stmt = $this->db->prepare(
+        $sql = Database::upsertSql(
             'INSERT INTO interfaces (
                 interface_id, name, session_token, bitrate, mtu, status,
                 metadata_json, created_at, last_seen_at,
@@ -90,8 +90,10 @@ trait RequestInterfaceRegistryTrait
                 last_seen_at = excluded.last_seen_at,
                 peer_url = excluded.peer_url,
                 peer_interface_id = excluded.peer_interface_id,
-                peer_session_token = excluded.peer_session_token'
+                peer_session_token = excluded.peer_session_token',
+            $this->backend
         );
+        $stmt = $this->db->prepare($sql);
         $stmt->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
         $stmt->bindValue(':name', $name, PDO::PARAM_STR);
         $stmt->bindValue(':session_token', $sessionToken, PDO::PARAM_STR);
@@ -167,10 +169,10 @@ trait RequestInterfaceRegistryTrait
                AND op.acked_at IS NULL
              ORDER BY i.interface_id'
         );
-        $result = $stmt->execute();
+        $stmt->execute();
 
         $rows = [];
-        while (($row = $result->fetch(PDO::FETCH_ASSOC)) !== false) {
+        while (($row = $stmt->fetch(PDO::FETCH_ASSOC)) !== false) {
             if (!is_array($row)) {
                 continue;
             }

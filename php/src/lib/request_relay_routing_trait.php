@@ -261,10 +261,10 @@ trait RequestRelayRoutingTrait
         if (!$validatedOnly) {
             $stmt->bindValue(':now', $now, PDO::PARAM_INT);
         }
-        $result = $stmt->execute();
+        $stmt->execute();
 
         $entries = [];
-        while (($row = $result->fetch(PDO::FETCH_ASSOC)) !== false) {
+        while (($row = $stmt->fetch(PDO::FETCH_ASSOC)) !== false) {
             if (!is_array($row)) {
                 continue;
             }
@@ -604,10 +604,10 @@ trait RequestRelayRoutingTrait
             'SELECT interface_id FROM interfaces WHERE interface_id != :interface_id'
         );
         $stmt->bindValue(':interface_id', $sourceInterfaceId, PDO::PARAM_STR);
-        $result = $stmt->execute();
+        $stmt->execute();
 
         $interfaceIds = [];
-        while (($row = $result->fetch(PDO::FETCH_ASSOC)) !== false) {
+        while (($row = $stmt->fetch(PDO::FETCH_ASSOC)) !== false) {
             if (!is_array($row)) {
                 continue;
             }
@@ -707,10 +707,10 @@ trait RequestRelayRoutingTrait
         $stmt->bindValue(':empty_destination_hash', '', PDO::PARAM_STR);
         $stmt->bindValue(':now', $now, PDO::PARAM_INT);
         $stmt->bindValue(':active_after', $validatedLinkActiveAfter, PDO::PARAM_INT);
-        $result = $stmt->execute();
+        $stmt->execute();
 
         $invalidated = [];
-        while (($row = $result->fetch(PDO::FETCH_ASSOC)) !== false) {
+        while (($row = $stmt->fetch(PDO::FETCH_ASSOC)) !== false) {
             if (!is_array($row)) {
                 continue;
             }

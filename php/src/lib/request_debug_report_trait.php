@@ -92,10 +92,10 @@ trait RequestDebugReportTrait
              LIMIT :limit'
         );
         $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
-        $result = $stmt->execute();
+        $stmt->execute();
 
         $packets = [];
-        while (($row = $result->fetch(PDO::FETCH_ASSOC)) !== false) {
+        while (($row = $stmt->fetch(PDO::FETCH_ASSOC)) !== false) {
             $packets[] = $row;
         }
 
@@ -111,10 +111,10 @@ trait RequestDebugReportTrait
              LIMIT :limit'
         );
         $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
-        $result = $stmt->execute();
+        $stmt->execute();
 
         $paths = [];
-        while (($row = $result->fetch(PDO::FETCH_ASSOC)) !== false) {
+        while (($row = $stmt->fetch(PDO::FETCH_ASSOC)) !== false) {
             $paths[] = $row;
         }
 
@@ -145,10 +145,10 @@ trait RequestDebugReportTrait
              LIMIT :limit'
         );
         $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
-        $result = $stmt->execute();
+        $stmt->execute();
 
         $interfaces = [];
-        while (($row = $result->fetch(PDO::FETCH_ASSOC)) !== false) {
+        while (($row = $stmt->fetch(PDO::FETCH_ASSOC)) !== false) {
             if (!is_array($row)) {
                 continue;
             }
@@ -184,10 +184,10 @@ trait RequestDebugReportTrait
         );
         $stmt->bindValue(':status', $status, PDO::PARAM_STR);
         $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
-        $result = $stmt->execute();
+        $stmt->execute();
 
         $interfaces = [];
-        while (($row = $result->fetch(PDO::FETCH_ASSOC)) !== false) {
+        while (($row = $stmt->fetch(PDO::FETCH_ASSOC)) !== false) {
             if (!is_array($row)) {
                 continue;
             }
@@ -216,10 +216,10 @@ trait RequestDebugReportTrait
              LIMIT :limit'
         );
         $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
-        $result = $stmt->execute();
+        $stmt->execute();
 
         $batches = [];
-        while (($row = $result->fetch(PDO::FETCH_ASSOC)) !== false) {
+        while (($row = $stmt->fetch(PDO::FETCH_ASSOC)) !== false) {
             if (!is_array($row)) {
                 continue;
             }
@@ -254,10 +254,10 @@ trait RequestDebugReportTrait
              LIMIT :limit'
         );
         $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
-        $result = $stmt->execute();
+        $stmt->execute();
 
         $packets = [];
-        while (($row = $result->fetch(PDO::FETCH_ASSOC)) !== false) {
+        while (($row = $stmt->fetch(PDO::FETCH_ASSOC)) !== false) {
             if (!is_array($row)) {
                 continue;
             }
@@ -282,10 +282,10 @@ trait RequestDebugReportTrait
              LIMIT :limit'
         );
         $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
-        $result = $stmt->execute();
+        $stmt->execute();
 
         $batches = [];
-        while (($row = $result->fetch(PDO::FETCH_ASSOC)) !== false) {
+        while (($row = $stmt->fetch(PDO::FETCH_ASSOC)) !== false) {
             if (!is_array($row)) {
                 continue;
             }
@@ -318,10 +318,10 @@ trait RequestDebugReportTrait
              LIMIT :limit'
         );
         $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
-        $result = $stmt->execute();
+        $stmt->execute();
 
         $events = [];
-        while (($row = $result->fetch(PDO::FETCH_ASSOC)) !== false) {
+        while (($row = $stmt->fetch(PDO::FETCH_ASSOC)) !== false) {
             if (!is_array($row)) {
                 continue;
             }
@@ -379,10 +379,10 @@ trait RequestDebugReportTrait
              HAVING pending > 0
              ORDER BY pending DESC'
         );
-        $result = $stmt->execute();
+        $stmt->execute();
 
         $rows = [];
-        while (($row = $result->fetch(PDO::FETCH_ASSOC)) !== false) {
+        while (($row = $stmt->fetch(PDO::FETCH_ASSOC)) !== false) {
             if (is_array($row)) {
                 $rows[] = $row;
             }
