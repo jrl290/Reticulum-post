@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace ReticulumPhp;
 
+use PDO;
+
 // Reticulum-php is request-operated. These interface registry helpers only
 // persist credentials and state for the next authenticated request exchange;
 // they do not create a second transport path.
@@ -36,18 +38,18 @@ trait RequestInterfaceRegistryTrait
                 :peer_url, :peer_interface_id, :peer_session_token
             )'
         );
-        $stmt->bindValue(':interface_id', $interfaceId, SQLITE3_TEXT);
-        $stmt->bindValue(':name', $name, SQLITE3_TEXT);
-        $stmt->bindValue(':session_token', $sessionToken, SQLITE3_TEXT);
-        $stmt->bindValue(':bitrate', $bitrate, SQLITE3_INTEGER);
-        $stmt->bindValue(':mtu', $mtu, SQLITE3_INTEGER);
-        $stmt->bindValue(':status', 'online', SQLITE3_TEXT);
-        $stmt->bindValue(':metadata_json', self::encodeJson($metadata), SQLITE3_TEXT);
-        $stmt->bindValue(':created_at', $now, SQLITE3_INTEGER);
-        $stmt->bindValue(':last_seen_at', $now, SQLITE3_INTEGER);
-        $stmt->bindValue(':peer_url', $peerUrl, $peerUrl === null ? SQLITE3_NULL : SQLITE3_TEXT);
-        $stmt->bindValue(':peer_interface_id', $peerInterfaceId, $peerInterfaceId === null ? SQLITE3_NULL : SQLITE3_TEXT);
-        $stmt->bindValue(':peer_session_token', $peerSessionToken, $peerSessionToken === null ? SQLITE3_NULL : SQLITE3_TEXT);
+        $stmt->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
+        $stmt->bindValue(':name', $name, PDO::PARAM_STR);
+        $stmt->bindValue(':session_token', $sessionToken, PDO::PARAM_STR);
+        $stmt->bindValue(':bitrate', $bitrate, PDO::PARAM_INT);
+        $stmt->bindValue(':mtu', $mtu, PDO::PARAM_INT);
+        $stmt->bindValue(':status', 'online', PDO::PARAM_STR);
+        $stmt->bindValue(':metadata_json', self::encodeJson($metadata), PDO::PARAM_STR);
+        $stmt->bindValue(':created_at', $now, PDO::PARAM_INT);
+        $stmt->bindValue(':last_seen_at', $now, PDO::PARAM_INT);
+        $stmt->bindValue(':peer_url', $peerUrl, $peerUrl === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
+        $stmt->bindValue(':peer_interface_id', $peerInterfaceId, $peerInterfaceId === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
+        $stmt->bindValue(':peer_session_token', $peerSessionToken, $peerSessionToken === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
         $stmt->execute();
 
         $response = [
@@ -90,18 +92,18 @@ trait RequestInterfaceRegistryTrait
                 peer_interface_id = excluded.peer_interface_id,
                 peer_session_token = excluded.peer_session_token'
         );
-        $stmt->bindValue(':interface_id', $interfaceId, SQLITE3_TEXT);
-        $stmt->bindValue(':name', $name, SQLITE3_TEXT);
-        $stmt->bindValue(':session_token', $sessionToken, SQLITE3_TEXT);
-        $stmt->bindValue(':bitrate', $bitrate, SQLITE3_INTEGER);
-        $stmt->bindValue(':mtu', $mtu, SQLITE3_INTEGER);
-        $stmt->bindValue(':status', 'online', SQLITE3_TEXT);
-        $stmt->bindValue(':metadata_json', self::encodeJson($metadata), SQLITE3_TEXT);
-        $stmt->bindValue(':created_at', $now, SQLITE3_INTEGER);
-        $stmt->bindValue(':last_seen_at', $now, SQLITE3_INTEGER);
-        $stmt->bindValue(':peer_url', $peerUrl, $peerUrl === null ? SQLITE3_NULL : SQLITE3_TEXT);
-        $stmt->bindValue(':peer_interface_id', $peerInterfaceId, $peerInterfaceId === null ? SQLITE3_NULL : SQLITE3_TEXT);
-        $stmt->bindValue(':peer_session_token', $peerSessionToken, $peerSessionToken === null ? SQLITE3_NULL : SQLITE3_TEXT);
+        $stmt->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
+        $stmt->bindValue(':name', $name, PDO::PARAM_STR);
+        $stmt->bindValue(':session_token', $sessionToken, PDO::PARAM_STR);
+        $stmt->bindValue(':bitrate', $bitrate, PDO::PARAM_INT);
+        $stmt->bindValue(':mtu', $mtu, PDO::PARAM_INT);
+        $stmt->bindValue(':status', 'online', PDO::PARAM_STR);
+        $stmt->bindValue(':metadata_json', self::encodeJson($metadata), PDO::PARAM_STR);
+        $stmt->bindValue(':created_at', $now, PDO::PARAM_INT);
+        $stmt->bindValue(':last_seen_at', $now, PDO::PARAM_INT);
+        $stmt->bindValue(':peer_url', $peerUrl, $peerUrl === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
+        $stmt->bindValue(':peer_interface_id', $peerInterfaceId, $peerInterfaceId === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
+        $stmt->bindValue(':peer_session_token', $peerSessionToken, $peerSessionToken === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
         $stmt->execute();
     }
 
@@ -111,8 +113,8 @@ trait RequestInterfaceRegistryTrait
             'SELECT interface_id, name, session_token, bitrate, mtu, status, metadata_json, created_at, last_seen_at
              FROM interfaces WHERE interface_id = :interface_id'
         );
-        $stmt->bindValue(':interface_id', $interfaceId, SQLITE3_TEXT);
-        $row = $stmt->execute()->fetchArray(SQLITE3_ASSOC);
+        $stmt->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
+        $stmt->execute(); $row = $stmt->fetch(PDO::FETCH_ASSOC);
 
         if (!is_array($row) || !hash_equals((string) $row['session_token'], $sessionToken)) {
             throw new ApiError(401, 'Invalid interface credentials', ['error' => 'unauthorized']);
@@ -135,17 +137,17 @@ trait RequestInterfaceRegistryTrait
         $stmt = $this->db->prepare(
             'UPDATE interfaces SET last_seen_at = :last_seen_at, status = :status WHERE interface_id = :interface_id'
         );
-        $stmt->bindValue(':last_seen_at', time(), SQLITE3_INTEGER);
-        $stmt->bindValue(':status', $status, SQLITE3_TEXT);
-        $stmt->bindValue(':interface_id', $interfaceId, SQLITE3_TEXT);
+        $stmt->bindValue(':last_seen_at', time(), PDO::PARAM_INT);
+        $stmt->bindValue(':status', $status, PDO::PARAM_STR);
+        $stmt->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
         $stmt->execute();
     }
 
     private function interfaceBitrate(string $interfaceId): ?int
     {
         $stmt = $this->db->prepare('SELECT bitrate FROM interfaces WHERE interface_id = :interface_id');
-        $stmt->bindValue(':interface_id', $interfaceId, SQLITE3_TEXT);
-        $row = $stmt->execute()->fetchArray(SQLITE3_ASSOC);
+        $stmt->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
+        $stmt->execute(); $row = $stmt->fetch(PDO::FETCH_ASSOC);
         if (!is_array($row)) {
             return null;
         }
@@ -168,7 +170,7 @@ trait RequestInterfaceRegistryTrait
         $result = $stmt->execute();
 
         $rows = [];
-        while (($row = $result->fetchArray(SQLITE3_ASSOC)) !== false) {
+        while (($row = $result->fetch(PDO::FETCH_ASSOC)) !== false) {
             if (!is_array($row)) {
                 continue;
             }
@@ -186,8 +188,8 @@ trait RequestInterfaceRegistryTrait
              WHERE peer_url = :peer_url
              LIMIT 1'
         );
-        $stmt->bindValue(':peer_url', $peerUrl, SQLITE3_TEXT);
-        $row = $stmt->execute()->fetchArray(SQLITE3_ASSOC);
+        $stmt->bindValue(':peer_url', $peerUrl, PDO::PARAM_STR);
+        $stmt->execute(); $row = $stmt->fetch(PDO::FETCH_ASSOC);
 
         return is_array($row) ? $row : null;
     }
@@ -197,8 +199,8 @@ trait RequestInterfaceRegistryTrait
         $stmt = $this->db->prepare(
             'UPDATE interfaces SET last_wake_sent_at = :now WHERE interface_id = :interface_id'
         );
-        $stmt->bindValue(':now', time(), SQLITE3_INTEGER);
-        $stmt->bindValue(':interface_id', $interfaceId, SQLITE3_TEXT);
+        $stmt->bindValue(':now', time(), PDO::PARAM_INT);
+        $stmt->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
         $stmt->execute();
     }
 }

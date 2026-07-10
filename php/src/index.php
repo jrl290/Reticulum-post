@@ -5,10 +5,10 @@ declare(strict_types=1);
 namespace ReticulumPhp;
 
 use RuntimeException;
-use SQLite3;
-use SQLite3Result;
+use PDO;
 
 require_once __DIR__ . '/lib/request_runtime.php';
+require_once __DIR__ . '/lib/database.php';
 require_once __DIR__ . '/lib/request_control_plane_trait.php';
 require_once __DIR__ . '/lib/request_debug_report_trait.php';
 require_once __DIR__ . '/lib/request_http_api_helper_trait.php';
@@ -107,8 +107,17 @@ final class Config
     {
         return [
             'storage' => [
+                'backend' => 'mysql',
                 'sqlite_path' => $projectRoot . '/var/reticulum-php.sqlite',
+                'mysql_host' => '127.0.0.1',
+                'mysql_port' => 3306,
+                'mysql_dbname' => 'reticulum_php',
+                'mysql_user' => 'reticulum',
+                'mysql_pass' => '',
                 'log_path' => $projectRoot . '/var/router.log',
+            ],
+            'php' => [
+                'memory_limit' => '128M',
             ],
             'http' => [
                 'idle_exchange_interval_ms' => 1000,
@@ -1412,14 +1421,13 @@ final class Storage
     use RequestWakeDispatchTrait;
     use RequestPhpWakeTrait;
 
-    private SQLite3 $db;
+    private PDO $db;
+    private string $backend;
 
     public function __construct(private readonly array $config)
     {
-        $path = (string) $this->config['storage']['sqlite_path'];
-        $this->db = new SQLite3($path);
-        $this->db->enableExceptions(true);
-        $this->db->busyTimeout(5000);
+        $this->backend = Database::backend($config);
+        $this->db = Database::connect($config);
     }
 
 }
@@ -2440,6 +2448,13 @@ function wakeTcpBridge(string $projectRoot, ?string $statePath = null): int
 function initializeRuntime(string $projectRoot): array
 {
     $reticulumPhpConfig = Config::load($projectRoot);
+
+    // Enforce PHP memory limit from config (shared-hosting safety).
+    $phpMemoryLimit = (string) ($reticulumPhpConfig['php']['memory_limit'] ?? '128M');
+    if ($phpMemoryLimit !== '' && ini_set('memory_limit', $phpMemoryLimit) === false) {
+        error_log('Reticulum-php: unable to set memory_limit=' . $phpMemoryLimit);
+    }
+
     Config::ensureDirectories($reticulumPhpConfig);
     Environment::verify();
 

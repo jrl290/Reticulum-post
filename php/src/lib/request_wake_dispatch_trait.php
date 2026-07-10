@@ -85,7 +85,7 @@ trait RequestWakeDispatchTrait
              LIMIT 1'
         );
         $stmt->bindValue(':wake_event_id', $wakeEventId, PDO::PARAM_INT);
-        $row = $stmt->execute(); $row = $stmt->fetch(PDO::FETCH_ASSOC);
+        $stmt->execute(); $row = $stmt->fetch(PDO::FETCH_ASSOC);
 
         if (!is_array($row)) {
             return [
@@ -129,7 +129,7 @@ trait RequestWakeDispatchTrait
              LIMIT 1'
         );
         $select->bindValue(':wake_event_id', $wakeEventId, PDO::PARAM_INT);
-        $row = $select->execute(); $row = $select->fetch(PDO::FETCH_ASSOC);
+        $select->execute(); $row = $select->fetch(PDO::FETCH_ASSOC);
         if (!is_array($row)) {
             return false;
         }
@@ -196,10 +196,6 @@ trait RequestWakeDispatchTrait
             if (is_array($row)) {
                 $rows[] = $row;
             }
-        }
-
-        if ($result instanceof SQLite3Result) {
-            $result->finalize();
         }
 
         foreach ($rows as $row) {

@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace ReticulumPhp;
 
+use PDO;
+
 // Reticulum-php is request-operated. These reporting helpers expose request
 // path state for /health and /debug inspection only; they do not alter packet
 // flow or create a second transport mechanism.
@@ -89,11 +91,11 @@ trait RequestDebugReportTrait
              ORDER BY packet_record_id DESC
              LIMIT :limit'
         );
-        $stmt->bindValue(':limit', $limit, SQLITE3_INTEGER);
+        $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
         $result = $stmt->execute();
 
         $packets = [];
-        while (($row = $result->fetchArray(SQLITE3_ASSOC)) !== false) {
+        while (($row = $result->fetch(PDO::FETCH_ASSOC)) !== false) {
             $packets[] = $row;
         }
 
@@ -108,11 +110,11 @@ trait RequestDebugReportTrait
              ORDER BY updated_at DESC
              LIMIT :limit'
         );
-        $stmt->bindValue(':limit', $limit, SQLITE3_INTEGER);
+        $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
         $result = $stmt->execute();
 
         $paths = [];
-        while (($row = $result->fetchArray(SQLITE3_ASSOC)) !== false) {
+        while (($row = $result->fetch(PDO::FETCH_ASSOC)) !== false) {
             $paths[] = $row;
         }
 
@@ -142,11 +144,11 @@ trait RequestDebugReportTrait
              ORDER BY last_seen_at DESC, created_at DESC
              LIMIT :limit'
         );
-        $stmt->bindValue(':limit', $limit, SQLITE3_INTEGER);
+        $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
         $result = $stmt->execute();
 
         $interfaces = [];
-        while (($row = $result->fetchArray(SQLITE3_ASSOC)) !== false) {
+        while (($row = $result->fetch(PDO::FETCH_ASSOC)) !== false) {
             if (!is_array($row)) {
                 continue;
             }
@@ -180,12 +182,12 @@ trait RequestDebugReportTrait
              ORDER BY last_seen_at DESC, created_at DESC
              LIMIT :limit'
         );
-        $stmt->bindValue(':status', $status, SQLITE3_TEXT);
-        $stmt->bindValue(':limit', $limit, SQLITE3_INTEGER);
+        $stmt->bindValue(':status', $status, PDO::PARAM_STR);
+        $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
         $result = $stmt->execute();
 
         $interfaces = [];
-        while (($row = $result->fetchArray(SQLITE3_ASSOC)) !== false) {
+        while (($row = $result->fetch(PDO::FETCH_ASSOC)) !== false) {
             if (!is_array($row)) {
                 continue;
             }
@@ -213,11 +215,11 @@ trait RequestDebugReportTrait
              ORDER BY created_at DESC
              LIMIT :limit'
         );
-        $stmt->bindValue(':limit', $limit, SQLITE3_INTEGER);
+        $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
         $result = $stmt->execute();
 
         $batches = [];
-        while (($row = $result->fetchArray(SQLITE3_ASSOC)) !== false) {
+        while (($row = $result->fetch(PDO::FETCH_ASSOC)) !== false) {
             if (!is_array($row)) {
                 continue;
             }
@@ -251,11 +253,11 @@ trait RequestDebugReportTrait
              ORDER BY packet_id DESC
              LIMIT :limit'
         );
-        $stmt->bindValue(':limit', $limit, SQLITE3_INTEGER);
+        $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
         $result = $stmt->execute();
 
         $packets = [];
-        while (($row = $result->fetchArray(SQLITE3_ASSOC)) !== false) {
+        while (($row = $result->fetch(PDO::FETCH_ASSOC)) !== false) {
             if (!is_array($row)) {
                 continue;
             }
@@ -279,11 +281,11 @@ trait RequestDebugReportTrait
              ORDER BY created_at DESC
              LIMIT :limit'
         );
-        $stmt->bindValue(':limit', $limit, SQLITE3_INTEGER);
+        $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
         $result = $stmt->execute();
 
         $batches = [];
-        while (($row = $result->fetchArray(SQLITE3_ASSOC)) !== false) {
+        while (($row = $result->fetch(PDO::FETCH_ASSOC)) !== false) {
             if (!is_array($row)) {
                 continue;
             }
@@ -315,11 +317,11 @@ trait RequestDebugReportTrait
              ORDER BY wake_event_id DESC
              LIMIT :limit'
         );
-        $stmt->bindValue(':limit', $limit, SQLITE3_INTEGER);
+        $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
         $result = $stmt->execute();
 
         $events = [];
-        while (($row = $result->fetchArray(SQLITE3_ASSOC)) !== false) {
+        while (($row = $result->fetch(PDO::FETCH_ASSOC)) !== false) {
             if (!is_array($row)) {
                 continue;
             }
@@ -349,9 +351,8 @@ trait RequestDebugReportTrait
 
     private function countByQuery(string $query): int
     {
-        /** @var SQLite3Result $result */
         $result = $this->db->query($query);
-        $row = $result->fetchArray(SQLITE3_NUM);
+        $row = $result->fetch(PDO::FETCH_NUM);
         return (int) ($row[0] ?? 0);
     }
 
@@ -381,7 +382,7 @@ trait RequestDebugReportTrait
         $result = $stmt->execute();
 
         $rows = [];
-        while (($row = $result->fetchArray(SQLITE3_ASSOC)) !== false) {
+        while (($row = $result->fetch(PDO::FETCH_ASSOC)) !== false) {
             if (is_array($row)) {
                 $rows[] = $row;
             }

@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace ReticulumPhp;
 
+use PDO;
+
 // Reticulum-php is request-operated. These relay and link-transport helpers
 // only prepare state and batches for the next authenticated exchange; they do
 // not create a second push transport path.
@@ -196,15 +198,15 @@ trait RequestRelayRoutingTrait
                 proof_expires_at = excluded.proof_expires_at,
                 updated_at = excluded.updated_at'
         );
-        $stmt->bindValue(':link_id_hex', $linkIdHex, SQLITE3_TEXT);
-        $stmt->bindValue(':received_interface_id', $receivedInterfaceId, SQLITE3_TEXT);
-        $stmt->bindValue(':outbound_interface_id', $outboundInterfaceId, SQLITE3_TEXT);
-        $stmt->bindValue(':next_hop_hex', $nextHopHex, SQLITE3_TEXT);
-        $stmt->bindValue(':remaining_hops', $remainingHops, SQLITE3_INTEGER);
-        $stmt->bindValue(':taken_hops', $takenHops, SQLITE3_INTEGER);
-        $stmt->bindValue(':destination_hash_hex', $destinationHashHex, SQLITE3_TEXT);
-        $stmt->bindValue(':proof_expires_at', $proofExpiresAt, SQLITE3_INTEGER);
-        $stmt->bindValue(':updated_at', time(), SQLITE3_INTEGER);
+        $stmt->bindValue(':link_id_hex', $linkIdHex, PDO::PARAM_STR);
+        $stmt->bindValue(':received_interface_id', $receivedInterfaceId, PDO::PARAM_STR);
+        $stmt->bindValue(':outbound_interface_id', $outboundInterfaceId, PDO::PARAM_STR);
+        $stmt->bindValue(':next_hop_hex', $nextHopHex, PDO::PARAM_STR);
+        $stmt->bindValue(':remaining_hops', $remainingHops, PDO::PARAM_INT);
+        $stmt->bindValue(':taken_hops', $takenHops, PDO::PARAM_INT);
+        $stmt->bindValue(':destination_hash_hex', $destinationHashHex, PDO::PARAM_STR);
+        $stmt->bindValue(':proof_expires_at', $proofExpiresAt, PDO::PARAM_INT);
+        $stmt->bindValue(':updated_at', time(), PDO::PARAM_INT);
         $stmt->execute();
     }
 
@@ -226,11 +228,11 @@ trait RequestRelayRoutingTrait
                                OR (lte.proof_expires_at IS NULL AND lte.updated_at >= :active_after)
                              )"
         );
-        $stmt->bindValue(':link_id_hex', $linkIdHex, SQLITE3_TEXT);
-        $stmt->bindValue(':outbound_interface_id', $outboundInterfaceId, SQLITE3_TEXT);
-        $stmt->bindValue(':now', $now, SQLITE3_INTEGER);
-        $stmt->bindValue(':active_after', $this->validatedLinkTransportActiveAfter($now), SQLITE3_INTEGER);
-        $row = $stmt->execute()->fetchArray(SQLITE3_ASSOC);
+        $stmt->bindValue(':link_id_hex', $linkIdHex, PDO::PARAM_STR);
+        $stmt->bindValue(':outbound_interface_id', $outboundInterfaceId, PDO::PARAM_STR);
+        $stmt->bindValue(':now', $now, PDO::PARAM_INT);
+        $stmt->bindValue(':active_after', $this->validatedLinkTransportActiveAfter($now), PDO::PARAM_INT);
+        $stmt->execute(); $row = $stmt->fetch(PDO::FETCH_ASSOC);
 
         return is_array($row) ? $row : null;
     }
@@ -254,15 +256,15 @@ trait RequestRelayRoutingTrait
         }
 
         $stmt = $this->db->prepare($query);
-        $stmt->bindValue(':link_id_hex', $linkIdHex, SQLITE3_TEXT);
-        $stmt->bindValue(':active_after', $this->validatedLinkTransportActiveAfter($now), SQLITE3_INTEGER);
+        $stmt->bindValue(':link_id_hex', $linkIdHex, PDO::PARAM_STR);
+        $stmt->bindValue(':active_after', $this->validatedLinkTransportActiveAfter($now), PDO::PARAM_INT);
         if (!$validatedOnly) {
-            $stmt->bindValue(':now', $now, SQLITE3_INTEGER);
+            $stmt->bindValue(':now', $now, PDO::PARAM_INT);
         }
         $result = $stmt->execute();
 
         $entries = [];
-        while (($row = $result->fetchArray(SQLITE3_ASSOC)) !== false) {
+        while (($row = $result->fetch(PDO::FETCH_ASSOC)) !== false) {
             if (!is_array($row)) {
                 continue;
             }
@@ -287,9 +289,9 @@ trait RequestRelayRoutingTrait
                AND updated_at >= :active_after
              LIMIT 1'
         );
-        $stmt->bindValue(':link_id_hex', $linkIdHex, SQLITE3_TEXT);
-        $stmt->bindValue(':active_after', $this->validatedLinkTransportActiveAfter(), SQLITE3_INTEGER);
-        $row = $stmt->execute()->fetchArray(SQLITE3_NUM);
+        $stmt->bindValue(':link_id_hex', $linkIdHex, PDO::PARAM_STR);
+        $stmt->bindValue(':active_after', $this->validatedLinkTransportActiveAfter(), PDO::PARAM_INT);
+        $stmt->execute(); $row = $stmt->fetch(PDO::FETCH_NUM);
 
         return $row !== false;
     }
@@ -306,12 +308,12 @@ trait RequestRelayRoutingTrait
         $query .= ' WHERE link_id_hex = :link_id_hex AND outbound_interface_id = :outbound_interface_id';
 
         $stmt = $this->db->prepare($query);
-        $stmt->bindValue(':updated_at', time(), SQLITE3_INTEGER);
+        $stmt->bindValue(':updated_at', time(), PDO::PARAM_INT);
         if ($validated !== null) {
-            $stmt->bindValue(':validated', $validated ? 1 : 0, SQLITE3_INTEGER);
+            $stmt->bindValue(':validated', $validated ? 1 : 0, PDO::PARAM_INT);
         }
-        $stmt->bindValue(':link_id_hex', $linkIdHex, SQLITE3_TEXT);
-        $stmt->bindValue(':outbound_interface_id', $outboundInterfaceId, SQLITE3_TEXT);
+        $stmt->bindValue(':link_id_hex', $linkIdHex, PDO::PARAM_STR);
+        $stmt->bindValue(':outbound_interface_id', $outboundInterfaceId, PDO::PARAM_STR);
         $stmt->execute();
     }
 
@@ -320,7 +322,7 @@ trait RequestRelayRoutingTrait
         $stmt = $this->db->prepare(
             'DELETE FROM link_transport_entries WHERE link_id_hex = :link_id_hex'
         );
-        $stmt->bindValue(':link_id_hex', $linkIdHex, SQLITE3_TEXT);
+        $stmt->bindValue(':link_id_hex', $linkIdHex, PDO::PARAM_STR);
         $stmt->execute();
     }
 
@@ -342,10 +344,10 @@ trait RequestRelayRoutingTrait
                 received_interface_id = excluded.received_interface_id,
                 created_at = excluded.created_at'
         );
-        $stmt->bindValue(':truncated_hash_hex', $truncatedHashHex, SQLITE3_TEXT);
-        $stmt->bindValue(':received_interface_id', $receivedInterfaceId, SQLITE3_TEXT);
-        $stmt->bindValue(':outbound_interface_id', $outboundInterfaceId, SQLITE3_TEXT);
-        $stmt->bindValue(':created_at', time(), SQLITE3_INTEGER);
+        $stmt->bindValue(':truncated_hash_hex', $truncatedHashHex, PDO::PARAM_STR);
+        $stmt->bindValue(':received_interface_id', $receivedInterfaceId, PDO::PARAM_STR);
+        $stmt->bindValue(':outbound_interface_id', $outboundInterfaceId, PDO::PARAM_STR);
+        $stmt->bindValue(':created_at', time(), PDO::PARAM_INT);
         $stmt->execute();
     }
 
@@ -361,9 +363,9 @@ trait RequestRelayRoutingTrait
                              AND received_if.status = 'online'
                              AND outbound_if.status = 'online'"
         );
-        $select->bindValue(':truncated_hash_hex', $truncatedHashHex, SQLITE3_TEXT);
-        $select->bindValue(':outbound_interface_id', $outboundInterfaceId, SQLITE3_TEXT);
-        $row = $select->execute()->fetchArray(SQLITE3_ASSOC);
+        $select->bindValue(':truncated_hash_hex', $truncatedHashHex, PDO::PARAM_STR);
+        $select->bindValue(':outbound_interface_id', $outboundInterfaceId, PDO::PARAM_STR);
+        $select->execute(); $row = $select->fetch(PDO::FETCH_ASSOC);
         if (!is_array($row)) {
             return null;
         }
@@ -373,8 +375,8 @@ trait RequestRelayRoutingTrait
              WHERE truncated_hash_hex = :truncated_hash_hex
                AND outbound_interface_id = :outbound_interface_id'
         );
-        $delete->bindValue(':truncated_hash_hex', $truncatedHashHex, SQLITE3_TEXT);
-        $delete->bindValue(':outbound_interface_id', $outboundInterfaceId, SQLITE3_TEXT);
+        $delete->bindValue(':truncated_hash_hex', $truncatedHashHex, PDO::PARAM_STR);
+        $delete->bindValue(':outbound_interface_id', $outboundInterfaceId, PDO::PARAM_STR);
         $delete->execute();
 
         return $row;
@@ -601,11 +603,11 @@ trait RequestRelayRoutingTrait
         $stmt = $this->db->prepare(
             'SELECT interface_id FROM interfaces WHERE interface_id != :interface_id'
         );
-        $stmt->bindValue(':interface_id', $sourceInterfaceId, SQLITE3_TEXT);
+        $stmt->bindValue(':interface_id', $sourceInterfaceId, PDO::PARAM_STR);
         $result = $stmt->execute();
 
         $interfaceIds = [];
-        while (($row = $result->fetchArray(SQLITE3_ASSOC)) !== false) {
+        while (($row = $result->fetch(PDO::FETCH_ASSOC)) !== false) {
             if (!is_array($row)) {
                 continue;
             }
@@ -624,8 +626,8 @@ trait RequestRelayRoutingTrait
         $stmt = $this->db->prepare(
             'SELECT 1 FROM interfaces WHERE interface_id = :interface_id LIMIT 1'
         );
-        $stmt->bindValue(':interface_id', $interfaceId, SQLITE3_TEXT);
-        $row = $stmt->execute()->fetchArray(SQLITE3_NUM);
+        $stmt->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
+        $stmt->execute(); $row = $stmt->fetch(PDO::FETCH_NUM);
 
         return $row !== false;
     }
@@ -702,13 +704,13 @@ trait RequestRelayRoutingTrait
                  OR (proof_expires_at IS NULL AND updated_at < :active_after)
                )'
         );
-        $stmt->bindValue(':empty_destination_hash', '', SQLITE3_TEXT);
-        $stmt->bindValue(':now', $now, SQLITE3_INTEGER);
-        $stmt->bindValue(':active_after', $validatedLinkActiveAfter, SQLITE3_INTEGER);
+        $stmt->bindValue(':empty_destination_hash', '', PDO::PARAM_STR);
+        $stmt->bindValue(':now', $now, PDO::PARAM_INT);
+        $stmt->bindValue(':active_after', $validatedLinkActiveAfter, PDO::PARAM_INT);
         $result = $stmt->execute();
 
         $invalidated = [];
-        while (($row = $result->fetchArray(SQLITE3_ASSOC)) !== false) {
+        while (($row = $result->fetch(PDO::FETCH_ASSOC)) !== false) {
             if (!is_array($row)) {
                 continue;
             }
