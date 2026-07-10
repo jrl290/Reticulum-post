@@ -184,6 +184,9 @@ trait RequestInterfaceRegistryTrait
 
     public function phpPeerInterfaceByPeerUrl(string $peerUrl): ?array
     {
+        $peerUrl = rtrim($peerUrl, '/');
+
+        // Try exact match first.
         $stmt = $this->db->prepare(
             'SELECT interface_id, peer_url, peer_interface_id, peer_session_token
              FROM interfaces
@@ -192,8 +195,28 @@ trait RequestInterfaceRegistryTrait
         );
         $stmt->bindValue(':peer_url', $peerUrl, PDO::PARAM_STR);
         $stmt->execute(); $row = $stmt->fetch(PDO::FETCH_ASSOC);
+        if (is_array($row)) {
+            return $row;
+        }
 
-        return is_array($row) ? $row : null;
+        // Try with /v1/wake appended.
+        $stmt->bindValue(':peer_url', $peerUrl . '/v1/wake', PDO::PARAM_STR);
+        $stmt->execute(); $row = $stmt->fetch(PDO::FETCH_ASSOC);
+        if (is_array($row)) {
+            return $row;
+        }
+
+        // Try stripping /v1/wake.
+        if (str_ends_with($peerUrl, '/v1/wake')) {
+            $baseUrl = substr($peerUrl, 0, -strlen('/v1/wake'));
+            $stmt->bindValue(':peer_url', $baseUrl, PDO::PARAM_STR);
+            $stmt->execute(); $row = $stmt->fetch(PDO::FETCH_ASSOC);
+            if (is_array($row)) {
+                return $row;
+            }
+        }
+
+        return null;
     }
 
     public function touchPeerWakeSent(string $interfaceId): void

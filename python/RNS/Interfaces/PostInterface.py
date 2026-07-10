@@ -181,15 +181,11 @@ class PostInterface(Interface):
             self._peer_interface_id = secrets.token_hex(16)
             self._peer_session_token = secrets.token_hex(32)
 
-            # peer_url must be the base URL — the PHP node appends /v1/wake.
-            peer_url = self.wake_url.rstrip('/')
-            if peer_url.endswith('/v1/wake'):
-                peer_url = peer_url[:-len('/v1/wake')]
-
+            # peer_url is the literal wake endpoint — used as-is.
             metadata.update({
                 'client': 'reticulum-php',
                 'implementation': 'PostInterface',
-                'peer_url': peer_url,
+                'peer_url': self.wake_url,
                 'peer_interface_id': self._peer_interface_id,
                 'peer_session_token': self._peer_session_token,
             })

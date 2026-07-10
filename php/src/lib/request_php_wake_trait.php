@@ -37,12 +37,7 @@ trait RequestPhpWakeTrait
 
     private function fireAndForgetWake(string $peerUrl, int $timeoutMs): void
     {
-        // peerUrl is the base URL. Append /v1/wake unless already present.
-        $peerUrl = rtrim($peerUrl, '/');
-        if (!str_ends_with($peerUrl, '/v1/wake')) {
-            $peerUrl .= '/v1/wake';
-        }
-
+        // peerUrl is the literal wake endpoint — use it as-is.
         $hostUrl = $this->config['host_url'] ?? ($this->config['http']['advertise_url'] ?? null);
         if (!is_string($hostUrl) || trim($hostUrl) === '') {
             return;
@@ -324,26 +319,36 @@ trait RequestPhpWakeTrait
                 continue;
             }
 
-            $peerUrl = $ifaceConfig['node_url'] ?? $ifaceConfig['peer_url'] ?? null;
-            if (!is_string($peerUrl) || trim($peerUrl) === '') {
+            $exchangeUrl = $ifaceConfig['node_url'] ?? $ifaceConfig['peer_url'] ?? null;
+            if (!is_string($exchangeUrl) || trim($exchangeUrl) === '') {
                 continue;
             }
+            $exchangeUrl = rtrim(trim($exchangeUrl), '/');
 
-            $peerUrl = rtrim(trim($peerUrl), '/');
-            $result = $this->connectToPeer($peerUrl, $hostUrl, (string) $ifaceName);
+            // Wake URL: explicit config field takes precedence, otherwise
+            // the standard PHP node convention (<base>/v1/wake).
+            $wakeUrl = $ifaceConfig['wake_url'] ?? null;
+            if (is_string($wakeUrl) && trim($wakeUrl) !== '') {
+                $wakeUrl = trim($wakeUrl);
+            } else {
+                $wakeUrl = $exchangeUrl . '/v1/wake';
+            }
+
+            $result = $this->connectToPeer($exchangeUrl, $wakeUrl, $hostUrl, (string) $ifaceName);
             $summary['peers'][] = $result;
         }
 
         return $summary;
     }
 
-    private function connectToPeer(string $peerUrl, string $hostUrl, string $name): array
+    private function connectToPeer(string $exchangeUrl, string $wakeUrl, string $hostUrl, string $name): array
     {
         // Check if already connected.
-        $existing = $this->phpPeerInterfaceByPeerUrl($peerUrl);
+        $existing = $this->phpPeerInterfaceByPeerUrl($exchangeUrl);
         if ($existing !== null) {
             return [
-                'peer_url' => $peerUrl,
+                'peer_url' => $exchangeUrl,
+                'wake_url' => $wakeUrl,
                 'status' => 'already_connected',
                 'interface_id' => $existing['interface_id'],
             ];
@@ -353,15 +358,15 @@ trait RequestPhpWakeTrait
         $localInterfaceId = bin2hex(random_bytes(16));
         $localSessionToken = bin2hex(random_bytes(32));
 
-        // Register with the peer.
-        $registerUrl = $peerUrl . '/v1/interfaces/register';
+        // Register with the peer using the exchange base URL.
+        $registerUrl = $exchangeUrl . '/v1/interfaces/register';
         $body = json_encode([
             'name' => $name,
             'bitrate' => 1000000,
             'mtu' => 500,
             'metadata' => [
                 'client' => 'reticulum-php',
-                'peer_url' => $hostUrl,
+                'peer_url' => $hostUrl . '/v1/wake',
                 'peer_interface_id' => $localInterfaceId,
                 'peer_session_token' => $localSessionToken,
             ],
@@ -370,7 +375,7 @@ trait RequestPhpWakeTrait
         $response = $this->httpPostJson($registerUrl, $body);
         if ($response === null) {
             return [
-                'peer_url' => $peerUrl,
+                'peer_url' => $exchangeUrl,
                 'status' => 'register_failed',
             ];
         }
@@ -379,26 +384,28 @@ trait RequestPhpWakeTrait
         $remoteSessionToken = isset($response['session_token']) && is_string($response['session_token']) ? $response['session_token'] : null;
         if ($remoteInterfaceId === null || $remoteSessionToken === null) {
             return [
-                'peer_url' => $peerUrl,
+                'peer_url' => $exchangeUrl,
                 'status' => 'register_malformed_response',
             ];
         }
 
         // Store the peer locally so we can queue packets and send wakes.
+        // wakeUrl is the literal URL for fire-and-forget wake POSTs.
         $this->upsertConfiguredInterface(
             $localInterfaceId,
             $name,
             $localSessionToken,
             1000000,
             500,
-            ['client' => 'reticulum-php', 'peer_url' => $peerUrl],
-            $peerUrl,
+            ['client' => 'reticulum-php', 'peer_url' => $exchangeUrl],
+            $wakeUrl,
             $remoteInterfaceId,
             $remoteSessionToken,
         );
 
         return [
-            'peer_url' => $peerUrl,
+            'peer_url' => $exchangeUrl,
+            'wake_url' => $wakeUrl,
             'status' => 'connected',
             'interface_id' => $localInterfaceId,
         ];
