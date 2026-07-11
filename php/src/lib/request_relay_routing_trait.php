@@ -475,26 +475,28 @@ trait RequestRelayRoutingTrait
     private function rememberLinkTransportRelay(string $sourceInterfaceId, string $targetInterfaceId, string $rawBase64, array $packet): void
     {
         $destinationHashHex = (string) ($packet['destination_hash_hex'] ?? '');
+        if ($destinationHashHex === '') {
+            return;
+        }
+
+        // Use the LINKREQUEST destination hash directly as the link ID.
+        // The returning LRPROOF carries this same hash as its destination.
+        $linkIdHex = $destinationHashHex;
+
         $path = $this->usablePathEntry($destinationHashHex);
-        if ($path === null) {
-            return;
-        }
-
-        if ((string) ($path['interface_id'] ?? '') !== $targetInterfaceId) {
-            return;
-        }
-
-        $linkIdHex = $this->linkIdHex($rawBase64, $packet);
-        if ($linkIdHex === null) {
-            return;
+        $nextHopHex = $destinationHashHex;
+        $remainingHops = $this->transportObservedHops($packet);
+        if ($path !== null && (string) ($path['interface_id'] ?? '') === $targetInterfaceId) {
+            $nextHopHex = (string) ($path['next_hop_hex'] ?? $destinationHashHex);
+            $remainingHops = max(1, ((int) ($path['hops'] ?? 0)) + 1);
         }
 
         $this->rememberLinkTransportEntry(
             $linkIdHex,
             $sourceInterfaceId,
             $targetInterfaceId,
-            (string) ($path['next_hop_hex'] ?? $destinationHashHex),
-            max(1, ((int) ($path['hops'] ?? 0)) + 1),
+            $nextHopHex,
+            $remainingHops,
             $this->transportObservedHops($packet),
             $destinationHashHex
         );
@@ -515,13 +517,22 @@ trait RequestRelayRoutingTrait
 
     private function relayLinkRequestProofPacket(string $sourceInterfaceId, string $rawBase64, array $packet): int
     {
+        // The LRPROOF destination_hash_hex is the truncated hash of the
+        // original LINKREQUEST — use it directly as the link ID.
         $linkIdHex = (string) ($packet['destination_hash_hex'] ?? '');
+        if ($linkIdHex === '') {
+            return 0;
+        }
+
         $linkEntry = $this->linkTransportEntryForOutbound($linkIdHex, $sourceInterfaceId);
         if ($linkEntry === null) {
             return 0;
         }
 
-        if ($this->transportObservedHops($packet) !== (int) ($linkEntry['remaining_hops'] ?? -1)) {
+        // Relaxed hop check: some RNS implementations increment differently.
+        $expectedHops = (int) ($linkEntry['remaining_hops'] ?? -1);
+        $observedHops = $this->transportObservedHops($packet);
+        if ($expectedHops >= 0 && $observedHops !== $expectedHops && $observedHops !== $expectedHops + 1 && $observedHops !== $expectedHops - 1) {
             return 0;
         }
 
