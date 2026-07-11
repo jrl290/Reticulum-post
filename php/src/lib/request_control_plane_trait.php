@@ -138,11 +138,14 @@ trait RequestControlPlaneTrait
             return (string) ($packet['announce_status'] ?? '') !== 'invalid';
         }
 
-        if ((int) ($packet['destination_type'] ?? -1) === 3) {
+        // Path requests are handled separately.
+        if ($this->isPathRequestPacket($packet)) {
             return false;
         }
 
-        if ($this->isPathRequestPacket($packet)) {
+        // Data and link packets: relay if a usable path exists.
+        // Proofs (type 3) are routed by reverse path, not generic relay.
+        if ((int) ($packet['packet_type'] ?? -1) === 3) {
             return false;
         }
 

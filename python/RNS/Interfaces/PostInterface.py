@@ -344,12 +344,15 @@ class PostInterface(Interface):
         while self._running:
             now = time.time()
 
-            # Check for pending wake — trigger immediate exchange.
+            # Check for pending wake OR queued outbound packets.
             with self._wake_lock:
                 triggered = self._pending_wake
                 self._pending_wake = False
 
-            if not triggered:
+            with self._queue_lock:
+                has_outbound = len(self._outgoing_queue) > 0
+
+            if not triggered and not has_outbound:
                 # Determine poll interval.
                 if self._poll_interval is not None:
                     interval = max(self._poll_interval, _min_interval)
