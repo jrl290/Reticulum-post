@@ -14,7 +14,21 @@ trait RequestPhpWakeTrait
 {
     public function dispatchWakes(): void
     {
+        // Wake peers with pending outbound (primary trigger).
         $peers = $this->phpPeerInterfaceIdsWithPendingOutbound();
+
+        // Also wake peers that have pending acks owed to them — this ensures
+        // the ack cycle completes even when only one side has outbound traffic.
+        $ackPeers = $this->phpPeerInterfaceIdsWithPendingAcks();
+        $seen = [];
+        foreach ($peers as $p) { $seen[(string)$p['interface_id']] = true; }
+        foreach ($ackPeers as $p) {
+            if (!isset($seen[(string)$p['interface_id']])) {
+                $peers[] = $p;
+                $seen[(string)$p['interface_id']] = true;
+            }
+        }
+
         $minWakeInterval = (int) ($this->config['http']['min_wake_interval_ms'] ?? 1000);
         $wakeTimeoutMs = (int) ($this->config['http']['wake_timeout_ms'] ?? 500);
         $now = time();
@@ -37,7 +51,10 @@ trait RequestPhpWakeTrait
 
     private function fireAndForgetWake(string $peerUrl, int $timeoutMs): void
     {
-        // peerUrl is the literal wake endpoint — use it as-is.
+        // Append /v1/wake if peerUrl is a base URL (no /v1/ path suffix).
+        if (!str_ends_with($peerUrl, "/v1/wake") && !str_contains($peerUrl, "/v1/")) {
+            $peerUrl = rtrim($peerUrl, "/") . "/v1/wake";
+        }
         $hostUrl = $this->config['host_url'] ?? ($this->config['http']['advertise_url'] ?? null);
         if (!is_string($hostUrl) || trim($hostUrl) === '') {
             return;
@@ -46,7 +63,7 @@ trait RequestPhpWakeTrait
         $hostUrl = rtrim(trim($hostUrl), '/');
         $body = json_encode([
             'waker_url' => $hostUrl,
-        ], JSON_THROW_ON_ERROR);
+        ], JSON_THROW_ON_ERROR | JSON_PARTIAL_OUTPUT_ON_ERROR);
 
         // Fire-and-forget: short timeout, ignore response.
         if (function_exists('curl_init')) {
@@ -71,7 +88,6 @@ trait RequestPhpWakeTrait
         curl_setopt($curl, CURLOPT_CONNECTTIMEOUT_MS, min($timeoutMs, 500));
         // Fire and drop — we don't care about the response.
         curl_exec($curl);
-        curl_close($curl);
     }
 
     private function fireAndForgetWakeWithStream(string $url, string $body, int $timeoutMs): void
@@ -113,13 +129,18 @@ trait RequestPhpWakeTrait
         // Call the peer's exchange endpoint.
         $exchangeUrl = $peerUrl . '/v1/interfaces/exchange';
 
-        $payload = json_encode([
-            'interface_id' => $peerInterfaceId,
-            'session_token' => $peerSessionToken,
-            'packets' => [],
-            'max_packets' => (int) $this->config['http']['max_batch_packets'],
-            'ack_batch_ids' => $ackBatchIds,
-        ], JSON_THROW_ON_ERROR);
+        try {
+            $payload = json_encode([
+                'interface_id' => $peerInterfaceId,
+                'session_token' => $peerSessionToken,
+                'packets' => [],
+                'max_packets' => (int) $this->config['http']['max_batch_packets'],
+                'ack_batch_ids' => $ackBatchIds,
+            ], JSON_THROW_ON_ERROR | JSON_PARTIAL_OUTPUT_ON_ERROR);
+        } catch (\JsonException $e) {
+            $this->log('exchangeWithPhpPeer: json_encode failed: ' . $e->getMessage());
+            return ['status' => 'encode_failed', 'message' => $e->getMessage(), 'peer_url' => $peerUrl];
+        }
 
         $response = $this->httpPostJson($exchangeUrl, $payload);
         if ($response === null) {
@@ -240,7 +261,6 @@ trait RequestPhpWakeTrait
 
         $responseBody = curl_exec($curl);
         $statusCode = (int) curl_getinfo($curl, CURLINFO_RESPONSE_CODE);
-        curl_close($curl);
 
         if ($responseBody === false || $statusCode < 200 || $statusCode >= 300) {
             return null;
@@ -370,7 +390,7 @@ trait RequestPhpWakeTrait
                 'peer_interface_id' => $localInterfaceId,
                 'peer_session_token' => $localSessionToken,
             ],
-        ], JSON_THROW_ON_ERROR);
+        ], JSON_THROW_ON_ERROR | JSON_PARTIAL_OUTPUT_ON_ERROR);
 
         $response = $this->httpPostJson($registerUrl, $body);
         if ($response === null) {

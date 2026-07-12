@@ -15,7 +15,6 @@ trait RequestInterfaceRegistryTrait
     public function registerInterface(string $name, int $bitrate, int $mtu, array $metadata): array
     {
         $now = time();
-        $interfaceId = bin2hex(random_bytes(16));
         $sessionToken = bin2hex(random_bytes(32));
 
         $peerUrl = null;
@@ -26,6 +25,49 @@ trait RequestInterfaceRegistryTrait
             $peerInterfaceId = isset($metadata['peer_interface_id']) && is_string($metadata['peer_interface_id']) ? $metadata['peer_interface_id'] : null;
             $peerSessionToken = isset($metadata['peer_session_token']) && is_string($metadata['peer_session_token']) ? $metadata['peer_session_token'] : null;
         }
+
+        // Bridge interface dedup: if a peer_url already has an interface, update it
+        // instead of creating a duplicate. Matches Python RNS where interfaces are
+        // singletons identified by transport object identity.
+        if ($peerUrl !== null && $peerInterfaceId !== null) {
+            $existing = $this->phpPeerInterfaceByPeerUrl($peerUrl);
+            if ($existing !== null) {
+                $interfaceId = (string) $existing['interface_id'];
+                $updateStmt = $this->db->prepare(
+                    'UPDATE interfaces
+                     SET session_token = :session_token,
+                         name = :name,
+                         bitrate = :bitrate,
+                         mtu = :mtu,
+                         status = :status,
+                         metadata_json = :metadata_json,
+                         last_seen_at = :last_seen_at,
+                         peer_url = :peer_url,
+                         peer_interface_id = :peer_interface_id,
+                         peer_session_token = :peer_session_token
+                     WHERE interface_id = :interface_id'
+                );
+                $updateStmt->bindValue(':session_token', $sessionToken, PDO::PARAM_STR);
+                $updateStmt->bindValue(':name', $name, PDO::PARAM_STR);
+                $updateStmt->bindValue(':bitrate', $bitrate, PDO::PARAM_INT);
+                $updateStmt->bindValue(':mtu', $mtu, PDO::PARAM_INT);
+                $updateStmt->bindValue(':status', 'online', PDO::PARAM_STR);
+                $updateStmt->bindValue(':metadata_json', self::encodeJson($metadata), PDO::PARAM_STR);
+                $updateStmt->bindValue(':last_seen_at', $now, PDO::PARAM_INT);
+                $updateStmt->bindValue(':peer_url', $peerUrl, PDO::PARAM_STR);
+                $updateStmt->bindValue(':peer_interface_id', $peerInterfaceId, PDO::PARAM_STR);
+                $updateStmt->bindValue(':peer_session_token', $peerSessionToken, $peerSessionToken === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
+                $updateStmt->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
+                $updateStmt->execute();
+
+                return [
+                    'interface_id' => $interfaceId,
+                    'session_token' => $sessionToken,
+                ];
+            }
+        }
+
+        $interfaceId = bin2hex(random_bytes(16));
 
         $stmt = $this->db->prepare(
             'INSERT INTO interfaces (
@@ -180,6 +222,41 @@ trait RequestInterfaceRegistryTrait
         }
 
         return $rows;
+    }
+
+    public function phpPeerInterfaceIdsWithPendingAcks(): array
+    {
+        $stmt = $this->db->prepare(
+            "SELECT i.interface_id, i.peer_url, i.peer_interface_id, i.peer_session_token, i.last_wake_sent_at
+             FROM interfaces i
+             WHERE i.peer_url IS NOT NULL
+               AND i.peer_interface_id IS NOT NULL
+               AND i.peer_session_token IS NOT NULL
+               AND i.pending_ack_batch_ids_json IS NOT NULL
+               AND i.pending_ack_batch_ids_json != '[]'
+               AND i.pending_ack_batch_ids_json != ''"
+        );
+        $stmt->execute();
+
+        $rows = [];
+        while (($row = $stmt->fetch(PDO::FETCH_ASSOC)) !== false) {
+            if (!is_array($row)) {
+                continue;
+            }
+            $rows[] = $row;
+        }
+
+        return $rows;
+    }
+
+    public function isPhpPeerInterface(string $interfaceId): bool
+    {
+        $stmt = $this->db->prepare(
+            'SELECT 1 FROM interfaces WHERE interface_id = :id AND peer_url IS NOT NULL AND peer_interface_id IS NOT NULL LIMIT 1'
+        );
+        $stmt->bindValue(':id', $interfaceId, PDO::PARAM_STR);
+        $stmt->execute();
+        return $stmt->fetch(PDO::FETCH_NUM) !== false;
     }
 
     public function phpPeerInterfaceByPeerUrl(string $peerUrl): ?array

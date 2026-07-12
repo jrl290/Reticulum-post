@@ -652,7 +652,7 @@ trait RequestPostInterfaceTrait
     private function postInterfaceHttpPost(string $url, array $body, int $httpTimeoutSeconds, int $connectTimeoutSeconds): array
     {
         $headers = ['Content-Type: application/json'];
-        $encodedBody = json_encode($body, JSON_THROW_ON_ERROR);
+        $encodedBody = json_encode($body, JSON_THROW_ON_ERROR | JSON_PARTIAL_OUTPUT_ON_ERROR);
 
         if (function_exists('curl_init')) {
             return $this->postInterfaceHttpPostWithCurl($url, $headers, $encodedBody, $httpTimeoutSeconds, $connectTimeoutSeconds);

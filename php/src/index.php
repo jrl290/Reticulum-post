@@ -1135,7 +1135,7 @@ final class LogWakeProvider implements WakeProvider
             'wake_event' => $event,
             'dispatched_at' => time(),
         ];
-        $line = json_encode($payload, JSON_THROW_ON_ERROR) . PHP_EOL;
+        $line = json_encode($payload, JSON_THROW_ON_ERROR | JSON_PARTIAL_OUTPUT_ON_ERROR) . PHP_EOL;
         if (file_put_contents($logPath, $line, FILE_APPEND | LOCK_EX) === false) {
             throw new RuntimeException('failed to append wake event to log sink');
         }
@@ -1262,7 +1262,7 @@ final class HttpWakeProvider implements WakeProvider
     private function requestJson(string $url, array $payload, int $httpTimeoutSeconds, int $connectTimeoutSeconds): array
     {
         $headers = ['Content-Type: application/json'];
-        $body = json_encode($payload, JSON_THROW_ON_ERROR);
+        $body = json_encode($payload, JSON_THROW_ON_ERROR | JSON_PARTIAL_OUTPUT_ON_ERROR);
 
         if (function_exists('curl_init')) {
             return $this->requestJsonWithCurl($url, $headers, $body, $httpTimeoutSeconds, $connectTimeoutSeconds);
@@ -1471,6 +1471,24 @@ final class HttpApi
                 $this->respond(200, $this->storage->monitorData());
             }
 
+            if ($method === 'POST' && $path === '/v1/maintenance/flush') {
+                $body = $this->readJsonBody();
+                $force = !empty($body['force']);
+
+                if ($force) {
+                    // Force: mark ALL non-peer interfaces as stale immediately
+                    $interfaceStaleSeconds = 0;
+                } else {
+                    $interfaceStaleSeconds = $this->maintenanceInt('interface_stale_after_seconds', 15);
+                }
+
+                $results = $this->storage->runMaintenance(
+                    $interfaceStaleSeconds,
+                    $this->maintenanceInt('batch_ttl_seconds', 86400),
+                );
+                $this->respond(200, ['status' => 'ok', 'force' => $force, 'flushed' => $results]);
+            }
+
             if ($method === 'GET' && $path === '/health') {
                 $this->respond(200, [
                     'status' => 'ok',
@@ -1544,6 +1562,7 @@ final class HttpApi
                 [$interfaceId, $sessionToken] = $this->requireInterfaceCredentials($body);
                 $this->storage->authenticateInterface($interfaceId, $sessionToken);
                 $this->runInterfaceRequestPrelude();
+                $this->storage->seedInterfaceIfNew($interfaceId);
                 $ackBatchIds = $this->optionalStringArray($body, 'ack_batch_ids');
                 $requestedMaxPackets = $body['max_packets'] ?? (int) $this->config['http']['max_batch_packets'];
                 $maxPackets = min($this->requirePositiveIntValue($requestedMaxPackets, 'max_packets'), (int) $this->config['http']['max_batch_packets']);
@@ -1568,6 +1587,7 @@ final class HttpApi
 
                 $delivery = $this->storage->fetchOutboundBatch($interfaceId, $maxPackets);
                 $this->runInterfaceRequestEpilogue();
+                try { $this->dispatchWakes(); } catch (\Throwable $e) {}
 
                 $this->respond(200, [
                     'status' => 'accepted',
@@ -1594,7 +1614,7 @@ final class HttpApi
 
                 // The wake caller has already dropped the connection.
                 // We call the peer's exchange endpoint inline to pull any pending packets.
-                $result = $this->storage->exchangeWithPhpPeer($wakerUrl);
+                try { $result = $this->storage->exchangeWithPhpPeer($wakerUrl); } catch (\Throwable $e) { $result = ["status" => "exchange_error", "message" => $e->getMessage(), "file" => $e->getFile(), "line" => $e->getLine()]; }
 
                 $this->respond(200, [
                     'status' => 'ok',
@@ -1614,6 +1634,7 @@ final class HttpApi
                 $acked = $this->storage->acknowledgeOutboundBatches($interfaceId, $ackBatchIds);
                 $batch = $this->storage->fetchOutboundBatch($interfaceId, $maxPackets);
                 $this->runInterfaceRequestEpilogue();
+                try { $this->dispatchWakes(); } catch (\Throwable $e) {}
 
                 $this->respond(200, [
                     'status' => 'ok',
@@ -1933,7 +1954,7 @@ final class TcpBridgeHttpClient
             $headers[] = $header;
         }
 
-        $body = $payload === null ? null : json_encode($payload, JSON_THROW_ON_ERROR);
+        $body = $payload === null ? null : json_encode($payload, JSON_THROW_ON_ERROR | JSON_PARTIAL_OUTPUT_ON_ERROR);
         if (function_exists('curl_init')) {
             $response = $this->requestJsonWithCurl($url, $method, $headers, $body);
         } else {

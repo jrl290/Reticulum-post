@@ -63,9 +63,10 @@ trait RequestPathStateTrait
 
     private function pathEntry(string $destinationHashHex): ?array
     {
+        $normalized = strtolower($destinationHashHex);
         $stmt = $this->db->prepare('SELECT * FROM path_entries WHERE destination_hash_hex = :destination_hash_hex');
-        $stmt->bindValue(':destination_hash_hex', $destinationHashHex, PDO::PARAM_STR);
-        $row = $stmt->execute(); $row = $stmt->fetch(PDO::FETCH_ASSOC);
+        $stmt->bindValue(':destination_hash_hex', $normalized, PDO::PARAM_STR);
+        $stmt->execute(); $row = $stmt->fetch(PDO::FETCH_ASSOC);
 
         return is_array($row) ? $row : null;
     }

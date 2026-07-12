@@ -154,11 +154,23 @@ trait RequestControlPlaneTrait
 
     private function registerLocalDestinationIfOwnInterface(string $destinationHashHex, string $interfaceId): void
     {
-        // Use the standard RNS interface mode to decide local-destination registration.
-        // Modes that represent foreign/transit destinations (gateway, access-point, boundary)
-        // must NOT be registered as local — their announces are for peers BEHIND them.
-        // Endpoint modes (full, point-to-point, roaming) register normally.
+        // PHP peer interfaces are transit pipes, not local endpoints.
+        // Their announces represent destinations on the remote node.
+        if ($this->isPhpPeerInterface($interfaceId)) {
+            return;
+        }
+
+        // Only rns-js browser/client endpoints can register local destinations.
+        // Bridge/post-interface tunnels (client=rns-post-interface or
+        // client=reticulum-php) carry foreign announces that must NOT
+        // overwrite real endpoint registrations.
         $metadata = $this->interfaceMetadata($interfaceId);
+        $client = (string) ($metadata['client'] ?? '');
+        if ($client !== 'rns-js') {
+            // This is a bridge/tunnel — do NOT register its announces as local.
+            return;
+        }
+
         $mode = (int) ($metadata['mode'] ?? 1); // default MODE_FULL
 
         // RNS mode constants: MODE_ACCESS_POINT=3, MODE_BOUNDARY=5, MODE_GATEWAY=6
@@ -166,14 +178,49 @@ trait RequestControlPlaneTrait
             return; // Transit interface — announces represent remote peers, not local
         }
 
+        // Endpoint registrations from actual browsers/clients take priority.
+        // If the existing registration is also an endpoint, allow the new
+        // endpoint to overwrite (browser re-registered on new interface).
+        $existing = $this->localDestinationRaw($destinationHashHex);
+        if ($existing !== null) {
+            $existingIface = (string) ($existing['interface_id'] ?? '');
+            if ($existingIface === $interfaceId) {
+                // Same interface re-announcing — update timestamp below.
+            } else {
+                $existingIsTransit = $this->isPhpPeerInterface($existingIface)
+                    || in_array((int) ($this->interfaceMode($existingIface)), [3, 5, 6], true);
+                $newIsTransit = $this->isPhpPeerInterface($interfaceId)
+                    || in_array($mode, [3, 5, 6], true);
+                if (!$existingIsTransit && $newIsTransit) {
+                    // Existing is a real endpoint, new is transit — keep existing.
+                    return;
+                }
+                // Otherwise: endpoint→endpoint (re-registration), transit→endpoint,
+                // or transit→transit — allow the update.
+                $del = $this->db->prepare('DELETE FROM local_destinations WHERE destination_hash_hex = :dest');
+                $del->bindValue(':dest', $destinationHashHex, PDO::PARAM_STR);
+                $del->execute();
+            }
+        }
+
         $stmt = $this->db->prepare($this->insertOrSql(
-            'INSERT OR REPLACE INTO local_destinations (destination_hash_hex, interface_id, registered_at)
+            'INSERT OR IGNORE INTO local_destinations (destination_hash_hex, interface_id, registered_at)
              VALUES (:dest, :iface, :ts)'
         ));
         $stmt->bindValue(':dest', $destinationHashHex, PDO::PARAM_STR);
         $stmt->bindValue(':iface', $interfaceId, PDO::PARAM_STR);
         $stmt->bindValue(':ts', time(), PDO::PARAM_INT);
         $stmt->execute();
+    }
+
+    private function localDestinationRaw(string $destinationHashHex): ?array
+    {
+        $stmt = $this->db->prepare(
+            'SELECT interface_id, registered_at FROM local_destinations WHERE destination_hash_hex = :dest LIMIT 1'
+        );
+        $stmt->bindValue(':dest', $destinationHashHex, PDO::PARAM_STR);
+        $row = $stmt->execute(); $row = $stmt->fetch(PDO::FETCH_ASSOC);
+        return is_array($row) ? $row : null;
     }
 
     private function localDestinationInterface(string $destinationHashHex): ?string

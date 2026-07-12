@@ -20,13 +20,42 @@ trait RequestMaintenanceTrait
         $packetHashTrimBefore = $now - $this->maintenanceInt('packet_hash_ttl_seconds', $batchTtlSeconds);
 
         $staleStmt = $this->db->prepare(
-            'UPDATE interfaces SET status = :new_status WHERE status != :current_status AND last_seen_at < :stale_before'
+            "UPDATE interfaces SET status = :new_status
+             WHERE status != :current_status
+               AND last_seen_at < :stale_before
+               AND peer_url IS NULL"
         );
         $staleStmt->bindValue(':new_status', 'offline', PDO::PARAM_STR);
         $staleStmt->bindValue(':current_status', 'offline', PDO::PARAM_STR);
         $staleStmt->bindValue(':stale_before', $staleBefore, PDO::PARAM_INT);
         $staleStmt->execute();
         $interfacesMarkedOffline = $staleStmt->rowCount();
+
+        // Peer interfaces count as active if seen recently; repair any that drifted offline.
+        // Stale peers (no activity for peer_stale_seconds) are left offline.
+        $peerActiveAfter = $now - $this->maintenanceInt('peer_stale_after_seconds', 900);
+        $peerRepairStmt = $this->db->prepare(
+            'UPDATE interfaces SET status = :online
+             WHERE peer_url IS NOT NULL
+               AND status != :online2
+               AND last_seen_at >= :active_after'
+        );
+        $peerRepairStmt->bindValue(':online', 'online', PDO::PARAM_STR);
+        $peerRepairStmt->bindValue(':online2', 'online', PDO::PARAM_STR);
+        $peerRepairStmt->bindValue(':active_after', $peerActiveAfter, PDO::PARAM_INT);
+        $peerRepairStmt->execute();
+
+        // Stale peers: mark offline so downstream relay excludes them.
+        $peerStaleStmt = $this->db->prepare(
+            'UPDATE interfaces SET status = :offline
+             WHERE peer_url IS NOT NULL
+               AND status != :offline2
+               AND last_seen_at < :stale_before'
+        );
+        $peerStaleStmt->bindValue(':offline', 'offline', PDO::PARAM_STR);
+        $peerStaleStmt->bindValue(':offline2', 'offline', PDO::PARAM_STR);
+        $peerStaleStmt->bindValue(':stale_before', $peerActiveAfter, PDO::PARAM_INT);
+        $peerStaleStmt->execute();
 
         $deleteInbound = $this->db->prepare(
             'DELETE FROM inbound_batches WHERE created_at < :trim_before'
@@ -65,6 +94,8 @@ trait RequestMaintenanceTrait
         $deleteOfflineOutboundPackets->execute();
         $trimmedOutboundPackets += $deleteOfflineOutboundPackets->rowCount();
 
+        // Stale outbound: packets queued > 1 hour ago that were never delivered.\n        // Prevents unbounded accumulation for interfaces that stay \"online\" but never pull.\n        $maxPacketAge = $this->maintenanceInt('max_outbound_packet_age_seconds', 3600);\n        $deleteStaleOutboundPackets = $this->db->prepare(\n            'DELETE FROM outbound_packets\n             WHERE acked_at IS NULL\n               AND queued_at < :max_age\n               AND interface_id IN (SELECT interface_id FROM interfaces WHERE peer_url IS NULL)'\n        );\n        $deleteStaleOutboundPackets->bindValue(':max_age', $now - $maxPacketAge, PDO::PARAM_INT);\n        $deleteStaleOutboundPackets->execute();\n        $trimmedOutboundPackets += $deleteStaleOutboundPackets->rowCount();
+
         $deleteWakeEvents = $this->db->prepare(
             'DELETE FROM wake_events
              WHERE created_at < :trim_before
@@ -89,6 +120,18 @@ trait RequestMaintenanceTrait
         $deleteExpiredPaths->bindValue(':expires_before', $now, PDO::PARAM_INT);
         $deleteExpiredPaths->execute();
         $trimmedExpiredPaths = $deleteExpiredPaths->rowCount();
+
+        // Paths through offline non-peer interfaces are dead ends — drop them.
+        // Peer interfaces are wake-driven and always viable; keep their paths.
+        $deleteDeadInterfacePaths = $this->db->prepare(
+            "DELETE FROM path_entries
+             WHERE interface_id IN (
+                 SELECT interface_id FROM interfaces
+                 WHERE status != 'online' AND peer_url IS NULL
+             )"
+        );
+        $deleteDeadInterfacePaths->execute();
+        $trimmedExpiredPaths += $deleteDeadInterfacePaths->rowCount();
 
         $deletePathRequestTags = $this->db->prepare(
             'DELETE FROM path_request_tags WHERE created_at < :trim_before'

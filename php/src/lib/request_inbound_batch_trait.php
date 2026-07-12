@@ -31,23 +31,36 @@ trait RequestInboundBatchTrait
 
         $byteCount = $this->batchByteCount($packets);
 
-        $stmt = $this->db->prepare(
-            'INSERT INTO inbound_batches (
-                interface_id, batch_id, packet_count, byte_count,
-                payload_json, created_at, processed_at, processing_summary_json
-            )
-             VALUES (
-                :interface_id, :batch_id, :packet_count, :byte_count,
-                :payload_json, :created_at, NULL, NULL
-            )'
-        );
-        $stmt->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
-        $stmt->bindValue(':batch_id', $batchId, PDO::PARAM_STR);
-        $stmt->bindValue(':packet_count', count($packets), PDO::PARAM_INT);
-        $stmt->bindValue(':byte_count', $byteCount, PDO::PARAM_INT);
-        $stmt->bindValue(':payload_json', self::encodeJson($packets), PDO::PARAM_STR);
-        $stmt->bindValue(':created_at', time(), PDO::PARAM_INT);
-        $stmt->execute();
+        try {
+            $stmt = $this->db->prepare(
+                'INSERT INTO inbound_batches (
+                    interface_id, batch_id, packet_count, byte_count,
+                    payload_json, created_at, processed_at, processing_summary_json
+                )
+                 VALUES (
+                    :interface_id, :batch_id, :packet_count, :byte_count,
+                    :payload_json, :created_at, NULL, NULL
+                )'
+            );
+            $stmt->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
+            $stmt->bindValue(':batch_id', $batchId, PDO::PARAM_STR);
+            $stmt->bindValue(':packet_count', count($packets), PDO::PARAM_INT);
+            $stmt->bindValue(':byte_count', $byteCount, PDO::PARAM_INT);
+            $stmt->bindValue(':payload_json', self::encodeJson($packets), PDO::PARAM_STR);
+            $stmt->bindValue(':created_at', time(), PDO::PARAM_INT);
+            $stmt->execute();
+        } catch (\PDOException $e) {
+            // Race: another request inserted the same batch between our
+            // duplicate check and this insert. Treat as duplicate.
+            if (str_contains($e->getMessage(), 'Duplicate entry') || str_contains($e->getMessage(), 'UNIQUE constraint')) {
+                return [
+                    'duplicate_batch' => true,
+                    'accepted_packets' => count($packets),
+                    'accepted_bytes' => $byteCount,
+                ];
+            }
+            throw $e;
+        }
 
         $this->incrementInterfaceRxCounters($interfaceId, count($packets), $byteCount);
 
@@ -95,7 +108,18 @@ trait RequestInboundBatchTrait
         $claim->bindValue(':payload_json', self::encodeJson([]), PDO::PARAM_STR);
         $claim->bindValue(':created_at', $now, PDO::PARAM_INT);
         $claim->bindValue(':processed_at', 0, PDO::PARAM_INT);
-        $claim->execute();
+        try {
+            $claim->execute();
+        } catch (\PDOException $e) {
+            if (str_contains($e->getMessage(), 'Duplicate entry') || str_contains($e->getMessage(), 'UNIQUE constraint')) {
+                return [
+                    'duplicate_batch' => true,
+                    'accepted_packets' => count($packets),
+                    'accepted_bytes' => $byteCount,
+                ];
+            }
+            throw $e;
+        }
 
         $this->incrementInterfaceRxCounters($interfaceId, count($packets), $byteCount);
 
@@ -189,11 +213,40 @@ trait RequestInboundBatchTrait
     private function deliverLocallyIfKnown(string $sourceInterfaceId, string $rawBase64, array $packet): bool
     {
         $destHash = (string) ($packet['destination_hash_hex'] ?? '');
+        $pktType = (int) ($packet['packet_type'] ?? -1);
+        error_log("[deliverLocallyIfKnown] type=$pktType dest=" . substr($destHash,0,12) . " src=" . substr($sourceInterfaceId,0,10));
         if ($destHash === '') {
             return false;
         }
 
         $localIface = $this->localDestinationInterface($destHash);
+        error_log("[deliverLocallyIfKnown] localIface=" . ($localIface ? substr($localIface,0,10) : 'null'));
+
+        // Fallback: if exact destination hash isn't registered, try to
+        // match by identity. Different aspects of the same identity
+        // (e.g. identity vs lxmf.delivery) have different destination
+        // hashes but must route to the same endpoint.
+        if ($localIface === null) {
+            $destIdentityHex = $this->knownDestinationIdentityHash($destHash);
+            if ($destIdentityHex !== null) {
+                // Check all local destinations for one with the same identity
+                $stmt = $this->db->prepare(
+                    'SELECT ld.interface_id
+                     FROM local_destinations ld
+                     INNER JOIN known_destinations kd
+                       ON kd.destination_hash_hex = ld.destination_hash_hex
+                     WHERE kd.identity_hash_hex = :id_hash
+                     LIMIT 1'
+                );
+                $stmt->bindValue(':id_hash', $destIdentityHex, PDO::PARAM_STR);
+                $stmt->execute();
+                $row = $stmt->fetch(PDO::FETCH_ASSOC);
+                if (is_array($row)) {
+                    $localIface = (string) ($row['interface_id'] ?? '');
+                }
+            }
+        }
+
         if ($localIface === null || $localIface === $sourceInterfaceId) {
             return false;
         }
@@ -202,7 +255,34 @@ trait RequestInboundBatchTrait
         $queueReason = 'local_delivery';
         $this->queueOutboundPacket($localIface, $rawBase64, $queueReason, $sourceInterfaceId);
 
+        // If this is a link request, remember the reverse path so the
+        // proof can be routed back to the requester (the bridge).
+        if ((int) ($packet['packet_type'] ?? -1) === 2) {
+            $truncatedHashHex = (string) ($packet['truncated_hash_hex'] ?? '');
+            error_log("[deliverLocallyIfKnown] LINK local delivery, storing reverse path: hash=$truncatedHashHex src=$sourceInterfaceId local=$localIface");
+            if ($truncatedHashHex !== '') {
+                $this->rememberReversePath($truncatedHashHex, $sourceInterfaceId, $localIface);
+            }
+        }
+
+        error_log("[deliverLocallyIfKnown] returning TRUE (queued local_delivery)");
         return true;
+    }
+
+    /**
+     * Look up the identity hash for a destination hash from known_destinations.
+     */
+    private function knownDestinationIdentityHash(string $destinationHashHex): ?string
+    {
+        $stmt = $this->db->prepare(
+            'SELECT identity_hash_hex FROM known_destinations
+             WHERE destination_hash_hex = :dest
+             LIMIT 1'
+        );
+        $stmt->bindValue(':dest', $destinationHashHex, PDO::PARAM_STR);
+        $stmt->execute();
+        $row = $stmt->fetch(PDO::FETCH_ASSOC);
+        return is_array($row) ? ($row['identity_hash_hex'] ?? null) : null;
     }
 
     private function processInboundBatchRow(array $row, array &$summary): void

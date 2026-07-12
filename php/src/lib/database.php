@@ -111,20 +111,20 @@ final class Database
 
     private static function connectMysql(array $config): PDO
     {
-        $host    = (string) ($config['storage']['mysql_host'] ?? '127.0.0.1');
-        $port    = (int)    ($config['storage']['mysql_port'] ?? 3306);
-        $dbname  = (string) ($config['storage']['mysql_dbname'] ?? 'reticulum_php');
-        $user    = (string) ($config['storage']['mysql_user'] ?? '');
-        $pass    = (string) ($config['storage']['mysql_pass'] ?? '');
+        $host    = (string) ($config["storage"]["mysql_host"] ?? "127.0.0.1");
+        $port    = (int)    ($config["storage"]["mysql_port"] ?? 3306);
+        $dbname  = (string) ($config["storage"]["mysql_dbname"] ?? "reticulum_php");
+        $user    = (string) ($config["storage"]["mysql_user"] ?? "");
+        $pass    = (string) ($config["storage"]["mysql_pass"] ?? "");
 
-        if ($host === '' || $dbname === '') {
+        if ($host === "" || $dbname === "") {
             throw new \RuntimeException(
-                'MySQL backend requires storage.mysql_host and storage.mysql_dbname'
+                "MySQL backend requires storage.mysql_host and storage.mysql_dbname"
             );
         }
 
         $dsn = sprintf(
-            'mysql:host=%s;port=%d;dbname=%s;charset=utf8mb4',
+            "mysql:host=%s;port=%d;dbname=%s;charset=utf8mb4",
             $host,
             $port,
             $dbname
@@ -135,6 +135,8 @@ final class Database
             PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
             PDO::ATTR_EMULATE_PREPARES   => false,
         ]);
+
+        $pdo->exec("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED");
 
         return $pdo;
     }

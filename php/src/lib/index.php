@@ -1204,7 +1204,7 @@ final class LogWakeProvider implements WakeProvider
             'wake_event' => $event,
             'dispatched_at' => time(),
         ];
-        $line = json_encode($payload, JSON_THROW_ON_ERROR) . PHP_EOL;
+        $line = json_encode($payload, JSON_THROW_ON_ERROR | JSON_PARTIAL_OUTPUT_ON_ERROR) . PHP_EOL;
         if (file_put_contents($logPath, $line, FILE_APPEND | LOCK_EX) === false) {
             throw new RuntimeException('failed to append wake event to log sink');
         }
@@ -1246,7 +1246,7 @@ final class CommandWakeProvider implements WakeProvider
             throw new RuntimeException('failed to start wake command');
         }
 
-        fwrite($pipes[0], json_encode($event, JSON_THROW_ON_ERROR));
+        fwrite($pipes[0], json_encode($event, JSON_THROW_ON_ERROR | JSON_PARTIAL_OUTPUT_ON_ERROR));
         fclose($pipes[0]);
 
         $stdout = stream_get_contents($pipes[1]);
@@ -1331,7 +1331,7 @@ final class HttpWakeProvider implements WakeProvider
     private function requestJson(string $url, array $payload, int $httpTimeoutSeconds, int $connectTimeoutSeconds): array
     {
         $headers = ['Content-Type: application/json'];
-        $body = json_encode($payload, JSON_THROW_ON_ERROR);
+        $body = json_encode($payload, JSON_THROW_ON_ERROR | JSON_PARTIAL_OUTPUT_ON_ERROR);
 
         if (function_exists('curl_init')) {
             return $this->requestJsonWithCurl($url, $headers, $body, $httpTimeoutSeconds, $connectTimeoutSeconds);
@@ -1479,6 +1479,7 @@ final class Storage
     use RequestRelayRoutingTrait;
     use RequestSchemaTrait;
     use RequestWakeDispatchTrait;
+    use RequestPhpWakeTrait;
 
     private PDO $db;
     private string $backend;
@@ -1503,6 +1504,7 @@ final class HttpApi
 
     public function handle(string $method, string $uri, array $server): never
     {
+        register_shutdown_function(fn() => $this->dispatchWakes());
         try {
             $path = $this->normalizedPath($uri, $server);
 
@@ -1569,6 +1571,7 @@ final class HttpApi
                 [$interfaceId, $sessionToken] = $this->requireInterfaceCredentials($body);
                 $this->storage->authenticateInterface($interfaceId, $sessionToken);
                 $this->runInterfaceRequestPrelude();
+                $this->storage->seedInterfaceIfNew($interfaceId);
                 $ackBatchIds = $this->optionalStringArray($body, 'ack_batch_ids');
                 $requestedMaxPackets = $body['max_packets'] ?? (int) $this->config['http']['max_batch_packets'];
                 $maxPackets = min($this->requirePositiveIntValue($requestedMaxPackets, 'max_packets'), (int) $this->config['http']['max_batch_packets']);
@@ -1593,6 +1596,7 @@ final class HttpApi
 
                 $delivery = $this->storage->fetchOutboundBatch($interfaceId, $maxPackets);
                 $this->runInterfaceRequestEpilogue();
+                try { $this->dispatchWakes(); } catch (\Throwable $e) {}
 
                 $this->respond(200, [
                     'status' => 'accepted',
@@ -1615,10 +1619,15 @@ final class HttpApi
                 $wakerUrl = $this->requireNonEmptyString($body, 'waker_url');
 
                 $this->runInterfaceRequestPrelude();
-                $result = $this->storage->handleIncomingPostInterfaceWake($wakerUrl);
+                $result = $this->storage->exchangeWithPhpPeer($wakerUrl);
                 $this->runInterfaceRequestEpilogue();
+                try { $this->dispatchWakes(); } catch (\Throwable $e) {}
 
-                $this->respond(200, $result);
+                $this->respond(200, [
+                    'status' => 'ok',
+                    'waker_url' => $wakerUrl,
+                    'exchange' => $result,
+                ]);
             }
 
             if ($method === 'POST' && $path === '/v1/interfaces/poll') {
@@ -1632,6 +1641,7 @@ final class HttpApi
                 $acked = $this->storage->acknowledgeOutboundBatches($interfaceId, $ackBatchIds);
                 $batch = $this->storage->fetchOutboundBatch($interfaceId, $maxPackets);
                 $this->runInterfaceRequestEpilogue();
+                try { $this->dispatchWakes(); } catch (\Throwable $e) {}
 
                 $this->respond(200, [
                     'status' => 'ok',
@@ -1788,7 +1798,7 @@ final class TcpBridgeState
         }
 
         $temporaryPath = $path . '.tmp';
-        file_put_contents($temporaryPath, json_encode($state, JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR));
+        file_put_contents($temporaryPath, json_encode($state, JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR | JSON_PARTIAL_OUTPUT_ON_ERROR));
         rename($temporaryPath, $path);
     }
 
@@ -1952,7 +1962,7 @@ final class TcpBridgeHttpClient
             $headers[] = $header;
         }
 
-        $body = $payload === null ? null : json_encode($payload, JSON_THROW_ON_ERROR);
+        $body = $payload === null ? null : json_encode($payload, JSON_THROW_ON_ERROR | JSON_PARTIAL_OUTPUT_ON_ERROR);
         if (function_exists('curl_init')) {
             $response = $this->requestJsonWithCurl($url, $method, $headers, $body);
         } else {
@@ -2501,7 +2511,7 @@ function runIndexCli(string $projectRoot, array $argv): int
             'queues' => $reticulumPhpStorage->healthSummary(),
         ];
 
-        fwrite(STDOUT, json_encode($summary, JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR) . PHP_EOL);
+        fwrite(STDOUT, json_encode($summary, JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR | JSON_PARTIAL_OUTPUT_ON_ERROR) . PHP_EOL);
         return 0;
     }
 
@@ -2517,7 +2527,7 @@ function runIndexCli(string $projectRoot, array $argv): int
             (int) (getmypid() ?: 0),
             new WakeDispatcher($reticulumPhpConfig),
         );
-        fwrite(STDOUT, json_encode($result, JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR) . PHP_EOL);
+        fwrite(STDOUT, json_encode($result, JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR | JSON_PARTIAL_OUTPUT_ON_ERROR) . PHP_EOL);
         return ($result['status'] ?? null) === 'failed' ? 1 : 0;
     }
 
@@ -2556,7 +2566,7 @@ if (realpath($_SERVER['SCRIPT_FILENAME'] ?? '') === __FILE__) {
         header('Access-Control-Allow-Origin: *');
         header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
         header('Access-Control-Allow-Headers: Content-Type, X-Interface-Id, X-Session-Token');
-        echo json_encode(['error' => 'internal error'], JSON_THROW_ON_ERROR);
+        echo json_encode(['error' => 'internal error'], JSON_THROW_ON_ERROR | JSON_PARTIAL_OUTPUT_ON_ERROR);
         exit;
     }
 }

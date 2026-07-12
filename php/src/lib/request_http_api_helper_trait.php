@@ -238,13 +238,37 @@ trait RequestHttpApiHelperTrait
 
     private function respond(int $statusCode, array $payload): never
     {
+
         http_response_code($statusCode);
         header('Content-Type: application/json');
         header('Access-Control-Allow-Origin: *');
         header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
         header('Access-Control-Allow-Headers: Content-Type, X-Interface-Id, X-Session-Token');
         header('Access-Control-Max-Age: 86400');
-        echo json_encode($payload, JSON_THROW_ON_ERROR);
+        // Strip control characters from all string values before encoding
+        array_walk_recursive($payload, function(&$v) {
+            if (is_string($v)) { $v = preg_replace("/[\x00-\x08\x0b\x0c\x0e-\x1f]/", "", $v); }
+        });
+        try {
+            $encoded = json_encode($payload, JSON_THROW_ON_ERROR | JSON_PARTIAL_OUTPUT_ON_ERROR);
+        } catch (\JsonException $e) {
+            $msg = "json_encode threw: " . $e->getMessage() . " keys=" . implode(",", array_keys($payload));
+            foreach ($payload as $k => $v) {
+                if (is_string($v) && preg_match("/[\x00-\x08\x0b\x0c\x0e-\x1f]/", $v)) {
+                    $msg .= " | $k has ctrl len=" . strlen($v) . " prev=" . substr($v,0,40);
+                }
+                if (is_array($v)) {
+                    foreach ($v as $i => $sv) {
+                        if (is_string($sv) && preg_match("/[\x00-\x08\x0b\x0c\x0e-\x1f]/", $sv)) {
+                            $msg .= " | $k" . "[$i] has ctrl len=" . strlen($sv);
+                        }
+                    }
+                }
+            }
+            $this->log("error", $msg);
+            $encoded = json_encode(["error" => "internal error"]);
+        }
+        echo $encoded;
         exit;
     }
 
@@ -314,6 +338,8 @@ trait RequestHttpApiHelperTrait
 
         $totalPending = array_sum(array_column($outbound, 'pending'));
         $ifaceCount = count($interfaces);
+        $ifaceOnline = count(array_filter($interfaces, fn($i) => ($i['status'] ?? '') === 'online' && ($i['peer_url'] ?? '') === ''));
+        $ifaceOffline = $ifaceCount - $ifaceOnline;
         $pktCount = count($packets);
 
         echo <<<HTML
@@ -338,15 +364,24 @@ trait RequestHttpApiHelperTrait
   .count { text-align: right; font-weight: bold; }
   h2 { font-size: 14px; color: #888; margin: 20px 0 8px; text-transform: uppercase; }
   .refresh { font-size: 10px; color: #555; }
+  .btn-flush { background: #c44; color: #fff; border: none; border-radius: 4px; padding: 6px 14px; font-size: 12px; cursor: pointer; margin-left: 12px; }
+  .btn-flush:hover { background: #d55; }
+  .btn-flush:disabled { background: #555; cursor: default; }
+  .btn-force { background: #a30; color: #fff; border: none; border-radius: 4px; padding: 6px 14px; font-size: 12px; cursor: pointer; margin-left: 6px; }
+  .btn-force:hover { background: #c40; }
+  .btn-force:disabled { background: #555; cursor: default; }
+  .flush-msg { font-size: 11px; margin-left: 12px; padding: 4px 8px; border-radius: 3px; display: inline-block; }
+  .flush-msg.ok { background: #153; color: #4f8; }
+  .flush-msg.err { background: #531; color: #f84; }
 </style>
 </head>
 <body>
 <h1>Reticulum-php</h1>
-<div class="sub">{$hostUrl} &mdash; {$now} <span class="refresh">(auto-refresh 5s)</span></div>
+<div class="sub">{$hostUrl} &mdash; {$now} <span class="refresh">(auto-refresh 5s)</span><button class="btn-flush" id="btn-flush" onclick="flushStale(false)">Flush Stale</button><button class="btn-force" id="btn-force" onclick="flushStale(true)">Force Flush</button><span id="flush-msg"></span></div>
 
 <div class="grid">
   <div class="card"><div class="val">{$totalPending}</div><div class="lbl">Pending Outbound</div></div>
-  <div class="card"><div class="val">{$ifaceCount}</div><div class="lbl">Interfaces</div></div>
+  <div class="card"><div class="val">{$ifaceOnline}<span style="font-size:14px;color:#888">/{$ifaceCount}</span></div><div class="lbl">Clients (online/total)</div></div>
   <div class="card"><div class="val">{$pktCount}</div><div class="lbl">Recent Packets</div></div>
 </div>
 
@@ -366,7 +401,48 @@ trait RequestHttpApiHelperTrait
 <table><thead><tr><th>Dest Hash</th><th>Reason</th><th>State</th><th>Queued</th></tr></thead><tbody>{$outPktRows}</tbody></table>
 
 <script>
-setTimeout(function(){ location.reload(); }, 5000);
+var autoRefresh = setTimeout(function(){ location.reload(); }, 5000);
+
+function flushStale(force) {
+  var btn = document.getElementById(force ? 'btn-force' : 'btn-flush');
+  var otherBtn = document.getElementById(force ? 'btn-flush' : 'btn-force');
+  var msg = document.getElementById('flush-msg');
+  btn.disabled = true;
+  if (otherBtn) otherBtn.disabled = true;
+  btn.textContent = force ? 'Force Flushing...' : 'Flushing...';
+  msg.className = 'flush-msg';
+  msg.textContent = '';
+
+  clearTimeout(autoRefresh);
+
+  fetch('../maintenance/flush', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ force: !!force })
+  })
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      var f = data.flushed || {};
+      var parts = [];
+      if (f.interfaces_marked_offline) parts.push(f.interfaces_marked_offline + ' ifaces offline');
+      if (f.trimmed_outbound_packets) parts.push(f.trimmed_outbound_packets + ' pkts flushed');
+      if (f.trimmed_expired_paths) parts.push(f.trimmed_expired_paths + ' paths');
+      if (f.trimmed_link_transport_entries) parts.push(f.trimmed_link_transport_entries + ' links');
+      if (parts.length === 0) parts.push('nothing to flush');
+      msg.textContent = parts.join(', ');
+      msg.className = 'flush-msg ok';
+    })
+    .catch(function(err) {
+      msg.textContent = 'Error: ' + err.message;
+      msg.className = 'flush-msg err';
+    })
+    .finally(function() {
+      btn.disabled = false;
+      if (otherBtn) otherBtn.disabled = false;
+      btn.textContent = force ? 'Force Flush' : 'Flush Stale';
+      autoRefresh = setTimeout(function(){ location.reload(); }, 3000);
+    });
+}
 </script>
 </body>
 </html>

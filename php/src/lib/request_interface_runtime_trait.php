@@ -45,44 +45,102 @@ trait RequestInterfaceRuntimeTrait
         $destinationHashHex = (string) ($parsedPacket['destination_hash_hex'] ?? '');
         $destinationPublicKeyHex = $destinationHashHex === '' ? null : $this->knownDestinationPublicKey($destinationHashHex);
         $wrappedPacketBase64 = base64_encode(IfacCodec::wrapForInterface($packetRaw, $this->ifacConfig($interfaceId)));
-        $stmt = $this->db->prepare(
-            'INSERT INTO outbound_packets (
-                interface_id,
-                packet_hash_hex,
-                proof_destination_hash_hex,
-                destination_hash_hex,
-                destination_public_key_hex,
-                packet_base64,
-                queued_at,
-                delivered_at,
-                delivered_batch_id,
-                acked_at,
-                proofed_at,
-                queue_reason
-            ) VALUES (
-                :interface_id,
-                :packet_hash_hex,
-                :proof_destination_hash_hex,
-                :destination_hash_hex,
-                :destination_public_key_hex,
-                :packet_base64,
-                :queued_at,
-                NULL,
-                NULL,
-                NULL,
-                NULL,
-                :queue_reason
-            )'
+
+        // Announce dedup per destination per interface: replace older announce for same dest.
+        // Matches Python RNS announce_queue dedup behaviour (Transport.py ~line 1380).
+        $replaced = false;
+        if ($reason === 'relay_announce' && $destinationHashHex !== '') {
+            $replaceStmt = $this->db->prepare(
+                'UPDATE outbound_packets
+                 SET packet_base64 = :packet_base64,
+                     packet_hash_hex = :packet_hash_hex,
+                     queued_at = :queued_at,
+                     delivered_at = NULL,
+                     delivered_batch_id = NULL
+                 WHERE interface_id = :interface_id
+                   AND destination_hash_hex = :dest_hash_hex
+                   AND queue_reason = :queue_reason
+                   AND acked_at IS NULL
+                   AND delivered_batch_id IS NULL'
+            );
+            $replaceStmt->bindValue(':packet_base64', $wrappedPacketBase64, PDO::PARAM_STR);
+            $replaceStmt->bindValue(':packet_hash_hex', (string) ($parsedPacket['packet_hash_hex'] ?? ''), PDO::PARAM_STR);
+            $replaceStmt->bindValue(':queued_at', time(), PDO::PARAM_INT);
+            $replaceStmt->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
+            $replaceStmt->bindValue(':dest_hash_hex', $destinationHashHex, PDO::PARAM_STR);
+            $replaceStmt->bindValue(':queue_reason', 'relay_announce', PDO::PARAM_STR);
+            $replaceStmt->execute();
+            $replaced = $replaceStmt->rowCount() > 0;
+        }
+
+        if (!$replaced) {
+            $stmt = $this->db->prepare(
+                'INSERT INTO outbound_packets (
+                    interface_id,
+                    packet_hash_hex,
+                    proof_destination_hash_hex,
+                    destination_hash_hex,
+                    destination_public_key_hex,
+                    packet_base64,
+                    queued_at,
+                    delivered_at,
+                    delivered_batch_id,
+                    acked_at,
+                    proofed_at,
+                    queue_reason
+                ) VALUES (
+                    :interface_id,
+                    :packet_hash_hex,
+                    :proof_destination_hash_hex,
+                    :destination_hash_hex,
+                    :destination_public_key_hex,
+                    :packet_base64,
+                    :queued_at,
+                    NULL,
+                    NULL,
+                    NULL,
+                    NULL,
+                    :queue_reason
+                )'
+            );
+            $stmt->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
+            $stmt->bindValue(':packet_hash_hex', (string) ($parsedPacket['packet_hash_hex'] ?? ''), PDO::PARAM_STR);
+            $stmt->bindValue(':proof_destination_hash_hex', (string) ($parsedPacket['truncated_hash_hex'] ?? ''), PDO::PARAM_STR);
+            $stmt->bindValue(':destination_hash_hex', $destinationHashHex, $destinationHashHex === '' ? PDO::PARAM_NULL : PDO::PARAM_STR);
+            $stmt->bindValue(':destination_public_key_hex', $destinationPublicKeyHex, $destinationPublicKeyHex === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
+            $stmt->bindValue(':packet_base64', $wrappedPacketBase64, PDO::PARAM_STR);
+            $stmt->bindValue(':queued_at', time(), PDO::PARAM_INT);
+            $stmt->bindValue(':queue_reason', $reason, PDO::PARAM_STR);
+            $stmt->execute();
+        }
+
+        // Cap pending outbound per interface at 256. Drop oldest unissued entries.
+        // Python RNS caps announce_queue at MAX_QUEUED_ANNOUNCES (16384).
+        $minIdStmt = $this->db->prepare(
+            'SELECT packet_id FROM outbound_packets
+             WHERE interface_id = :cap_iface
+               AND acked_at IS NULL
+               AND delivered_batch_id IS NULL
+             ORDER BY packet_id DESC
+             LIMIT 1 OFFSET :offset'
         );
-        $stmt->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
-        $stmt->bindValue(':packet_hash_hex', (string) ($parsedPacket['packet_hash_hex'] ?? ''), PDO::PARAM_STR);
-        $stmt->bindValue(':proof_destination_hash_hex', (string) ($parsedPacket['truncated_hash_hex'] ?? ''), PDO::PARAM_STR);
-        $stmt->bindValue(':destination_hash_hex', $destinationHashHex, $destinationHashHex === '' ? PDO::PARAM_NULL : PDO::PARAM_STR);
-        $stmt->bindValue(':destination_public_key_hex', $destinationPublicKeyHex, $destinationPublicKeyHex === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
-        $stmt->bindValue(':packet_base64', $wrappedPacketBase64, PDO::PARAM_STR);
-        $stmt->bindValue(':queued_at', time(), PDO::PARAM_INT);
-        $stmt->bindValue(':queue_reason', $reason, PDO::PARAM_STR);
-        $stmt->execute();
+        $minIdStmt->bindValue(':cap_iface', $interfaceId, PDO::PARAM_STR);
+        $minIdStmt->bindValue(':offset', 255, PDO::PARAM_INT);
+        $minIdStmt->execute();
+        $minKeepId = $minIdStmt->fetchColumn();
+
+        if ($minKeepId !== false && $minKeepId !== null) {
+            $delStmt = $this->db->prepare(
+                'DELETE FROM outbound_packets
+                 WHERE interface_id = :del_iface
+                   AND acked_at IS NULL
+                   AND delivered_batch_id IS NULL
+                   AND packet_id < :min_id'
+            );
+            $delStmt->bindValue(':del_iface', $interfaceId, PDO::PARAM_STR);
+            $delStmt->bindValue(':min_id', (int) $minKeepId, PDO::PARAM_INT);
+            $delStmt->execute();
+        }
 
         if ($currentExchangeInterfaceId !== null && $currentExchangeInterfaceId === $interfaceId) {
             return;
@@ -229,5 +287,11 @@ trait RequestInterfaceRuntimeTrait
     private function ifacConfig(string $interfaceId): ?array
     {
         return IfacCodec::configFromMetadata($this->interfaceMetadata($interfaceId));
+    }
+
+    private function interfaceMode(string $interfaceId): int
+    {
+        $metadata = $this->interfaceMetadata($interfaceId);
+        return (int) ($metadata['mode'] ?? 1); // default MODE_FULL
     }
 }

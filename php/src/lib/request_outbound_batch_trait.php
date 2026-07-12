@@ -531,4 +531,100 @@ trait RequestOutboundBatchTrait
         $stmt->bindValue(':packet_id', $packetId, PDO::PARAM_INT);
         $stmt->execute();
     }
+
+    private function interfaceRxPackets(string $interfaceId): int
+    {
+        $stmt = $this->db->prepare(
+            'SELECT rx_packets FROM interfaces WHERE interface_id = :id'
+        );
+        $stmt->bindValue(':id', $interfaceId, PDO::PARAM_STR);
+        $stmt->execute();
+        $row = $stmt->fetch(PDO::FETCH_ASSOC);
+        return is_array($row) ? (int) ($row['rx_packets'] ?? 0) : 0;
+    }
+
+    private function interfaceTotalOutboundCount(string $interfaceId): int
+    {
+        $stmt = $this->db->prepare(
+            'SELECT COUNT(*) as cnt FROM outbound_packets WHERE interface_id = :id'
+        );
+        $stmt->bindValue(':id', $interfaceId, PDO::PARAM_STR);
+        $stmt->execute();
+        $row = $stmt->fetch(PDO::FETCH_ASSOC);
+        return is_array($row) ? (int) ($row['cnt'] ?? 0) : 0;
+    }
+
+    /**
+     * Seed a newly-registered interface with cached announces from other
+     * interfaces. Called once per interface lifetime — only triggers when
+     * the interface has never received inbound traffic and has no outbound
+     * history.
+     */
+    public function seedInterfaceIfNew(string $interfaceId): void
+    {
+        if ($this->interfaceRxPackets($interfaceId) > 0) return;
+        if ($this->interfaceTotalOutboundCount($interfaceId) > 0) return;
+        if ($this->isPhpPeerInterface($interfaceId)) return;
+        $this->seedInterfaceWithCachedAnnounces($interfaceId);
+    }
+
+    /**
+     * Replay cached announces to a newly-registered interface so it learns
+     * existing destinations immediately — no need to wait for the next
+     * announce cycle or page reload.
+     */
+    private function seedInterfaceWithCachedAnnounces(string $interfaceId): void
+    {
+        // Find the most recent accepted announce per unique destination,
+        // excluding announces that originated from this interface (echoes).
+        $stmt = $this->db->prepare(
+            'SELECT DISTINCT destination_hash_hex
+             FROM inbound_packets
+             WHERE packet_type = 1
+               AND filter_status = :accepted
+               AND announce_status IN (:validated, :path_updated)
+               AND interface_id != :self_iface
+             ORDER BY packet_record_id DESC
+             LIMIT 64'
+        );
+        $stmt->bindValue(':accepted', 'accepted', PDO::PARAM_STR);
+        $stmt->bindValue(':validated', 'validated', PDO::PARAM_STR);
+        $stmt->bindValue(':path_updated', 'path_updated', PDO::PARAM_STR);
+        $stmt->bindValue(':self_iface', $interfaceId, PDO::PARAM_STR);
+        $stmt->execute();
+
+        $queued = 0;
+        while (($row = $stmt->fetch(PDO::FETCH_ASSOC)) !== false) {
+            if (!is_array($row)) continue;
+            $destHex = (string) ($row['destination_hash_hex'] ?? '');
+            if ($destHex === '') continue;
+
+            // Find the cached raw announce for this destination
+            $rawStmt = $this->db->prepare(
+                'SELECT raw_base64 FROM inbound_packets
+                 WHERE destination_hash_hex = :dest
+                   AND packet_type = 1
+                   AND filter_status = :accepted
+                   AND raw_base64 IS NOT NULL
+                 ORDER BY packet_record_id DESC
+                 LIMIT 1'
+            );
+            $rawStmt->bindValue(':dest', $destHex, PDO::PARAM_STR);
+            $rawStmt->bindValue(':accepted', 'accepted', PDO::PARAM_STR);
+            $rawStmt->execute();
+            $rawRow = $rawStmt->fetch(PDO::FETCH_ASSOC);
+
+            if (!is_array($rawRow)) continue;
+            $rawBase64 = (string) ($rawRow['raw_base64'] ?? '');
+            if ($rawBase64 === '') continue;
+
+            // Queue the cached announce for this interface
+            $this->queueOutboundPacket($interfaceId, $rawBase64, 'relay_announce', null);
+            $queued++;
+        }
+
+        if ($queued > 0) {
+            error_log("Reticulum-php: Seeded interface {$interfaceId} with {$queued} cached announces");
+        }
+    }
 }

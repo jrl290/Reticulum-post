@@ -66,8 +66,12 @@ trait RequestRelayRoutingTrait
             throw new RuntimeException('Relayed proof raw payload is invalid');
         }
 
-        $forwardedHops = max(0, min(255, ((int) ($packet['hops'] ?? 0)) + 1));
-        return base64_encode($this->incrementedHopRaw($raw, $forwardedHops));
+        // Do NOT increment the hop count for proofs. The proof carries the
+        // hop count set by the responder (the browser). Intermediary nodes
+        // must transport proofs unmodified — the bridge expects the proof
+        // hop to match the stored link table entry (remaining hops).
+        // Incrementing it causes a "hop mismatch" rejection in Transport.
+        return $rawBase64;
     }
 
     private function incrementedHopRaw(string $raw, int $forwardedHops): string
@@ -164,7 +168,7 @@ trait RequestRelayRoutingTrait
         string $destinationHashHex
     ): void {
         $proofExpiresAt = $this->linkRequestProofExpiresAt($receivedInterfaceId, $remainingHops);
-        $stmt = $this->db->prepare(
+        $stmt = $this->db->prepare(Database::upsertSql(
             'INSERT INTO link_transport_entries (
                 link_id_hex,
                 received_interface_id,
@@ -196,8 +200,9 @@ trait RequestRelayRoutingTrait
                 destination_hash_hex = excluded.destination_hash_hex,
                 validated = 0,
                 proof_expires_at = excluded.proof_expires_at,
-                updated_at = excluded.updated_at'
-        );
+                updated_at = excluded.updated_at',
+            $this->backend
+        ));
         $stmt->bindValue(':link_id_hex', $linkIdHex, PDO::PARAM_STR);
         $stmt->bindValue(':received_interface_id', $receivedInterfaceId, PDO::PARAM_STR);
         $stmt->bindValue(':outbound_interface_id', $outboundInterfaceId, PDO::PARAM_STR);
@@ -328,7 +333,7 @@ trait RequestRelayRoutingTrait
 
     private function rememberReversePath(string $truncatedHashHex, string $receivedInterfaceId, string $outboundInterfaceId): void
     {
-        $stmt = $this->db->prepare(
+        $stmt = $this->db->prepare(Database::upsertSql(
             'INSERT INTO reverse_path_entries (
                 truncated_hash_hex,
                 received_interface_id,
@@ -342,8 +347,9 @@ trait RequestRelayRoutingTrait
             )
             ON CONFLICT(truncated_hash_hex, outbound_interface_id) DO UPDATE SET
                 received_interface_id = excluded.received_interface_id,
-                created_at = excluded.created_at'
-        );
+                created_at = excluded.created_at',
+            $this->backend
+        ));
         $stmt->bindValue(':truncated_hash_hex', $truncatedHashHex, PDO::PARAM_STR);
         $stmt->bindValue(':received_interface_id', $receivedInterfaceId, PDO::PARAM_STR);
         $stmt->bindValue(':outbound_interface_id', $outboundInterfaceId, PDO::PARAM_STR);
@@ -395,6 +401,10 @@ trait RequestRelayRoutingTrait
             $this->queueOutboundPacket($targetInterfaceId, $relayPacketBase64, $queueReason, $sourceInterfaceId);
             if ((int) ($packet['packet_type'] ?? -1) === 2) {
                 $this->rememberLinkTransportRelay($sourceInterfaceId, $targetInterfaceId, $rawBase64, $packet);
+                // Also remember reverse path for link requests, so proof
+                // responses (which carry a different link ID) can be routed
+                // back via reverse-path lookup as fallback.
+                $this->rememberReversePath((string) $packet['truncated_hash_hex'], $sourceInterfaceId, $targetInterfaceId);
             } elseif ((int) ($packet['packet_type'] ?? -1) !== 1) {
                 $this->rememberReversePath((string) $packet['truncated_hash_hex'], $sourceInterfaceId, $targetInterfaceId);
             }
@@ -526,7 +536,9 @@ trait RequestRelayRoutingTrait
 
         $linkEntry = $this->linkTransportEntryForOutbound($linkIdHex, $sourceInterfaceId);
         if ($linkEntry === null) {
-            return 0;
+            // Fallback: try reverse-path routing. Some RNS implementations
+            // use a different link ID in the proof than what was stored.
+            return $this->relayProofPacket($sourceInterfaceId, $rawBase64, $packet);
         }
 
         // Relaxed hop check: some RNS implementations increment differently.
@@ -611,21 +623,38 @@ trait RequestRelayRoutingTrait
 
     private function allOtherInterfaceIds(string $sourceInterfaceId): array
     {
+        // Online polling interfaces (staleness handled by runMaintenance).
         $stmt = $this->db->prepare(
-            'SELECT interface_id FROM interfaces WHERE interface_id != :interface_id'
+            'SELECT interface_id FROM interfaces
+             WHERE interface_id != :interface_id
+               AND status = :status'
         );
         $stmt->bindValue(':interface_id', $sourceInterfaceId, PDO::PARAM_STR);
+        $stmt->bindValue(':status', 'online', PDO::PARAM_STR);
         $stmt->execute();
 
         $interfaceIds = [];
         while (($row = $stmt->fetch(PDO::FETCH_ASSOC)) !== false) {
-            if (!is_array($row)) {
-                continue;
-            }
+            if (!is_array($row)) continue;
+            $id = (string) ($row['interface_id'] ?? '');
+            if ($id !== '') $interfaceIds[] = $id;
+        }
 
-            $targetInterfaceId = (string) ($row['interface_id'] ?? '');
-            if ($targetInterfaceId !== '') {
-                $interfaceIds[] = $targetInterfaceId;
+        // PHP peer interfaces (wake-driven, always considered active).
+        $peerStmt = $this->db->prepare(
+            'SELECT interface_id FROM interfaces
+             WHERE interface_id != :interface_id
+               AND peer_url IS NOT NULL
+               AND peer_interface_id IS NOT NULL'
+        );
+        $peerStmt->bindValue(':interface_id', $sourceInterfaceId, PDO::PARAM_STR);
+        $peerStmt->execute();
+
+        while (($row = $peerStmt->fetch(PDO::FETCH_ASSOC)) !== false) {
+            if (!is_array($row)) continue;
+            $id = (string) ($row['interface_id'] ?? '');
+            if ($id !== '' && !in_array($id, $interfaceIds, true)) {
+                $interfaceIds[] = $id;
             }
         }
 
@@ -634,8 +663,13 @@ trait RequestRelayRoutingTrait
 
     private function isInterfaceActive(string $interfaceId): bool
     {
+        // PHP peer interfaces are always considered active (wake-driven, not polling).
+        if ($this->isPhpPeerInterface($interfaceId)) {
+            return true;
+        }
+
         $stmt = $this->db->prepare(
-            'SELECT 1 FROM interfaces WHERE interface_id = :interface_id LIMIT 1'
+            "SELECT 1 FROM interfaces WHERE interface_id = :interface_id AND status = 'online' LIMIT 1"
         );
         $stmt->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
         $stmt->execute(); $row = $stmt->fetch(PDO::FETCH_NUM);
