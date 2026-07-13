@@ -259,14 +259,9 @@ trait RequestHttpApiHelperTrait
         header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
         header('Access-Control-Allow-Headers: Content-Type, X-Interface-Id, X-Session-Token');
         header('Access-Control-Max-Age: 86400');
-        // Strip control characters from all string values before encoding.
-        // Null byte handled separately — preg_replace rejects \x00 in regex
-        // bracket expressions on some PHP builds.
+        // Strip control characters from all string values before encoding
         array_walk_recursive($payload, function(&$v) {
-            if (is_string($v)) {
-                $v = str_replace("\x00", '', $v);
-                $v = preg_replace('/[\x01-\x08\x0b\x0c\x0e-\x1f]/', '', $v);
-            }
+            if (is_string($v)) { $v = preg_replace("/[\x00-\x08\x0b\x0c\x0e-\x1f]/", "", $v); }
         });
         try {
             $encoded = json_encode($payload, JSON_THROW_ON_ERROR | JSON_PARTIAL_OUTPUT_ON_ERROR);
