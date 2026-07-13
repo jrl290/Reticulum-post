@@ -1,0 +1,30 @@
+[reticulum]
+  enable_transport = True
+  share_instance = Yes
+  instance_name = bridge
+  shared_instance_port = 37528
+  instance_control_port = 37529
+
+[logging]
+  loglevel = 7
+  logdest = /Users/james/Offline/Reticulum/Reticulum-post/python/bridge.log
+
+[interfaces]
+  [[RMAP]]
+    type = TCPClientInterface
+    enabled = yes
+    target_host = rmap.world
+    target_port = 4242
+    mode = gateway
+
+  [[PostInterface]]
+    type = PostInterface
+    enabled = yes
+    name = Retichat PHP Bridge
+    node_url = https://retichat.com/reticulum
+    wake_url = http://retichat.jrl290.synology.me/v1/wake
+    wake_listen_host = 0.0.0.0
+    wake_listen_port = 4370
+    mode = boundary
+    bitrate = 100000000
+    mtu = 500

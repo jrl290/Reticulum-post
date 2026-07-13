@@ -10,12 +10,26 @@ namespace ReticulumPhp;
 
 trait RequestHttpApiHelperTrait
 {
+    /**
+     * Run maintenance at most once per interval to keep exchange/poll calls
+     * lightweight. Maintenance touches 9+ tables and causes InnoDB deadlocks
+     * when two concurrent exchange requests both try to run it. A file-based
+     * timestamp avoids adding DB load for the rate-limit check itself.
+     */
     private function runInterfaceRequestPrelude(): void
     {
-        $this->storage->runMaintenance(
-            $this->maintenanceInt('interface_stale_after_seconds', 15),
-            $this->maintenanceInt('batch_ttl_seconds', 86400),
-        );
+        $now = time();
+        $interval = $this->maintenanceInt('maintenance_interval_seconds', 30);
+        $flagFile = ($this->config['project_root'] ?? sys_get_temp_dir()) . '/var/last_maintenance_time';
+        $lastRun = (int) @file_get_contents($flagFile);
+
+        if (($now - $lastRun) >= $interval) {
+            @file_put_contents($flagFile, (string) $now, LOCK_EX);
+            $this->storage->runMaintenance(
+                $this->maintenanceInt('interface_stale_after_seconds', 300),
+                $this->maintenanceInt('batch_ttl_seconds', 86400),
+            );
+        }
     }
 
     private function runInterfaceRequestEpilogue(): void
@@ -245,9 +259,14 @@ trait RequestHttpApiHelperTrait
         header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
         header('Access-Control-Allow-Headers: Content-Type, X-Interface-Id, X-Session-Token');
         header('Access-Control-Max-Age: 86400');
-        // Strip control characters from all string values before encoding
+        // Strip control characters from all string values before encoding.
+        // Null byte handled separately — preg_replace rejects \x00 in regex
+        // bracket expressions on some PHP builds.
         array_walk_recursive($payload, function(&$v) {
-            if (is_string($v)) { $v = preg_replace("/[\x00-\x08\x0b\x0c\x0e-\x1f]/", "", $v); }
+            if (is_string($v)) {
+                $v = str_replace("\x00", '', $v);
+                $v = preg_replace('/[\x01-\x08\x0b\x0c\x0e-\x1f]/', '', $v);
+            }
         });
         try {
             $encoded = json_encode($payload, JSON_THROW_ON_ERROR | JSON_PARTIAL_OUTPUT_ON_ERROR);

@@ -185,9 +185,15 @@ trait RequestPhpWakeTrait
         $row = $stmt->fetch(PDO::FETCH_ASSOC);
 
         $json = is_array($row) ? (string) ($row['pending_ack_batch_ids_json'] ?? '') : '';
-        $ids = $json !== '' ? self::decodeJson($json) : [];
-        if (!is_array($ids)) {
-            $ids = [];
+        $ids = [];
+        if ($json !== '') {
+            try {
+                $decoded = self::decodeJson($json);
+                $ids = is_array($decoded) ? $decoded : [];
+            } catch (\JsonException $e) {
+                $this->log('error', 'drainPeerAckBatchIds: decodeJson failed for ' . $peerInterfaceId . ': ' . $e->getMessage());
+                $ids = [];
+            }
         }
 
         // Clear them from the database.
@@ -214,14 +220,22 @@ trait RequestPhpWakeTrait
         if (is_array($row)) {
             $json = (string) ($row['pending_ack_batch_ids_json'] ?? '');
             if ($json !== '') {
-                $decoded = self::decodeJson($json);
-                if (is_array($decoded)) {
-                    $ids = $decoded;
+                try {
+                    $decoded = self::decodeJson($json);
+                    if (is_array($decoded)) {
+                        $ids = $decoded;
+                    }
+                } catch (\JsonException $e) {
+                    $this->log('error', 'appendPeerAckBatchId: decodeJson failed for ' . $peerInterfaceId . ': ' . $e->getMessage());
+                    $ids = [];
                 }
             }
         }
 
-        $ids[] = $batchId;
+        // Deduplicate: don't append if this batch ID is already pending.
+        if (!in_array($batchId, $ids, true)) {
+            $ids[] = $batchId;
+        }
 
         // Keep the list bounded.
         if (count($ids) > 64) {

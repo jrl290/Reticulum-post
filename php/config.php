@@ -1,0 +1,1 @@
+/Users/james/Offline/Reticulum/e2e-local/config.php

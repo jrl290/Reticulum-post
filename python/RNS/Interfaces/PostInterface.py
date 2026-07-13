@@ -181,11 +181,15 @@ class PostInterface(Interface):
             self._peer_interface_id = secrets.token_hex(16)
             self._peer_session_token = secrets.token_hex(32)
 
-            # peer_url is the literal wake endpoint — used as-is.
+            # peer_url must be the base URL — the PHP node appends /v1/wake.
+            peer_url = self.wake_url.rstrip('/')
+            if peer_url.endswith('/v1/wake'):
+                peer_url = peer_url[:-len('/v1/wake')]
+
             metadata.update({
                 'client': 'reticulum-php',
                 'implementation': 'PostInterface',
-                'peer_url': self.wake_url,
+                'peer_url': peer_url,
                 'peer_interface_id': self._peer_interface_id,
                 'peer_session_token': self._peer_session_token,
             })
@@ -248,8 +252,60 @@ class PostInterface(Interface):
             types = {0:'DATA',1:'ANNOUNCE',2:'LINK',3:'PROOF'}
             tname = types.get(pkt_type, str(pkt_type))
             RNS.log(f"PostInterface IN: {tname} dest={dest[:12]}... len={len(data)}", RNS.LOG_NOTICE)
+
+        # Fix: the PHP relay passes proofs through unchanged, preserving
+        # the hop count set by the responder (browser), which is always 0.
+        # RNS Transport expects the proof's hop count to match the
+        # forward-path remaining_hops for LRPROOF (link table check).
+        # Look up the link table to find the expected remaining_hops; if
+        # that fails, look up the path table hop count. Fall back to 2
+        # (the minimum for PHP-relayed destinations: NAS→PHP + PHP→node).
+        # Regular proofs use the reverse table (interface-based, not
+        # hop-based), so this increment is harmless for them.
+        if len(data) >= 2:
+            flags = data[0]
+            pkt_type = flags & 0x03
+            if pkt_type == 0x03:  # PROOF
+                hops = data[1]
+                if hops == 0:
+                    dest_hash = data[2:18]
+                    expected = 2  # default: NAS→PHP + PHP→node = 2 hops
+                    try:
+                        owner = self.owner
+                        if dest_hash in owner.link_table:
+                            expected = owner.link_table[dest_hash][3]  # IDX_LT_REM_HOPS
+                        elif dest_hash in owner.path_table:
+                            expected = owner.path_table[dest_hash][2]  # IDX_PT_HOPS
+                    except Exception:
+                        pass
+                    # Transport.inbound() increments packet.hops by 1
+                    # before the LRPROOF check, so we must set hops
+                    # to (expected - 1) so that after increment it
+                    # matches link_entry[IDX_LT_REM_HOPS].
+                    data = bytearray(data)
+                    data[1] = expected - 1
+                    data = bytes(data)
+                    dest = data[2:18].hex() if len(data) >= 18 else '?'
+                    RNS.log(f"PostInterface: PROOF hop fix 0->{expected-1} (expect={expected}) applied, dest={dest[:12]}... len={len(data)}", RNS.LOG_NOTICE)
+
+
+
         # Forward to RNS transport for processing and forwarding to backbone
         self.owner.inbound(data, self)
+
+        # Diagnostic: log all interfaces and their OUT/IN flags when an
+        # announce arrives. This helps verify whether spawned TCP client
+        # interfaces (e.g. Meshchat) are receiving announces.
+        if len(data) >= 2 and (data[0] & 0x03) == 0x01:  # ANNOUNCE
+            dest_hash = data[2:18].hex()[:12] if len(data) >= 18 else '?'
+            for iface in RNS.Transport.interfaces:
+                out = getattr(iface, 'OUT', '?')
+                inn = getattr(iface, 'IN', '?')
+                mode = getattr(iface, 'mode', '?')
+                parent = getattr(iface, 'parent_interface', None)
+                pname = (' (spawned from '+str(parent)[:40]+')') if parent is not None else ''
+                has_q = 'Q' if hasattr(iface, 'announce_queue') and len(getattr(iface, 'announce_queue', [])) > 0 else '-'
+                RNS.log(f"PostInterface diag: announce {dest_hash} -> iface={str(iface)[:55]} OUT={out} IN={inn} mode={mode}{pname} {has_q}", RNS.LOG_DEBUG)
 
     def process_outgoing(self, data):
         """Called by RNS when it wants to send a packet through this interface.
@@ -344,15 +400,12 @@ class PostInterface(Interface):
         while self._running:
             now = time.time()
 
-            # Check for pending wake OR queued outbound packets.
+            # Check for pending wake — trigger immediate exchange.
             with self._wake_lock:
                 triggered = self._pending_wake
                 self._pending_wake = False
 
-            with self._queue_lock:
-                has_outbound = len(self._outgoing_queue) > 0
-
-            if not triggered and not has_outbound:
+            if not triggered:
                 # Determine poll interval.
                 if self._poll_interval is not None:
                     interval = max(self._poll_interval, _min_interval)
