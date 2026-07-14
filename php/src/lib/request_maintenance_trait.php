@@ -57,49 +57,85 @@ trait RequestMaintenanceTrait
         $peerStaleStmt->bindValue(':stale_before', $peerActiveAfter, PDO::PARAM_INT);
         $peerStaleStmt->execute();
 
+        // Maintenance DELETEs use LIMIT to keep lock duration short and avoid
+        // deadlocks with concurrent exchange operations. Rows beyond the limit
+        // are cleaned up in the next maintenance cycle (every 30 s by default).
+
+        // Pre-fetch offline non-peer interface IDs with a non-locking read.
+        // Using subqueries in DELETE statements acquires shared locks on
+        // interfaces that can deadlock with concurrent status updates in
+        // exchange processing. Fetching IDs first avoids this.
+        $offlineIfaceIds = $this->fetchOfflineNonPeerInterfaceIds();
+        $offlinePlaceholders = $offlineIfaceIds !== []
+            ? implode(',', array_fill(0, count($offlineIfaceIds), '?'))
+            : '';
+
         $deleteInbound = $this->db->prepare(
-            'DELETE FROM inbound_batches WHERE created_at < :trim_before'
+            'DELETE FROM inbound_batches WHERE created_at < :trim_before LIMIT 1000'
         );
         $deleteInbound->bindValue(':trim_before', $trimBefore, PDO::PARAM_INT);
         $deleteInbound->execute();
         $trimmedInboundBatches = $deleteInbound->rowCount();
 
         $deleteOutboundBatches = $this->db->prepare(
-            'DELETE FROM outbound_batches WHERE acked_at IS NOT NULL AND acked_at < :trim_before'
+            'DELETE FROM outbound_batches WHERE acked_at IS NOT NULL AND acked_at < :trim_before LIMIT 1000'
         );
         $deleteOutboundBatches->bindValue(':trim_before', $trimBefore, PDO::PARAM_INT);
         $deleteOutboundBatches->execute();
         $trimmedOutboundBatches = $deleteOutboundBatches->rowCount();
 
-        $deleteOfflineOutboundBatches = $this->db->prepare(
-            "DELETE FROM outbound_batches
-             WHERE acked_at IS NULL
-               AND interface_id IN (SELECT interface_id FROM interfaces WHERE status != 'online')"
-        );
-        $deleteOfflineOutboundBatches->execute();
-        $trimmedOutboundBatches += $deleteOfflineOutboundBatches->rowCount();
+        if ($offlinePlaceholders !== '') {
+            $deleteOfflineOutboundBatches = $this->db->prepare(
+                "DELETE FROM outbound_batches
+                 WHERE acked_at IS NULL
+                   AND interface_id IN ($offlinePlaceholders)
+                 LIMIT 1000"
+            );
+            $deleteOfflineOutboundBatches->execute($offlineIfaceIds);
+            $trimmedOutboundBatches += $deleteOfflineOutboundBatches->rowCount();
+        }
 
         $deleteOutboundPackets = $this->db->prepare(
-            'DELETE FROM outbound_packets WHERE acked_at IS NOT NULL AND acked_at < :trim_before'
+            'DELETE FROM outbound_packets WHERE acked_at IS NOT NULL AND acked_at < :trim_before LIMIT 1000'
         );
         $deleteOutboundPackets->bindValue(':trim_before', $trimBefore, PDO::PARAM_INT);
         $deleteOutboundPackets->execute();
         $trimmedOutboundPackets = $deleteOutboundPackets->rowCount();
 
-        $deleteOfflineOutboundPackets = $this->db->prepare(
-            "DELETE FROM outbound_packets
-             WHERE acked_at IS NULL
-               AND interface_id IN (SELECT interface_id FROM interfaces WHERE status != 'online')"
-        );
-        $deleteOfflineOutboundPackets->execute();
-        $trimmedOutboundPackets += $deleteOfflineOutboundPackets->rowCount();
+        if ($offlinePlaceholders !== '') {
+            $deleteOfflineOutboundPackets = $this->db->prepare(
+                "DELETE FROM outbound_packets
+                 WHERE acked_at IS NULL
+                   AND interface_id IN ($offlinePlaceholders)
+                 LIMIT 1000"
+            );
+            $deleteOfflineOutboundPackets->execute($offlineIfaceIds);
+            $trimmedOutboundPackets += $deleteOfflineOutboundPackets->rowCount();
+        }
 
-        // Stale outbound: packets queued > 1 hour ago that were never delivered.\n        // Prevents unbounded accumulation for interfaces that stay \"online\" but never pull.\n        $maxPacketAge = $this->maintenanceInt('max_outbound_packet_age_seconds', 3600);\n        $deleteStaleOutboundPackets = $this->db->prepare(\n            'DELETE FROM outbound_packets\n             WHERE acked_at IS NULL\n               AND queued_at < :max_age\n               AND interface_id IN (SELECT interface_id FROM interfaces WHERE peer_url IS NULL)'\n        );\n        $deleteStaleOutboundPackets->bindValue(':max_age', $now - $maxPacketAge, PDO::PARAM_INT);\n        $deleteStaleOutboundPackets->execute();\n        $trimmedOutboundPackets += $deleteStaleOutboundPackets->rowCount();
+        // Stale outbound: packets queued > 1 hour ago that were never delivered.
+        // Prevents unbounded accumulation for interfaces that stay "online" but never pull.
+        $maxPacketAge = $this->maintenanceInt('max_outbound_packet_age_seconds', 3600);
+        $nonPeerIfaceIds = $this->fetchNonPeerInterfaceIds();
+        if ($nonPeerIfaceIds !== []) {
+            $nonPeerPlaceholders = implode(',', array_fill(0, count($nonPeerIfaceIds), '?'));
+            $maxAge = $now - $maxPacketAge;
+            $deleteStaleOutboundPackets = $this->db->prepare(
+                "DELETE FROM outbound_packets
+                 WHERE acked_at IS NULL
+                   AND queued_at < ?
+                   AND interface_id IN ($nonPeerPlaceholders)
+                 LIMIT 1000"
+            );
+            $deleteStaleOutboundPackets->execute(array_merge([$maxAge], $nonPeerIfaceIds));
+            $trimmedOutboundPackets += $deleteStaleOutboundPackets->rowCount();
+        }
 
         $deleteWakeEvents = $this->db->prepare(
             'DELETE FROM wake_events
              WHERE created_at < :trim_before
-               AND (dispatched_at IS NOT NULL OR failed_at IS NOT NULL)'
+               AND (dispatched_at IS NOT NULL OR failed_at IS NOT NULL)
+             LIMIT 1000'
         );
         $deleteWakeEvents->bindValue(':trim_before', $trimBefore, PDO::PARAM_INT);
         $deleteWakeEvents->execute();
@@ -108,14 +144,14 @@ trait RequestMaintenanceTrait
         $failedOrphanedWakeClaims = $this->failOrphanedClaimedWakeEvents();
 
         $deletePacketHashes = $this->db->prepare(
-            'DELETE FROM packet_hashes WHERE first_seen_at < :trim_before'
+            'DELETE FROM packet_hashes WHERE first_seen_at < :trim_before LIMIT 1000'
         );
         $deletePacketHashes->bindValue(':trim_before', $packetHashTrimBefore, PDO::PARAM_INT);
         $deletePacketHashes->execute();
         $trimmedPacketHashes = $deletePacketHashes->rowCount();
 
         $deleteExpiredPaths = $this->db->prepare(
-            'DELETE FROM path_entries WHERE expires_at < :expires_before'
+            'DELETE FROM path_entries WHERE expires_at < :expires_before LIMIT 1000'
         );
         $deleteExpiredPaths->bindValue(':expires_before', $now, PDO::PARAM_INT);
         $deleteExpiredPaths->execute();
@@ -123,18 +159,18 @@ trait RequestMaintenanceTrait
 
         // Paths through offline non-peer interfaces are dead ends — drop them.
         // Peer interfaces are wake-driven and always viable; keep their paths.
-        $deleteDeadInterfacePaths = $this->db->prepare(
-            "DELETE FROM path_entries
-             WHERE interface_id IN (
-                 SELECT interface_id FROM interfaces
-                 WHERE status != 'online' AND peer_url IS NULL
-             )"
-        );
-        $deleteDeadInterfacePaths->execute();
-        $trimmedExpiredPaths += $deleteDeadInterfacePaths->rowCount();
+        if ($offlinePlaceholders !== '') {
+            $deleteDeadInterfacePaths = $this->db->prepare(
+                "DELETE FROM path_entries
+                 WHERE interface_id IN ($offlinePlaceholders)
+                 LIMIT 1000"
+            );
+            $deleteDeadInterfacePaths->execute($offlineIfaceIds);
+            $trimmedExpiredPaths += $deleteDeadInterfacePaths->rowCount();
+        }
 
         $deletePathRequestTags = $this->db->prepare(
-            'DELETE FROM path_request_tags WHERE created_at < :trim_before'
+            'DELETE FROM path_request_tags WHERE created_at < :trim_before LIMIT 1000'
         );
         $deletePathRequestTags->bindValue(
             ':trim_before',
@@ -145,7 +181,7 @@ trait RequestMaintenanceTrait
         $trimmedPathRequestTags = $deletePathRequestTags->rowCount();
 
         $deleteReversePaths = $this->db->prepare(
-            'DELETE FROM reverse_path_entries WHERE created_at < :trim_before'
+            'DELETE FROM reverse_path_entries WHERE created_at < :trim_before LIMIT 1000'
         );
         $deleteReversePaths->bindValue(
             ':trim_before',
@@ -155,21 +191,29 @@ trait RequestMaintenanceTrait
         $deleteReversePaths->execute();
         $trimmedReversePaths = $deleteReversePaths->rowCount();
 
-        $deleteOfflineReversePaths = $this->db->prepare(
-            "DELETE FROM reverse_path_entries
-             WHERE received_interface_id IN (SELECT interface_id FROM interfaces WHERE status != 'online')
-                OR outbound_interface_id IN (SELECT interface_id FROM interfaces WHERE status != 'online')"
-        );
-        $deleteOfflineReversePaths->execute();
-        $trimmedReversePaths += $deleteOfflineReversePaths->rowCount();
+        if ($offlinePlaceholders !== '') {
+            $deleteOfflineReversePaths = $this->db->prepare(
+                "DELETE FROM reverse_path_entries
+                 WHERE received_interface_id IN ($offlinePlaceholders)
+                    OR outbound_interface_id IN ($offlinePlaceholders)
+                 LIMIT 1000"
+            );
+            $deleteOfflineReversePaths->execute(array_merge($offlineIfaceIds, $offlineIfaceIds));
+            $trimmedReversePaths += $deleteOfflineReversePaths->rowCount();
+        }
 
-        $deleteOfflineLinkTransport = $this->db->prepare(
-            "DELETE FROM link_transport_entries
-             WHERE received_interface_id IN (SELECT interface_id FROM interfaces WHERE status != 'online')
-                OR outbound_interface_id IN (SELECT interface_id FROM interfaces WHERE status != 'online')"
-        );
-        $deleteOfflineLinkTransport->execute();
-        $trimmedLinkTransport = $deleteOfflineLinkTransport->rowCount();
+        if ($offlinePlaceholders !== '') {
+            $deleteOfflineLinkTransport = $this->db->prepare(
+                "DELETE FROM link_transport_entries
+                 WHERE received_interface_id IN ($offlinePlaceholders)
+                    OR outbound_interface_id IN ($offlinePlaceholders)
+                 LIMIT 1000"
+            );
+            $deleteOfflineLinkTransport->execute(array_merge($offlineIfaceIds, $offlineIfaceIds));
+            $trimmedLinkTransport = $deleteOfflineLinkTransport->rowCount();
+        } else {
+            $trimmedLinkTransport = 0;
+        }
 
         $validatedLinkActiveAfter = $now - $this->maintenanceInt('link_transport_ttl_seconds', 900);
         $invalidatedPaths = $this->invalidatePathsForExpiredPendingLinks($now, $validatedLinkActiveAfter);
@@ -180,7 +224,8 @@ trait RequestMaintenanceTrait
                AND (
                     (proof_expires_at IS NOT NULL AND proof_expires_at < :now)
                  OR (proof_expires_at IS NULL AND updated_at < :active_after)
-               )'
+               )
+             LIMIT 1000'
         );
         $deleteExpiredPendingLinkTransport->bindValue(':now', $now, PDO::PARAM_INT);
         $deleteExpiredPendingLinkTransport->bindValue(':active_after', $validatedLinkActiveAfter, PDO::PARAM_INT);
@@ -190,7 +235,8 @@ trait RequestMaintenanceTrait
         $deleteInactiveValidatedLinkTransport = $this->db->prepare(
             'DELETE FROM link_transport_entries
              WHERE validated = 1
-               AND updated_at < :active_after'
+               AND updated_at < :active_after
+             LIMIT 1000'
         );
         $deleteInactiveValidatedLinkTransport->bindValue(':active_after', $validatedLinkActiveAfter, PDO::PARAM_INT);
         $deleteInactiveValidatedLinkTransport->execute();
@@ -210,6 +256,53 @@ trait RequestMaintenanceTrait
             'trimmed_reverse_paths' => $trimmedReversePaths,
             'trimmed_link_transport_entries' => $trimmedLinkTransport,
         ];
+    }
+
+    /**
+     * Fetch interface_ids for offline non-peer interfaces.
+     *
+     * Uses a plain SELECT (no locking) instead of a subquery in DELETE
+     * statements to avoid shared locks on the interfaces table that can
+     * deadlock with concurrent status updates during exchange processing.
+     *
+     * @return string[]
+     */
+    private function fetchOfflineNonPeerInterfaceIds(): array
+    {
+        $stmt = $this->db->prepare(
+            "SELECT interface_id FROM interfaces
+             WHERE status != 'online' AND peer_url IS NULL"
+        );
+        $stmt->execute();
+        $ids = [];
+        while (($row = $stmt->fetch(PDO::FETCH_ASSOC)) !== false) {
+            $id = (string) ($row['interface_id'] ?? '');
+            if ($id !== '') {
+                $ids[] = $id;
+            }
+        }
+        return $ids;
+    }
+
+    /**
+     * Fetch all non-peer interface_ids (Browser, NAS, etc.).
+     *
+     * @return string[]
+     */
+    private function fetchNonPeerInterfaceIds(): array
+    {
+        $stmt = $this->db->prepare(
+            'SELECT interface_id FROM interfaces WHERE peer_url IS NULL'
+        );
+        $stmt->execute();
+        $ids = [];
+        while (($row = $stmt->fetch(PDO::FETCH_ASSOC)) !== false) {
+            $id = (string) ($row['interface_id'] ?? '');
+            if ($id !== '') {
+                $ids[] = $id;
+            }
+        }
+        return $ids;
     }
 
     private function failOrphanedClaimedWakeEvents(): int

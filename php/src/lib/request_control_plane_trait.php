@@ -319,7 +319,11 @@ trait RequestControlPlaneTrait
     {
         $destinationHashHex = (string) $packet['destination_hash_hex'];
         $normalizedDestinationHashHex = strtolower($destinationHashHex);
-        $hops = (int) $packet['hops'];
+        // Python reference increments packet.hops at inbound() start (L1398),
+        // then stores the already-incremented value in path table (L1837→1957).
+        // transportObservedHops() mirrors this: it returns hops+1, the number
+        // of hops taken including this node.
+        $hops = $this->transportObservedHops($packet);
         $maxHops = (int) ($this->config['transport']['pathfinder_max_hops'] ?? 128);
         if ($hops > $maxHops) {
             return ['validated', 'announce_hops_exceeded'];

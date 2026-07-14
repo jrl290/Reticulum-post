@@ -843,7 +843,7 @@ final class PacketParser
         $hashablePart = chr($flags & 0b00001111);
 
         if ($headerType === self::HEADER_2) {
-            return $hashablePart . substr($raw, self::DST_LEN + 2);
+            return $hashablePart . substr($raw, 2);
         }
 
         return $hashablePart . substr($raw, 2);

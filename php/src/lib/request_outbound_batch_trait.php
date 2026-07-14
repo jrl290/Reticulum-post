@@ -106,55 +106,48 @@ trait RequestOutboundBatchTrait
 
     public function acknowledgeOutboundBatches(string $interfaceId, array $batchIds): int
     {
-        if ($batchIds === []) {
-            return 0;
-        }
-
-        $now = time();
-
-        // Batch fetch: one SELECT to find all unacked batches and their packet IDs.
-        $placeholders = implode(',', array_fill(0, count($batchIds), '?'));
-        $select = $this->db->prepare(
-            "SELECT batch_id, packet_ids_json FROM outbound_batches
-             WHERE interface_id = ? AND batch_id IN ($placeholders) AND acked_at IS NULL"
-        );
-        $params = [$interfaceId];
-        foreach ($batchIds as $bid) { $params[] = $bid; }
-        $select->execute($params);
-
-        $unackedBatchIds = [];
-        $allPacketIds = [];
-        while (($row = $select->fetch(PDO::FETCH_ASSOC)) !== false) {
-            $unackedBatchIds[] = (string) $row['batch_id'];
-            $packetIds = self::decodeJson((string) $row['packet_ids_json']);
-            foreach ($packetIds as $pid) {
-                $allPacketIds[] = (int) $pid;
-            }
-        }
-
-        if ($unackedBatchIds === []) {
-            return 0;
-        }
-
-        // Batch UPDATE: ack all unacked batches at once.
-        $batchPlaceholders = implode(',', array_fill(0, count($unackedBatchIds), '?'));
-        $updateBatches = $this->db->prepare(
-            "UPDATE outbound_batches SET acked_at = ?
-             WHERE interface_id = ? AND batch_id IN ($batchPlaceholders)"
-        );
-        $updateBatches->execute(array_merge([$now, $interfaceId], $unackedBatchIds));
-
-        // Batch UPDATE: ack all packets across all batches at once.
-        if ($allPacketIds !== []) {
-            $pktPlaceholders = implode(',', array_fill(0, count($allPacketIds), '?'));
-            $updatePackets = $this->db->prepare(
-                "UPDATE outbound_packets SET acked_at = ?, delivered_at = ?
-                 WHERE interface_id = ? AND packet_id IN ($pktPlaceholders)"
+        $acked = 0;
+        foreach ($batchIds as $batchId) {
+            $select = $this->db->prepare(
+                'SELECT packet_ids_json, acked_at FROM outbound_batches WHERE interface_id = :interface_id AND batch_id = :batch_id'
             );
-            $updatePackets->execute(array_merge([$now, $now, $interfaceId], $allPacketIds));
+            $select->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
+            $select->bindValue(':batch_id', $batchId, PDO::PARAM_STR);
+            $select->execute();
+            $batch = $select->fetch(PDO::FETCH_ASSOC);
+            if (!is_array($batch) || $batch['acked_at'] !== null) {
+                continue;
+            }
+
+            $packetIds = self::decodeJson((string) $batch['packet_ids_json']);
+            $now = time();
+
+            $updateBatch = $this->db->prepare(
+                'UPDATE outbound_batches SET acked_at = :acked_at WHERE interface_id = :interface_id AND batch_id = :batch_id'
+            );
+            $updateBatch->bindValue(':acked_at', $now, PDO::PARAM_INT);
+            $updateBatch->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
+            $updateBatch->bindValue(':batch_id', $batchId, PDO::PARAM_STR);
+            $updateBatch->execute();
+
+            foreach ($packetIds as $packetId) {
+                $updatePacket = $this->db->prepare(
+                    'UPDATE outbound_packets
+                     SET acked_at = :acked_at,
+                         delivered_at = :delivered_at
+                     WHERE packet_id = :packet_id AND interface_id = :interface_id'
+                );
+                $updatePacket->bindValue(':acked_at', $now, PDO::PARAM_INT);
+                $updatePacket->bindValue(':delivered_at', $now, PDO::PARAM_INT);
+                $updatePacket->bindValue(':packet_id', (int) $packetId, PDO::PARAM_INT);
+                $updatePacket->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
+                $updatePacket->execute();
+            }
+
+            $acked++;
         }
 
-        return count($unackedBatchIds);
+        return $acked;
     }
 
     public function fetchOutboundBatch(string $interfaceId, int $maxPackets): array
@@ -216,18 +209,13 @@ trait RequestOutboundBatchTrait
 
     private function eligibleOutboundPackets(string $interfaceId, int $maxPackets): array
     {
-        // Sort DATA/LINKREQUEST/PROOF before ANNOUNCE so user messages don't
-        // get starved behind mesh announce floods. Within each priority tier,
-        // oldest packets go first (FIFO by packet_id).
         $stmt = $this->db->prepare(
             'SELECT packet_id, packet_base64, queue_reason, destination_hash_hex
              FROM outbound_packets
              WHERE interface_id = :interface_id
                AND acked_at IS NULL
                AND delivered_batch_id IS NULL
-             ORDER BY
-               CASE WHEN queue_reason = \'relay_announce\' THEN 1 ELSE 0 END,
-               packet_id ASC'
+             ORDER BY packet_id ASC'
         );
         $stmt->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
         $stmt->execute();

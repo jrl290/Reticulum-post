@@ -10,26 +10,12 @@ namespace ReticulumPhp;
 
 trait RequestHttpApiHelperTrait
 {
-    /**
-     * Run maintenance at most once per interval to keep exchange/poll calls
-     * lightweight. Maintenance touches 9+ tables and causes InnoDB deadlocks
-     * when two concurrent exchange requests both try to run it. A file-based
-     * timestamp avoids adding DB load for the rate-limit check itself.
-     */
     private function runInterfaceRequestPrelude(): void
     {
-        $now = time();
-        $interval = $this->maintenanceInt('maintenance_interval_seconds', 30);
-        $flagFile = ($this->config['project_root'] ?? sys_get_temp_dir()) . '/var/last_maintenance_time';
-        $lastRun = (int) @file_get_contents($flagFile);
-
-        if (($now - $lastRun) >= $interval) {
-            @file_put_contents($flagFile, (string) $now, LOCK_EX);
-            $this->storage->runMaintenance(
-                $this->maintenanceInt('interface_stale_after_seconds', 300),
-                $this->maintenanceInt('batch_ttl_seconds', 86400),
-            );
-        }
+        $this->storage->runMaintenance(
+            $this->maintenanceInt('interface_stale_after_seconds', 15),
+            $this->maintenanceInt('batch_ttl_seconds', 86400),
+        );
     }
 
     private function runInterfaceRequestEpilogue(): void
@@ -252,7 +238,6 @@ trait RequestHttpApiHelperTrait
 
     private function respond(int $statusCode, array $payload): never
     {
-
         http_response_code($statusCode);
         header('Content-Type: application/json');
         header('Access-Control-Allow-Origin: *');
@@ -261,7 +246,7 @@ trait RequestHttpApiHelperTrait
         header('Access-Control-Max-Age: 86400');
         // Strip control characters from all string values before encoding
         array_walk_recursive($payload, function(&$v) {
-            if (is_string($v)) { $v = preg_replace("/[\x00-\x08\x0b\x0c\x0e-\x1f]/", "", $v); }
+            if (is_string($v) && strlen($v) > 0) { $cleaned = preg_replace("/[\x00-\x08\x0b\x0c\x0e-\x1f]/", "", str_replace("\x00", "", $v)); if ($cleaned !== null) { $v = $cleaned; } }
         });
         try {
             $encoded = json_encode($payload, JSON_THROW_ON_ERROR | JSON_PARTIAL_OUTPUT_ON_ERROR);
@@ -352,8 +337,6 @@ trait RequestHttpApiHelperTrait
 
         $totalPending = array_sum(array_column($outbound, 'pending'));
         $ifaceCount = count($interfaces);
-        $ifaceOnline = count(array_filter($interfaces, fn($i) => ($i['status'] ?? '') === 'online' && ($i['peer_url'] ?? '') === ''));
-        $ifaceOffline = $ifaceCount - $ifaceOnline;
         $pktCount = count($packets);
 
         echo <<<HTML
@@ -381,9 +364,6 @@ trait RequestHttpApiHelperTrait
   .btn-flush { background: #c44; color: #fff; border: none; border-radius: 4px; padding: 6px 14px; font-size: 12px; cursor: pointer; margin-left: 12px; }
   .btn-flush:hover { background: #d55; }
   .btn-flush:disabled { background: #555; cursor: default; }
-  .btn-force { background: #a30; color: #fff; border: none; border-radius: 4px; padding: 6px 14px; font-size: 12px; cursor: pointer; margin-left: 6px; }
-  .btn-force:hover { background: #c40; }
-  .btn-force:disabled { background: #555; cursor: default; }
   .flush-msg { font-size: 11px; margin-left: 12px; padding: 4px 8px; border-radius: 3px; display: inline-block; }
   .flush-msg.ok { background: #153; color: #4f8; }
   .flush-msg.err { background: #531; color: #f84; }
@@ -391,11 +371,11 @@ trait RequestHttpApiHelperTrait
 </head>
 <body>
 <h1>Reticulum-php</h1>
-<div class="sub">{$hostUrl} &mdash; {$now} <span class="refresh">(auto-refresh 5s)</span><button class="btn-flush" id="btn-flush" onclick="flushStale(false)">Flush Stale</button><button class="btn-force" id="btn-force" onclick="flushStale(true)">Force Flush</button><span id="flush-msg"></span></div>
+<div class="sub">{$hostUrl} &mdash; {$now} <span class="refresh">(auto-refresh 5s)</span><button class="btn-flush" id="btn-flush" onclick="flushStale()">Flush Stale</button><span id="flush-msg"></span></div>
 
 <div class="grid">
   <div class="card"><div class="val">{$totalPending}</div><div class="lbl">Pending Outbound</div></div>
-  <div class="card"><div class="val">{$ifaceOnline}<span style="font-size:14px;color:#888">/{$ifaceCount}</span></div><div class="lbl">Clients (online/total)</div></div>
+  <div class="card"><div class="val">{$ifaceCount}</div><div class="lbl">Interfaces</div></div>
   <div class="card"><div class="val">{$pktCount}</div><div class="lbl">Recent Packets</div></div>
 </div>
 
@@ -417,23 +397,17 @@ trait RequestHttpApiHelperTrait
 <script>
 var autoRefresh = setTimeout(function(){ location.reload(); }, 5000);
 
-function flushStale(force) {
-  var btn = document.getElementById(force ? 'btn-force' : 'btn-flush');
-  var otherBtn = document.getElementById(force ? 'btn-flush' : 'btn-force');
+function flushStale() {
+  var btn = document.getElementById('btn-flush');
   var msg = document.getElementById('flush-msg');
   btn.disabled = true;
-  if (otherBtn) otherBtn.disabled = true;
-  btn.textContent = force ? 'Force Flushing...' : 'Flushing...';
+  btn.textContent = 'Flushing...';
   msg.className = 'flush-msg';
   msg.textContent = '';
 
   clearTimeout(autoRefresh);
 
-  fetch('../maintenance/flush', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ force: !!force })
-  })
+  fetch('/v1/maintenance/flush', { method: 'POST' })
     .then(function(r) { return r.json(); })
     .then(function(data) {
       var f = data.flushed || {};
@@ -452,8 +426,7 @@ function flushStale(force) {
     })
     .finally(function() {
       btn.disabled = false;
-      if (otherBtn) otherBtn.disabled = false;
-      btn.textContent = force ? 'Force Flush' : 'Flush Stale';
+      btn.textContent = 'Flush Stale';
       autoRefresh = setTimeout(function(){ location.reload(); }, 3000);
     });
 }

@@ -275,6 +275,29 @@ trait RequestInboundBatchTrait
             if ($truncatedHashHex !== '') {
                 $this->registerLinkLocalDestination($truncatedHashHex, $localIface);
             }
+
+            // Create a link transport entry so that returning LRPROOF,
+            // LRRTT and subsequent link-addressed packets are routed
+            // back to the link initiator (NAS). Python reference creates
+            // this unconditionally in Transport.outbound() for all
+            // forwarded LINKREQUESTs, including to local clients.
+            $destinationHashHex = (string) ($packet['destination_hash_hex'] ?? '');
+            $linkIdHex = $this->linkIdHex($rawBase64, $packet);
+            if ($linkIdHex !== null && $linkIdHex !== '') {
+                $path = $this->usablePathEntry($destinationHashHex);
+                $remainingHops = $path !== null ? (int) ($path['hops'] ?? 0) : $this->transportObservedHops($packet);
+                $takenHops = $this->transportObservedHops($packet);
+                $nextHopHex = $path !== null ? (string) ($path['next_hop_hex'] ?? $destinationHashHex) : $destinationHashHex;
+                $this->rememberLinkTransportEntry(
+                    $linkIdHex,
+                    $sourceInterfaceId,
+                    $localIface,
+                    $nextHopHex,
+                    $remainingHops,
+                    $takenHops,
+                    $destinationHashHex
+                );
+            }
         }
 
         error_log("[deliverLocallyIfKnown] returning TRUE (queued local_delivery)");
