@@ -355,7 +355,7 @@ class PostInterface(Interface):
                     # Trigger an immediate exchange from the poll loop.
                     with iface._wake_lock:
                         iface._pending_wake = True
-                    RNS.log(f"PostInterface[{iface.name}]: Wake received from {waker_url}", RNS.LOG_DEBUG)
+                    RNS.log(f"PostInterface[{iface.name}]: Wake received from {waker_url} — queued immediate exchange", RNS.LOG_NOTICE)
 
                 except Exception as e:
                     self.send_error(400)
@@ -412,15 +412,17 @@ class PostInterface(Interface):
                 elif self.wake_url is not None:
                     interval = _wake_fallback_interval
                 else:
-                    interval = max(self._idle_ms / 2000.0, _min_interval)
+                    interval = max(self._idle_ms / 1000.0, _min_interval)
 
                 if now - last_exchange < interval:
                     time.sleep(0.5)
                     continue
 
             try:
+                RNS.log(f"PostInterface[{self.name}]: Starting exchange (triggered={triggered})...", RNS.LOG_DEBUG)
                 self._do_exchange()
                 last_exchange = now
+                RNS.log(f"PostInterface[{self.name}]: Exchange complete", RNS.LOG_DEBUG)
             except Exception as e:
                 RNS.log(f"PostInterface[{self.name}]: Exchange error: {e}", RNS.LOG_WARNING)
                 time.sleep(1)

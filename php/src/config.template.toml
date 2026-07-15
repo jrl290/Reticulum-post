@@ -1,0 +1,46 @@
+host_url = "https://your-domain.com/reticulum"
+
+[wake]
+dispatch_limit = 4
+
+[storage]
+backend = "mysql"
+mysql_host = "127.0.0.1"
+mysql_port = 3306
+mysql_dbname = "reticulum_php"
+mysql_user = "reticulum_php"
+mysql_pass = "YOUR_MYSQL_PASSWORD_HERE"
+
+[http]
+idle_exchange_interval_ms = 1000
+max_batch_packets = 64
+max_packet_bytes = 512
+
+[maintenance]
+interface_stale_after_seconds = 15
+batch_ttl_seconds = 86400
+packet_hash_ttl_seconds = 86400
+path_request_tag_ttl_seconds = 86400
+reverse_path_ttl_seconds = 480
+link_transport_ttl_seconds = 900
+
+[transport]
+rns_mtu = 500
+pathfinder_max_hops = 128
+path_expiry_default_seconds = 604800
+path_expiry_access_point_seconds = 86400
+path_expiry_roaming_seconds = 21600
+max_random_blobs = 64
+
+[interfaces]
+
+[[YourPeerName]]
+type = PostInterface
+enabled = yes
+node_url = "https://peer-domain.com/reticulum"
+wake_url = "https://your-domain.com/reticulum/v1/wake"
+bitrate = 62500
+mtu = 500
+
+[storage]
+log_path = "var/router.log"
