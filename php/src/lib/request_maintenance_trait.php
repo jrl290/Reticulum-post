@@ -153,6 +153,22 @@ trait RequestMaintenanceTrait
             $trimmedOutboundPackets += $deleteStaleOutboundPackets->rowCount();
         }
 
+        // Relay packets (announces, path requests, proofs) are fire-and-forget —
+        // they're forwarded once and never need to persist. Python drops them
+        // immediately after relay. We keep them just long enough to survive a
+        // single exchange cycle, then delete.
+        $relayTtl = $this->maintenanceInt('relay_packet_ttl_seconds', 30);
+        $relayTrimBefore = $now - $relayTtl;
+        $deleteRelayOutbound = $this->db->prepare(
+            "DELETE FROM outbound_packets
+             WHERE queue_reason != 'local_delivery'
+               AND queued_at < :ttl_before
+             LIMIT 1000"
+        );
+        $deleteRelayOutbound->bindValue(':ttl_before', $relayTrimBefore, PDO::PARAM_INT);
+        $deleteRelayOutbound->execute();
+        $trimmedOutboundPackets += $deleteRelayOutbound->rowCount();
+
         $deleteWakeEvents = $this->db->prepare(
             'DELETE FROM wake_events
              WHERE created_at < :trim_before

@@ -73,7 +73,20 @@ trait RequestPhpWakeTrait
     private function incrementWakeBackoff(string $interfaceId, int $currentFailures): void
     {
         $newCount = $currentFailures + 1;
-        $delay = min(pow(2, min($newCount, 6)), 64); // max 64 seconds
+        // Exponential backoff: 2^N seconds, uncapped.
+        $delay = pow(2, $newCount);
+
+        // After 24 hours of consecutive failures, drop the peer entirely.
+        if ($delay > 86400) {
+            $stmt = $this->db->prepare(
+                'UPDATE interfaces SET status = :offline, wake_failure_count = 0, wake_backoff_until = NULL WHERE interface_id = :id'
+            );
+            $stmt->bindValue(':offline', 'offline', PDO::PARAM_STR);
+            $stmt->bindValue(':id', $interfaceId, PDO::PARAM_STR);
+            $stmt->execute();
+            return;
+        }
+
         $backoffUntil = time() + (int) $delay;
         $stmt = $this->db->prepare(
             'UPDATE interfaces SET wake_failure_count = :count, wake_backoff_until = :until WHERE interface_id = :id'
