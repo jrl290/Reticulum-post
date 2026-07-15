@@ -202,7 +202,7 @@ trait RequestInterfaceRegistryTrait
     public function phpPeerInterfaceIdsWithPendingOutbound(): array
     {
         $stmt = $this->db->prepare(
-            'SELECT DISTINCT i.interface_id, i.peer_url, i.peer_interface_id, i.peer_session_token, i.last_wake_sent_at
+            'SELECT DISTINCT i.interface_id, i.peer_url, i.peer_interface_id, i.peer_session_token, i.last_wake_sent_at, i.wake_backoff_until, i.wake_failure_count
              FROM interfaces i
              INNER JOIN outbound_packets op ON op.interface_id = i.interface_id
              WHERE i.peer_url IS NOT NULL
@@ -227,7 +227,7 @@ trait RequestInterfaceRegistryTrait
     public function phpPeerInterfaceIdsWithPendingAcks(): array
     {
         $stmt = $this->db->prepare(
-            "SELECT i.interface_id, i.peer_url, i.peer_interface_id, i.peer_session_token, i.last_wake_sent_at
+            "SELECT i.interface_id, i.peer_url, i.peer_interface_id, i.peer_session_token, i.last_wake_sent_at, i.wake_backoff_until, i.wake_failure_count
              FROM interfaces i
              WHERE i.peer_url IS NOT NULL
                AND i.peer_interface_id IS NOT NULL

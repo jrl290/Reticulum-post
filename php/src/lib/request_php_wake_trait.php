@@ -34,8 +34,15 @@ trait RequestPhpWakeTrait
         $now = time();
 
         foreach ($peers as $peer) {
+            $peerId = (string) ($peer['interface_id'] ?? '');
             $lastWake = isset($peer['last_wake_sent_at']) ? (int) $peer['last_wake_sent_at'] : 0;
             if (($now - $lastWake) * 1000 < $minWakeInterval) {
+                continue;
+            }
+
+            // Exponential backoff: after N consecutive failures, wait 2^N seconds.
+            $backoffUntil = isset($peer['wake_backoff_until']) ? (int) $peer['wake_backoff_until'] : 0;
+            if ($backoffUntil > 0 && $now < $backoffUntil) {
                 continue;
             }
 
@@ -44,12 +51,40 @@ trait RequestPhpWakeTrait
                 continue;
             }
 
-            $this->fireAndForgetWake($peerUrl, $wakeTimeoutMs);
-            $this->touchPeerWakeSent((string) $peer['interface_id']);
+            $success = $this->fireAndForgetWake($peerUrl, $wakeTimeoutMs);
+            if ($success) {
+                $this->resetWakeBackoff($peerId);
+            } else {
+                $this->incrementWakeBackoff($peerId, isset($peer['wake_failure_count']) ? (int) $peer['wake_failure_count'] : 0);
+            }
+            $this->touchPeerWakeSent($peerId);
         }
     }
 
-    private function fireAndForgetWake(string $peerUrl, int $timeoutMs): void
+    private function resetWakeBackoff(string $interfaceId): void
+    {
+        $stmt = $this->db->prepare(
+            'UPDATE interfaces SET wake_failure_count = 0, wake_backoff_until = NULL WHERE interface_id = :id'
+        );
+        $stmt->bindValue(':id', $interfaceId, PDO::PARAM_STR);
+        $stmt->execute();
+    }
+
+    private function incrementWakeBackoff(string $interfaceId, int $currentFailures): void
+    {
+        $newCount = $currentFailures + 1;
+        $delay = min(pow(2, min($newCount, 6)), 64); // max 64 seconds
+        $backoffUntil = time() + (int) $delay;
+        $stmt = $this->db->prepare(
+            'UPDATE interfaces SET wake_failure_count = :count, wake_backoff_until = :until WHERE interface_id = :id'
+        );
+        $stmt->bindValue(':count', $newCount, PDO::PARAM_INT);
+        $stmt->bindValue(':until', $backoffUntil, PDO::PARAM_INT);
+        $stmt->bindValue(':id', $interfaceId, PDO::PARAM_STR);
+        $stmt->execute();
+    }
+
+    private function fireAndForgetWake(string $peerUrl, int $timeoutMs): bool
     {
         // Append /v1/wake if peerUrl is a base URL (no /v1/ path suffix).
         if (!str_ends_with($peerUrl, "/v1/wake") && !str_contains($peerUrl, "/v1/")) {
@@ -57,7 +92,7 @@ trait RequestPhpWakeTrait
         }
         $hostUrl = $this->config['host_url'] ?? ($this->config['http']['advertise_url'] ?? null);
         if (!is_string($hostUrl) || trim($hostUrl) === '') {
-            return;
+            return false;
         }
 
         $hostUrl = rtrim(trim($hostUrl), '/');
@@ -65,19 +100,19 @@ trait RequestPhpWakeTrait
             'waker_url' => $hostUrl,
         ], JSON_THROW_ON_ERROR | JSON_PARTIAL_OUTPUT_ON_ERROR);
 
-        // Fire-and-forget: short timeout, ignore response.
+        // Fire-and-forget: short timeout, but track success for backoff.
         if (function_exists('curl_init')) {
-            $this->fireAndForgetWakeWithCurl($peerUrl, $body, $timeoutMs);
+            return $this->fireAndForgetWakeWithCurl($peerUrl, $body, $timeoutMs);
         } else {
-            $this->fireAndForgetWakeWithStream($peerUrl, $body, $timeoutMs);
+            return $this->fireAndForgetWakeWithStream($peerUrl, $body, $timeoutMs);
         }
     }
 
-    private function fireAndForgetWakeWithCurl(string $url, string $body, int $timeoutMs): void
+    private function fireAndForgetWakeWithCurl(string $url, string $body, int $timeoutMs): bool
     {
         $curl = curl_init($url);
         if ($curl === false) {
-            return;
+            return false;
         }
 
         curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
@@ -86,11 +121,14 @@ trait RequestPhpWakeTrait
         curl_setopt($curl, CURLOPT_POSTFIELDS, $body);
         curl_setopt($curl, CURLOPT_TIMEOUT_MS, $timeoutMs);
         curl_setopt($curl, CURLOPT_CONNECTTIMEOUT_MS, min($timeoutMs, 500));
-        // Fire and drop — we don't care about the response.
-        curl_exec($curl);
+        // Fire and drop — but check if it got through for backoff tracking.
+        $result = curl_exec($curl);
+        $httpCode = curl_getinfo($curl, CURLINFO_HTTP_CODE);
+        curl_close($curl);
+        return $result !== false && $httpCode > 0;
     }
 
-    private function fireAndForgetWakeWithStream(string $url, string $body, int $timeoutMs): void
+    private function fireAndForgetWakeWithStream(string $url, string $body, int $timeoutMs): bool
     {
         $timeoutSec = max(0.1, $timeoutMs / 1000.0);
         $context = stream_context_create([
@@ -103,11 +141,13 @@ trait RequestPhpWakeTrait
             ],
         ]);
 
-        // Fire and ignore — we don't read the response.
+        // Fire and check — we need to know if it connected.
         $fp = @fopen($url, 'r', false, $context);
         if ($fp !== false) {
             fclose($fp);
+            return true;
         }
+        return false;
     }
 
     public function exchangeWithPhpPeer(string $peerUrl): array

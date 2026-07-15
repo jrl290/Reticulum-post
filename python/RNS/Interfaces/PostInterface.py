@@ -253,40 +253,42 @@ class PostInterface(Interface):
             tname = types.get(pkt_type, str(pkt_type))
             RNS.log(f"PostInterface IN: {tname} dest={dest[:12]}... len={len(data)}", RNS.LOG_NOTICE)
 
-        # Fix: the PHP relay passes proofs through unchanged, preserving
-        # the hop count set by the responder (browser), which is always 0.
-        # RNS Transport expects the proof's hop count to match the
-        # forward-path remaining_hops for LRPROOF (link table check).
+        # Fix: the PHP relay passes link transport packets (LRPROOF, LRRTT,
+        # link data) through unchanged via proofRelayPacketBase64(), preserving
+        # the hop count set by the originator, which is always 0 for browser
+        # responses. RNS Transport expects the hop count to match the
+        # forward-path remaining_hops in the link table for all link-context
+        # packets (LRPROOF, LRRTT, link data relay).
+        #
         # Look up the link table to find the expected remaining_hops; if
         # that fails, look up the path table hop count. Fall back to 2
         # (the minimum for PHP-relayed destinations: NAS→PHP + PHP→node).
-        # Regular proofs use the reverse table (interface-based, not
-        # hop-based), so this increment is harmless for them.
+        #
+        # Transport.inbound() increments packet.hops by 1 before the
+        # link table check, so we must set hops to (expected - 1) so that
+        # after increment it matches link_entry[IDX_LT_REM_HOPS].
         if len(data) >= 2:
             flags = data[0]
             pkt_type = flags & 0x03
-            if pkt_type == 0x03:  # PROOF
-                hops = data[1]
-                if hops == 0:
-                    dest_hash = data[2:18]
-                    expected = 2  # default: NAS→PHP + PHP→node = 2 hops
-                    try:
-                        owner = self.owner
-                        if dest_hash in owner.link_table:
-                            expected = owner.link_table[dest_hash][3]  # IDX_LT_REM_HOPS
-                        elif dest_hash in owner.path_table:
-                            expected = owner.path_table[dest_hash][2]  # IDX_PT_HOPS
-                    except Exception:
-                        pass
-                    # Transport.inbound() increments packet.hops by 1
-                    # before the LRPROOF check, so we must set hops
-                    # to (expected - 1) so that after increment it
-                    # matches link_entry[IDX_LT_REM_HOPS].
-                    data = bytearray(data)
-                    data[1] = expected - 1
-                    data = bytes(data)
-                    dest = data[2:18].hex() if len(data) >= 18 else '?'
-                    RNS.log(f"PostInterface: PROOF hop fix 0->{expected-1} (expect={expected}) applied, dest={dest[:12]}... len={len(data)}", RNS.LOG_NOTICE)
+            hops = data[1]
+            if hops == 0:
+                dest_hash = data[2:18]
+                expected = 2  # default: NAS→PHP + PHP→node = 2 hops
+                try:
+                    owner = self.owner
+                    if dest_hash in owner.link_table:
+                        expected = owner.link_table[dest_hash][3]  # IDX_LT_REM_HOPS
+                    elif dest_hash in owner.path_table:
+                        expected = owner.path_table[dest_hash][2]  # IDX_PT_HOPS
+                except Exception:
+                    pass
+                data = bytearray(data)
+                data[1] = expected - 1
+                data = bytes(data)
+                dest = data[2:18].hex() if len(data) >= 18 else '?'
+                types = {0:'DATA',1:'ANNOUNCE',2:'LINK',3:'PROOF'}
+                tname = types.get(pkt_type, str(pkt_type))
+                RNS.log(f"PostInterface: {tname} hop fix 0->{expected-1} (expect={expected}) dest={dest[:12]}... len={len(data)}", RNS.LOG_NOTICE)
 
 
 
