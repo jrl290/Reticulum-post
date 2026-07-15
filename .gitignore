@@ -27,3 +27,4 @@ Thumbs.db
 *.pem
 *.key
 id_rsa*
+chat.history
