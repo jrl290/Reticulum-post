@@ -103,6 +103,8 @@ trait RequestSchemaTrait
         $this->ensureColumn('interfaces', 'peer_session_token', 'TEXT');
         $this->ensureColumn('interfaces', 'last_wake_sent_at', 'INTEGER');
         $this->ensureColumn('interfaces', 'pending_ack_batch_ids_json', 'TEXT');
+        $this->ensureColumn('interfaces', 'wake_failure_count', 'INTEGER NOT NULL DEFAULT 0');
+        $this->ensureColumn('interfaces', 'wake_backoff_until', 'INTEGER');
         $this->ensureIndex('CREATE INDEX idx_interfaces_peer_url ON interfaces(peer_url)');
 
         // inbound_batches
@@ -173,6 +175,7 @@ trait RequestSchemaTrait
                 first_seen_at INTEGER NOT NULL
             )'
         );
+        $this->ensureIndex('CREATE INDEX idx_packet_hashes_first_seen ON packet_hashes(first_seen_at)');
 
         // known_destinations
         $this->execDdl(
@@ -211,6 +214,7 @@ trait RequestSchemaTrait
                 created_at INTEGER NOT NULL
             )'
         );
+        $this->ensureIndex('CREATE INDEX idx_path_request_tags_created ON path_request_tags(created_at)');
 
         // transport_state
         $this->execDdl(
@@ -301,6 +305,7 @@ trait RequestSchemaTrait
         $this->ensureIndex('CREATE INDEX idx_outbound_packets_ack_state ON outbound_packets(interface_id, acked_at, delivered_batch_id, packet_id)');
         $this->ensureIndex('CREATE INDEX idx_outbound_packets_packet_hash ON outbound_packets(packet_hash_hex)');
         $this->ensureIndex('CREATE INDEX idx_outbound_packets_proof_destination ON outbound_packets(proof_destination_hash_hex, proofed_at, packet_id)');
+        $this->ensureIndex('CREATE INDEX idx_outbound_packets_queued ON outbound_packets(queued_at)');
 
         // outbound_batches
         $this->execDdl(
@@ -313,6 +318,7 @@ trait RequestSchemaTrait
                 PRIMARY KEY (interface_id, batch_id)
             )'
         );
+        $this->ensureIndex('CREATE INDEX idx_outbound_batches_acked ON outbound_batches(acked_at)');
 
         // wake_events (auto-increment PK)
         $pk3 = $this->pkAuto('wake_event_id');
