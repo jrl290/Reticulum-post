@@ -70,12 +70,34 @@ trait RequestMaintenanceTrait
             ? implode(',', array_fill(0, count($offlineIfaceIds), '?'))
             : '';
 
-        $deleteInbound = $this->db->prepare(
+        $deleteInboundBatches = $this->db->prepare(
             'DELETE FROM inbound_batches WHERE created_at < :trim_before LIMIT 1000'
         );
-        $deleteInbound->bindValue(':trim_before', $trimBefore, PDO::PARAM_INT);
-        $deleteInbound->execute();
-        $trimmedInboundBatches = $deleteInbound->rowCount();
+        $deleteInboundBatches->bindValue(':trim_before', $trimBefore, PDO::PARAM_INT);
+        $deleteInboundBatches->execute();
+        $trimmedInboundBatches = $deleteInboundBatches->rowCount();
+
+        // Inbound packets TTL cleanup: control-plane packets (announces, link
+        // requests) flood the table; delete anything older than the TTL.
+        $inboundPacketTtl = $this->maintenanceInt('inbound_packet_ttl_seconds', 3600);
+        $inboundTrimBefore = $now - $inboundPacketTtl;
+        $deleteInboundPackets = $this->db->prepare(
+            'DELETE FROM inbound_packets WHERE created_at < :ttl_before LIMIT 1000'
+        );
+        $deleteInboundPackets->bindValue(':ttl_before', $inboundTrimBefore, PDO::PARAM_INT);
+        $deleteInboundPackets->execute();
+        $trimmedInboundPackets = $deleteInboundPackets->rowCount();
+
+        // Inbound packets for offline non-peer interfaces: dead weight, drop immediately.
+        if ($offlinePlaceholders !== '') {
+            $deleteOfflineInboundPackets = $this->db->prepare(
+                "DELETE FROM inbound_packets
+                 WHERE interface_id IN ($offlinePlaceholders)
+                 LIMIT 1000"
+            );
+            $deleteOfflineInboundPackets->execute($offlineIfaceIds);
+            $trimmedInboundPackets += $deleteOfflineInboundPackets->rowCount();
+        }
 
         $deleteOutboundBatches = $this->db->prepare(
             'DELETE FROM outbound_batches WHERE acked_at IS NOT NULL AND acked_at < :trim_before LIMIT 1000'
@@ -245,6 +267,7 @@ trait RequestMaintenanceTrait
         return [
             'interfaces_marked_offline' => $interfacesMarkedOffline,
             'trimmed_inbound_batches' => $trimmedInboundBatches,
+            'trimmed_inbound_packets' => $trimmedInboundPackets,
             'trimmed_outbound_batches' => $trimmedOutboundBatches,
             'trimmed_outbound_packets' => $trimmedOutboundPackets,
             'trimmed_wake_events' => $trimmedWakeEvents,
