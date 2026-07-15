@@ -154,17 +154,24 @@ trait RequestOutboundBatchTrait
     {
         $existingBatch = $this->existingUnackedOutboundBatch($interfaceId);
         if ($existingBatch !== null) {
-            $packetIds = $this->outboundBatchPacketIds($interfaceId, (string) $existingBatch['batch_id']);
-            $packets = $this->outboundPacketPayloads($interfaceId, (string) $existingBatch['batch_id']);
+            // Abandon batches that have been unacked for too long.
+            // Stale batches block delivery of new packets indefinitely.
+            $staleAfter = $this->maintenanceInt('outbound_batch_stale_seconds', 300);
+            if (time() - (int) ($existingBatch['created_at'] ?? 0) > $staleAfter) {
+                $this->abandonOutboundBatch($interfaceId, (string) $existingBatch['batch_id']);
+            } else {
+                $packetIds = $this->outboundBatchPacketIds($interfaceId, (string) $existingBatch['batch_id']);
+                $packets = $this->outboundPacketPayloads($interfaceId, (string) $existingBatch['batch_id']);
 
-            if ($packetIds !== [] && $packets !== []) {
-                $this->recordOutboundBatchAttempt($interfaceId, $packets);
+                if ($packetIds !== [] && $packets !== []) {
+                    $this->recordOutboundBatchAttempt($interfaceId, $packets);
 
-                return [
-                    'batch_id' => (string) $existingBatch['batch_id'],
-                    'packets' => $packets,
-                    'more' => $this->pendingOutboundPacketCount($interfaceId) > count($packetIds),
-                ];
+                    return [
+                        'batch_id' => (string) $existingBatch['batch_id'],
+                        'packets' => $packets,
+                        'more' => $this->pendingOutboundPacketCount($interfaceId) > count($packetIds),
+                    ];
+                }
             }
         }
 
@@ -358,6 +365,30 @@ trait RequestOutboundBatchTrait
         $row = $stmt->execute(); $row = $stmt->fetch(PDO::FETCH_ASSOC);
 
         return is_array($row) ? $row : null;
+    }
+
+    private function abandonOutboundBatch(string $interfaceId, string $batchId): void
+    {
+        // Clear the delivered_batch_id on packets so they can be picked up
+        // by a new batch. The old batch is marked acked (abandoned).
+        $stmt = $this->db->prepare(
+            'UPDATE outbound_packets
+             SET delivered_batch_id = NULL, delivered_at = NULL
+             WHERE interface_id = :interface_id
+               AND delivered_batch_id = :batch_id
+               AND acked_at IS NULL'
+        );
+        $stmt->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
+        $stmt->bindValue(':batch_id', $batchId, PDO::PARAM_STR);
+        $stmt->execute();
+
+        $stmt2 = $this->db->prepare(
+            'UPDATE outbound_batches SET acked_at = :now WHERE interface_id = :interface_id AND batch_id = :batch_id'
+        );
+        $stmt2->bindValue(':now', time(), PDO::PARAM_INT);
+        $stmt2->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
+        $stmt2->bindValue(':batch_id', $batchId, PDO::PARAM_STR);
+        $stmt2->execute();
     }
 
     private function outboundBatchPacketIds(string $interfaceId, string $batchId): array

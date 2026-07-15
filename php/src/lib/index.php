@@ -1617,9 +1617,9 @@ final class HttpApi
                 $body = $this->readJsonBody();
                 $wakerUrl = $this->requireNonEmptyString($body, 'waker_url');
 
-                $this->runInterfaceRequestPrelude();
+                // Wake handler must be fast — maintenance runs on every exchange
+                // already. Just pull from the waker and return.
                 $result = $this->storage->exchangeWithPhpPeer($wakerUrl);
-                $this->runInterfaceRequestEpilogue();
                 try { $this->dispatchWakes(); } catch (\Throwable $e) {}
 
                 $this->respond(200, [

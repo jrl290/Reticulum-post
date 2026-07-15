@@ -12,10 +12,28 @@ trait RequestHttpApiHelperTrait
 {
     private function runInterfaceRequestPrelude(): void
     {
-        $this->storage->runMaintenance(
-            $this->maintenanceInt('interface_stale_after_seconds', 15),
-            $this->maintenanceInt('batch_ttl_seconds', 86400),
-        );
+        // Rate-limit maintenance to once per 2 seconds. Maintenance DELETEs
+        // acquire row locks that deadlock with concurrent exchange INSERTs/UPDATEs
+        // when two exchanges (browser + PHP peer) overlap. Skipping redundant runs
+        // eliminates the deadlock without losing any cleanup — stale data will be
+        // caught by the next eligible request.
+        $lockFile = $this->maintenanceLockFilePath();
+        $now = time();
+        $lastRun = is_file($lockFile) ? (int) filemtime($lockFile) : 0;
+        if ($now - $lastRun >= 2) {
+            @touch($lockFile);
+            $this->storage->runMaintenance(
+                $this->maintenanceInt('interface_stale_after_seconds', 15),
+                $this->maintenanceInt('batch_ttl_seconds', 86400),
+            );
+        }
+    }
+
+    private function maintenanceLockFilePath(): string
+    {
+        $tmpDir = sys_get_temp_dir();
+        $hostHash = substr(hash('sha256', $this->config['host_url'] ?? 'default'), 0, 16);
+        return $tmpDir . '/reticulum-php-maintenance-' . $hostHash . '.lock';
     }
 
     private function runInterfaceRequestEpilogue(): void

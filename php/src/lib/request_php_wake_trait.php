@@ -30,7 +30,7 @@ trait RequestPhpWakeTrait
         }
 
         $minWakeInterval = (int) ($this->config['http']['min_wake_interval_ms'] ?? 1000);
-        $wakeTimeoutMs = (int) ($this->config['http']['wake_timeout_ms'] ?? 500);
+        $wakeTimeoutMs = max(5000, (int) ($this->config['http']['wake_timeout_ms'] ?? 500));
         $now = time();
 
         foreach ($peers as $peer) {

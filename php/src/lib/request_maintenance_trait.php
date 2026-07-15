@@ -149,11 +149,14 @@ trait RequestMaintenanceTrait
         // they're forwarded once and never need to persist. Python drops them
         // immediately after relay. We keep them just long enough to survive a
         // single exchange cycle, then delete.
+        // Exception: 'relay' packets (link requests, data) going to peer
+        // interfaces must survive the wake/pull cycle — those use the general
+        // outbound TTL instead.
         $relayTtl = $this->maintenanceInt('relay_packet_ttl_seconds', 30);
         $relayTrimBefore = $now - $relayTtl;
         $deleteRelayOutbound = $this->db->prepare(
             "DELETE FROM outbound_packets
-             WHERE queue_reason != 'local_delivery'
+             WHERE queue_reason IN ('relay_announce', 'path_request_forward', 'proof_relay', 'lrproof_relay', 'link_relay', 'path_response')
                AND queued_at < :ttl_before"
         );
         $deleteRelayOutbound->bindValue(':ttl_before', $relayTrimBefore, PDO::PARAM_INT);

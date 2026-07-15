@@ -238,6 +238,33 @@ trait RequestSchemaTrait
         $this->ensureIndex('CREATE UNIQUE INDEX idx_php_peer_sessions_local_interface_id ON php_peer_sessions(local_interface_id)');
         $this->ensureIndex('CREATE INDEX idx_php_peer_sessions_remote_url ON php_peer_sessions(remote_url)');
 
+        // post_interface_peers
+        $this->execDdl(
+            'CREATE TABLE IF NOT EXISTS post_interface_peers (
+                peer_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                local_interface_id TEXT NOT NULL,
+                remote_node_url TEXT NOT NULL,
+                local_wake_url TEXT,
+                remote_interface_id TEXT,
+                remote_session_token TEXT,
+                remote_max_batch_packets INTEGER NOT NULL DEFAULT 64,
+                remote_idle_exchange_interval_ms INTEGER NOT NULL DEFAULT 1000,
+                remote_max_packet_bytes INTEGER NOT NULL DEFAULT 512,
+                bitrate INTEGER NOT NULL,
+                mtu INTEGER NOT NULL,
+                poll_interval_seconds REAL,
+                http_timeout_seconds INTEGER NOT NULL DEFAULT 15,
+                connect_timeout_seconds INTEGER NOT NULL DEFAULT 5,
+                registered_at INTEGER,
+                last_exchange_at INTEGER,
+                last_error_message TEXT,
+                status TEXT NOT NULL DEFAULT \'pending\'
+            )'
+        );
+        $this->ensureIndex('CREATE INDEX idx_post_interface_peers_remote_node ON post_interface_peers(remote_node_url)');
+        $this->ensureIndex('CREATE INDEX idx_post_interface_peers_status ON post_interface_peers(status)');
+
         // reverse_path_entries
         $this->execDdl(
             'CREATE TABLE IF NOT EXISTS reverse_path_entries (
