@@ -14,11 +14,8 @@ trait RequestPhpWakeTrait
 {
     public function dispatchWakes(): void
     {
-        // Wake peers with pending outbound (primary trigger).
         $peers = $this->phpPeerInterfaceIdsWithPendingOutbound();
 
-        // Also wake peers that have pending acks owed to them — this ensures
-        // the ack cycle completes even when only one side has outbound traffic.
         $ackPeers = $this->phpPeerInterfaceIdsWithPendingAcks();
         $seen = [];
         foreach ($peers as $p) { $seen[(string)$p['interface_id']] = true; }
@@ -34,15 +31,8 @@ trait RequestPhpWakeTrait
         $now = time();
 
         foreach ($peers as $peer) {
-            $peerId = (string) ($peer['interface_id'] ?? '');
             $lastWake = isset($peer['last_wake_sent_at']) ? (int) $peer['last_wake_sent_at'] : 0;
             if (($now - $lastWake) * 1000 < $minWakeInterval) {
-                continue;
-            }
-
-            // Exponential backoff: after N consecutive failures, wait 2^N seconds.
-            $backoffUntil = isset($peer['wake_backoff_until']) ? (int) $peer['wake_backoff_until'] : 0;
-            if ($backoffUntil > 0 && $now < $backoffUntil) {
                 continue;
             }
 
@@ -51,53 +41,12 @@ trait RequestPhpWakeTrait
                 continue;
             }
 
-            $success = $this->fireAndForgetWake($peerUrl, $wakeTimeoutMs);
-            if ($success) {
-                $this->resetWakeBackoff($peerId);
-            } else {
-                $this->incrementWakeBackoff($peerId, isset($peer['wake_failure_count']) ? (int) $peer['wake_failure_count'] : 0);
-            }
-            $this->touchPeerWakeSent($peerId);
+            $this->fireAndForgetWake($peerUrl, $wakeTimeoutMs);
+            $this->touchPeerWakeSent((string) $peer['interface_id']);
         }
     }
 
-    private function resetWakeBackoff(string $interfaceId): void
-    {
-        $stmt = $this->db->prepare(
-            'UPDATE interfaces SET wake_failure_count = 0, wake_backoff_until = NULL WHERE interface_id = :id'
-        );
-        $stmt->bindValue(':id', $interfaceId, PDO::PARAM_STR);
-        $stmt->execute();
-    }
-
-    private function incrementWakeBackoff(string $interfaceId, int $currentFailures): void
-    {
-        $newCount = $currentFailures + 1;
-        // Exponential backoff: 2^N seconds, uncapped.
-        $delay = pow(2, $newCount);
-
-        // After 24 hours of consecutive failures, drop the peer entirely.
-        if ($delay > 86400) {
-            $stmt = $this->db->prepare(
-                'UPDATE interfaces SET status = :offline, wake_failure_count = 0, wake_backoff_until = NULL WHERE interface_id = :id'
-            );
-            $stmt->bindValue(':offline', 'offline', PDO::PARAM_STR);
-            $stmt->bindValue(':id', $interfaceId, PDO::PARAM_STR);
-            $stmt->execute();
-            return;
-        }
-
-        $backoffUntil = time() + (int) $delay;
-        $stmt = $this->db->prepare(
-            'UPDATE interfaces SET wake_failure_count = :count, wake_backoff_until = :until WHERE interface_id = :id'
-        );
-        $stmt->bindValue(':count', $newCount, PDO::PARAM_INT);
-        $stmt->bindValue(':until', $backoffUntil, PDO::PARAM_INT);
-        $stmt->bindValue(':id', $interfaceId, PDO::PARAM_STR);
-        $stmt->execute();
-    }
-
-    private function fireAndForgetWake(string $peerUrl, int $timeoutMs): bool
+    private function fireAndForgetWake(string $peerUrl, int $timeoutMs): void
     {
         // Append /v1/wake if peerUrl is a base URL (no /v1/ path suffix).
         if (!str_ends_with($peerUrl, "/v1/wake") && !str_contains($peerUrl, "/v1/")) {
@@ -105,7 +54,7 @@ trait RequestPhpWakeTrait
         }
         $hostUrl = $this->config['host_url'] ?? ($this->config['http']['advertise_url'] ?? null);
         if (!is_string($hostUrl) || trim($hostUrl) === '') {
-            return false;
+            return;
         }
 
         $hostUrl = rtrim(trim($hostUrl), '/');
@@ -113,19 +62,18 @@ trait RequestPhpWakeTrait
             'waker_url' => $hostUrl,
         ], JSON_THROW_ON_ERROR | JSON_PARTIAL_OUTPUT_ON_ERROR);
 
-        // Fire-and-forget: short timeout, but track success for backoff.
         if (function_exists('curl_init')) {
-            return $this->fireAndForgetWakeWithCurl($peerUrl, $body, $timeoutMs);
+            $this->fireAndForgetWakeWithCurl($peerUrl, $body, $timeoutMs);
         } else {
-            return $this->fireAndForgetWakeWithStream($peerUrl, $body, $timeoutMs);
+            $this->fireAndForgetWakeWithStream($peerUrl, $body, $timeoutMs);
         }
     }
 
-    private function fireAndForgetWakeWithCurl(string $url, string $body, int $timeoutMs): bool
+    private function fireAndForgetWakeWithCurl(string $url, string $body, int $timeoutMs): void
     {
         $curl = curl_init($url);
         if ($curl === false) {
-            return false;
+            return;
         }
 
         curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
@@ -134,14 +82,11 @@ trait RequestPhpWakeTrait
         curl_setopt($curl, CURLOPT_POSTFIELDS, $body);
         curl_setopt($curl, CURLOPT_TIMEOUT_MS, $timeoutMs);
         curl_setopt($curl, CURLOPT_CONNECTTIMEOUT_MS, min($timeoutMs, 500));
-        // Fire and drop — but check if it got through for backoff tracking.
-        $result = curl_exec($curl);
-        $httpCode = curl_getinfo($curl, CURLINFO_HTTP_CODE);
+        curl_exec($curl);
         curl_close($curl);
-        return $result !== false && $httpCode > 0;
     }
 
-    private function fireAndForgetWakeWithStream(string $url, string $body, int $timeoutMs): bool
+    private function fireAndForgetWakeWithStream(string $url, string $body, int $timeoutMs): void
     {
         $timeoutSec = max(0.1, $timeoutMs / 1000.0);
         $context = stream_context_create([
@@ -154,13 +99,10 @@ trait RequestPhpWakeTrait
             ],
         ]);
 
-        // Fire and check — we need to know if it connected.
         $fp = @fopen($url, 'r', false, $context);
         if ($fp !== false) {
             fclose($fp);
-            return true;
         }
-        return false;
     }
 
     public function exchangeWithPhpPeer(string $peerUrl): array
