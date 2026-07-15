@@ -17,7 +17,7 @@ trait RequestMaintenanceTrait
         $now = time();
         $staleBefore = $now - $interfaceStaleAfterSeconds;
         $trimBefore = $now - $batchTtlSeconds;
-        $packetHashTrimBefore = $now - $this->maintenanceInt('packet_hash_ttl_seconds', $batchTtlSeconds);
+        $packetHashTrimBefore = $now - $this->maintenanceInt('packet_hash_ttl_seconds', 30);
 
         $staleStmt = $this->db->prepare(
             "UPDATE interfaces SET status = :new_status
@@ -201,7 +201,7 @@ trait RequestMaintenanceTrait
         );
         $deletePathRequestTags->bindValue(
             ':trim_before',
-            $now - $this->maintenanceInt('path_request_tag_ttl_seconds', $batchTtlSeconds),
+            $now - $this->maintenanceInt('path_request_tag_ttl_seconds', 30),
             PDO::PARAM_INT
         );
         $deletePathRequestTags->execute();
