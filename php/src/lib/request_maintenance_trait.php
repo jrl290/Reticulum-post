@@ -71,7 +71,7 @@ trait RequestMaintenanceTrait
             : '';
 
         $deleteInboundBatches = $this->db->prepare(
-            'DELETE FROM inbound_batches WHERE created_at < :trim_before LIMIT 1000'
+            'DELETE FROM inbound_batches WHERE created_at < :trim_before'
         );
         $deleteInboundBatches->bindValue(':trim_before', $trimBefore, PDO::PARAM_INT);
         $deleteInboundBatches->execute();
@@ -82,7 +82,7 @@ trait RequestMaintenanceTrait
         $inboundPacketTtl = $this->maintenanceInt('inbound_packet_ttl_seconds', 3600);
         $inboundTrimBefore = $now - $inboundPacketTtl;
         $deleteInboundPackets = $this->db->prepare(
-            'DELETE FROM inbound_packets WHERE created_at < :ttl_before LIMIT 1000'
+            'DELETE FROM inbound_packets WHERE created_at < :ttl_before'
         );
         $deleteInboundPackets->bindValue(':ttl_before', $inboundTrimBefore, PDO::PARAM_INT);
         $deleteInboundPackets->execute();
@@ -100,7 +100,7 @@ trait RequestMaintenanceTrait
         }
 
         $deleteOutboundBatches = $this->db->prepare(
-            'DELETE FROM outbound_batches WHERE acked_at IS NOT NULL AND acked_at < :trim_before LIMIT 1000'
+            'DELETE FROM outbound_batches WHERE acked_at IS NOT NULL AND acked_at < :trim_before'
         );
         $deleteOutboundBatches->bindValue(':trim_before', $trimBefore, PDO::PARAM_INT);
         $deleteOutboundBatches->execute();
@@ -118,7 +118,7 @@ trait RequestMaintenanceTrait
         }
 
         $deleteOutboundPackets = $this->db->prepare(
-            'DELETE FROM outbound_packets WHERE acked_at IS NOT NULL AND acked_at < :trim_before LIMIT 1000'
+            'DELETE FROM outbound_packets WHERE acked_at IS NOT NULL AND acked_at < :trim_before'
         );
         $deleteOutboundPackets->bindValue(':trim_before', $trimBefore, PDO::PARAM_INT);
         $deleteOutboundPackets->execute();
@@ -162,8 +162,7 @@ trait RequestMaintenanceTrait
         $deleteRelayOutbound = $this->db->prepare(
             "DELETE FROM outbound_packets
              WHERE queue_reason != 'local_delivery'
-               AND queued_at < :ttl_before
-             LIMIT 1000"
+               AND queued_at < :ttl_before"
         );
         $deleteRelayOutbound->bindValue(':ttl_before', $relayTrimBefore, PDO::PARAM_INT);
         $deleteRelayOutbound->execute();
@@ -172,8 +171,7 @@ trait RequestMaintenanceTrait
         $deleteWakeEvents = $this->db->prepare(
             'DELETE FROM wake_events
              WHERE created_at < :trim_before
-               AND (dispatched_at IS NOT NULL OR failed_at IS NOT NULL)
-             LIMIT 1000'
+               AND (dispatched_at IS NOT NULL OR failed_at IS NOT NULL)'
         );
         $deleteWakeEvents->bindValue(':trim_before', $trimBefore, PDO::PARAM_INT);
         $deleteWakeEvents->execute();
@@ -182,14 +180,14 @@ trait RequestMaintenanceTrait
         $failedOrphanedWakeClaims = $this->failOrphanedClaimedWakeEvents();
 
         $deletePacketHashes = $this->db->prepare(
-            'DELETE FROM packet_hashes WHERE first_seen_at < :trim_before LIMIT 1000'
+            'DELETE FROM packet_hashes WHERE first_seen_at < :trim_before'
         );
         $deletePacketHashes->bindValue(':trim_before', $packetHashTrimBefore, PDO::PARAM_INT);
         $deletePacketHashes->execute();
         $trimmedPacketHashes = $deletePacketHashes->rowCount();
 
         $deleteExpiredPaths = $this->db->prepare(
-            'DELETE FROM path_entries WHERE expires_at < :expires_before LIMIT 1000'
+            'DELETE FROM path_entries WHERE expires_at < :expires_before'
         );
         $deleteExpiredPaths->bindValue(':expires_before', $now, PDO::PARAM_INT);
         $deleteExpiredPaths->execute();
@@ -208,7 +206,7 @@ trait RequestMaintenanceTrait
         }
 
         $deletePathRequestTags = $this->db->prepare(
-            'DELETE FROM path_request_tags WHERE created_at < :trim_before LIMIT 1000'
+            'DELETE FROM path_request_tags WHERE created_at < :trim_before'
         );
         $deletePathRequestTags->bindValue(
             ':trim_before',
@@ -219,7 +217,7 @@ trait RequestMaintenanceTrait
         $trimmedPathRequestTags = $deletePathRequestTags->rowCount();
 
         $deleteReversePaths = $this->db->prepare(
-            'DELETE FROM reverse_path_entries WHERE created_at < :trim_before LIMIT 1000'
+            'DELETE FROM reverse_path_entries WHERE created_at < :trim_before'
         );
         $deleteReversePaths->bindValue(
             ':trim_before',
