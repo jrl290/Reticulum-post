@@ -75,6 +75,11 @@ trait RequestPhpWakeTrait
 
     private function fireAndForgetWakeWithCurl(string $url, string $body, int $timeoutMs): void
     {
+        // Truly fire-and-forget: use a short timeout so we never block
+        // the request waiting for a peer response. The peer will process
+        // the wake even if we close the connection early.
+        $timeoutMs = min($timeoutMs, 1000);
+
         $curl = curl_init($url);
         if ($curl === false) {
             return;
@@ -87,6 +92,7 @@ trait RequestPhpWakeTrait
         curl_setopt($curl, CURLOPT_TIMEOUT_MS, $timeoutMs);
         curl_setopt($curl, CURLOPT_CONNECTTIMEOUT_MS, min($timeoutMs, 500));
         // Fire and drop — we don't care about the response.
+        // RETURNTRANSFER=true prevents stdout corruption.
         curl_exec($curl);
     }
 

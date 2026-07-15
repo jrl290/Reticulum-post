@@ -33,7 +33,7 @@ trait RequestMaintenanceTrait
 
         // Peer interfaces count as active if seen recently; repair any that drifted offline.
         // Stale peers (no activity for peer_stale_seconds) are left offline.
-        $peerActiveAfter = $now - $this->maintenanceInt('peer_stale_after_seconds', 900);
+        $peerActiveAfter = $now - $this->maintenanceInt('peer_stale_after_seconds', 86400);
         $peerRepairStmt = $this->db->prepare(
             'UPDATE interfaces SET status = :online
              WHERE peer_url IS NOT NULL

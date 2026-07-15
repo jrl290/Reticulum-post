@@ -6,12 +6,83 @@ namespace ReticulumPhp;
 
 use PDO;
 
-// Reticulum-php is request-operated. These maintenance helpers only prune and
-// reconcile request-path state between exchanges; they do not add retries,
-// polling loops, or a second transport mechanism.
+/**
+ * Maintenance Trait — periodic cleanup and state reconciliation.
+ *
+ * Reticulum-php is request-operated: maintenance runs inline during every
+ * exchange request (rate-limited to once per 2 seconds by the prelude).
+ * There is no background worker or cron job.
+ *
+ * TWO-TIER INTERFACE STALENESS MODEL
+ * ----------------------------------
+ * Interfaces have a `status` column: 'online' or 'offline'. The staleness
+ * threshold differs by interface type:
+ *
+ *   NON-PEER (browsers, clients, NAS):
+ *     Controlled by: interface_stale_after_seconds (default: 15 seconds)
+ *     Rationale: Clients poll frequently (every 1-5 seconds). If a client
+ *     hasn't been seen in 15 seconds, it's probably disconnected. Marking
+ *     it offline allows cleanup of its queued packets, path entries, and
+ *     link transport state. A short TTL prevents unbounded accumulation.
+ *
+ *   PEER (PHP↔PHP nodes):
+ *     Controlled by: peer_stale_after_seconds (default: 86400 = 24 hours)
+ *     Rationale: PHP peers may go extended periods without exchanging data.
+ *     Unlike browser clients, a peer can be healthy but idle. Marking a
+ *     peer offline prematurely breaks the PHP→PHP relay path and prevents
+ *     wake dispatch. 24 hours matches the upstream RNS path expiry default.
+ *     DO NOT reduce this below 3600 (1 hour) — it caused peer disappearance
+ *     from the monitor and broken relay chains.
+ *
+ * PEER AUTO-REPAIR
+ * ----------------
+ * If a peer interface was marked offline (e.g., transient network blip,
+ * server restart), maintenance will auto-repair it back to 'online' as long
+ * as its last_seen_at is within peer_stale_after_seconds. This means a
+ * single successful exchange brings the peer back immediately.
+ *
+ * TTL-BASED CLEANUP (no LIMITs)
+ * -----------------------------
+ * All cleanup is TTL-based, not row-count-based. Previous LIMIT-based
+ * approaches caused silent data loss when tables grew beyond the limit.
+ * TTLs target specific queue_reason values:
+ *   - 'relay_announce', 'path_request_forward', 'proof_relay',
+ *     'lrproof_relay', 'link_relay', 'path_response': 30s TTL
+ *     (fire-and-forget relay, only needs to survive one exchange cycle)
+ *   - 'relay' (link requests, data for peers): general outbound TTL
+ *     (must survive the wake/pull cycle for PHP peers)
+ *   - inbound_packet_ttl_seconds: 3600s (control-plane flood prevention)
+ *   - packet_hash_ttl_seconds: 30s (duplicate detection window)
+ *   - path_request_tag_ttl_seconds: 30s (path discovery dedup window)
+ *
+ * DEADLOCK AVOIDANCE
+ * ------------------
+ * Maintenance DELETEs acquire row locks. When two exchanges overlap
+ * (browser client + PHP peer), concurrent DELETE and INSERT/UPDATE on
+ * the same tables can deadlock. Mitigations:
+ *   1. Maintenance is rate-limited to once per 2 seconds (prelude).
+ *   2. Offline interface IDs are pre-fetched with a non-locking SELECT
+ *      before being used in DELETE queries, avoiding subquery locks.
+ *
+ * REGRESSION PREVENTION
+ * ---------------------
+ * DO NOT:
+ *   - Reduce peer_stale_after_seconds below 3600.
+ *   - Add LIMIT clauses to DELETE queries (use TTLs instead).
+ *   - Remove the rate-limit gating in the prelude.
+ *   - Add retry logic (violates DESIGN_PRINCIPLES.md Rule #1).
+ */
 
 trait RequestMaintenanceTrait
 {
+    /**
+     * Run all maintenance tasks. Called from the exchange prelude
+     * (rate-limited to once per 2 seconds).
+     *
+     * @param int $interfaceStaleAfterSeconds  Non-peer interface offline threshold.
+     * @param int $batchTtlSeconds             Batch record retention TTL.
+     * @return array                           Counts of cleaned-up rows by category.
+     */
     public function runMaintenance(int $interfaceStaleAfterSeconds, int $batchTtlSeconds): array
     {
         $now = time();
@@ -19,6 +90,9 @@ trait RequestMaintenanceTrait
         $trimBefore = $now - $batchTtlSeconds;
         $packetHashTrimBefore = $now - $this->maintenanceInt('packet_hash_ttl_seconds', 30);
 
+        // ── Non-peer interface staleness ──────────────────────────────
+        // Mark any non-peer interface offline if it hasn't been seen
+        // within interface_stale_after_seconds (default 15s).
         $staleStmt = $this->db->prepare(
             "UPDATE interfaces SET status = :new_status
              WHERE status != :current_status
@@ -31,9 +105,13 @@ trait RequestMaintenanceTrait
         $staleStmt->execute();
         $interfacesMarkedOffline = $staleStmt->rowCount();
 
-        // Peer interfaces count as active if seen recently; repair any that drifted offline.
-        // Stale peers (no activity for peer_stale_seconds) are left offline.
-        $peerActiveAfter = $now - $this->maintenanceInt('peer_stale_after_seconds', 900);
+        // ── Peer interface auto-repair ────────────────────────────────
+        // Peer interfaces may have been marked offline during a transient
+        // network issue or server restart. If they've been seen within
+        // peer_stale_after_seconds (default 86400 = 24h), repair them
+        // back to online.
+        // DO NOT reduce the default below 3600 — this broke peer relay.
+        $peerActiveAfter = $now - $this->maintenanceInt('peer_stale_after_seconds', 86400);
         $peerRepairStmt = $this->db->prepare(
             'UPDATE interfaces SET status = :online
              WHERE peer_url IS NOT NULL
@@ -45,7 +123,9 @@ trait RequestMaintenanceTrait
         $peerRepairStmt->bindValue(':active_after', $peerActiveAfter, PDO::PARAM_INT);
         $peerRepairStmt->execute();
 
-        // Stale peers: mark offline so downstream relay excludes them.
+        // ── Peer interface staleness ──────────────────────────────────
+        // Mark peer interfaces offline if they haven't been seen within
+        // peer_stale_after_seconds. These are truly dead peers.
         $peerStaleStmt = $this->db->prepare(
             'UPDATE interfaces SET status = :offline
              WHERE peer_url IS NOT NULL
@@ -57,15 +137,17 @@ trait RequestMaintenanceTrait
         $peerStaleStmt->bindValue(':stale_before', $peerActiveAfter, PDO::PARAM_INT);
         $peerStaleStmt->execute();
 
-        // Pre-fetch offline non-peer interface IDs with a non-locking read.
+        // ── Pre-fetch offline non-peer interface IDs ──────────────────
         // Subqueries in DELETE statements acquire shared locks on interfaces
         // that can deadlock with concurrent status updates. Fetching IDs first
-        // avoids this. TTL-based cleanup bounds row counts, so no LIMIT needed.
+        // with a non-locking SELECT avoids this. TTL-based cleanup bounds row
+        // counts, so no LIMIT needed.
         $offlineIfaceIds = $this->fetchOfflineNonPeerInterfaceIds();
         $offlinePlaceholders = $offlineIfaceIds !== []
             ? implode(',', array_fill(0, count($offlineIfaceIds), '?'))
             : '';
 
+        // ── Inbound batch TTL cleanup ─────────────────────────────────
         $deleteInboundBatches = $this->db->prepare(
             'DELETE FROM inbound_batches WHERE created_at < :trim_before'
         );
@@ -73,8 +155,11 @@ trait RequestMaintenanceTrait
         $deleteInboundBatches->execute();
         $trimmedInboundBatches = $deleteInboundBatches->rowCount();
 
-        // Inbound packets TTL cleanup: control-plane packets (announces, link
-        // requests) flood the table; delete anything older than the TTL.
+        // ── Inbound packet TTL cleanup ────────────────────────────────
+        // Control-plane packets (announces, link requests) flood the
+        // inbound_packets table. Delete anything older than the TTL.
+        // Default TTL is 3600s (1 hour) — long enough for debugging but
+        // short enough to prevent table bloat.
         $inboundPacketTtl = $this->maintenanceInt('inbound_packet_ttl_seconds', 3600);
         $inboundTrimBefore = $now - $inboundPacketTtl;
         $deleteInboundPackets = $this->db->prepare(
@@ -94,6 +179,7 @@ trait RequestMaintenanceTrait
             $trimmedInboundPackets += $deleteOfflineInboundPackets->rowCount();
         }
 
+        // ── Outbound batch TTL cleanup ────────────────────────────────
         $deleteOutboundBatches = $this->db->prepare(
             'DELETE FROM outbound_batches WHERE acked_at IS NOT NULL AND acked_at < :trim_before'
         );
@@ -101,6 +187,7 @@ trait RequestMaintenanceTrait
         $deleteOutboundBatches->execute();
         $trimmedOutboundBatches = $deleteOutboundBatches->rowCount();
 
+        // Orphaned outbound batches for offline non-peer interfaces.
         if ($offlinePlaceholders !== '') {
             $deleteOfflineOutboundBatches = $this->db->prepare(
                 "DELETE FROM outbound_batches
@@ -111,6 +198,7 @@ trait RequestMaintenanceTrait
             $trimmedOutboundBatches += $deleteOfflineOutboundBatches->rowCount();
         }
 
+        // ── Outbound packet TTL cleanup ───────────────────────────────
         $deleteOutboundPackets = $this->db->prepare(
             'DELETE FROM outbound_packets WHERE acked_at IS NOT NULL AND acked_at < :trim_before'
         );
@@ -118,6 +206,7 @@ trait RequestMaintenanceTrait
         $deleteOutboundPackets->execute();
         $trimmedOutboundPackets = $deleteOutboundPackets->rowCount();
 
+        // Orphaned outbound packets for offline non-peer interfaces.
         if ($offlinePlaceholders !== '') {
             $deleteOfflineOutboundPackets = $this->db->prepare(
                 "DELETE FROM outbound_packets
@@ -128,8 +217,11 @@ trait RequestMaintenanceTrait
             $trimmedOutboundPackets += $deleteOfflineOutboundPackets->rowCount();
         }
 
-        // Stale outbound: packets queued > 1 hour ago that were never delivered.
-        // Prevents unbounded accumulation for interfaces that stay "online" but never pull.
+        // ── Stale non-peer outbound ───────────────────────────────────
+        // Packets queued > max_outbound_packet_age_seconds (default 3600s)
+        // for non-peer interfaces that were never delivered. Prevents
+        // unbounded accumulation for interfaces that stay "online" but
+        // never pull (e.g., stale browser tabs).
         $maxPacketAge = $this->maintenanceInt('max_outbound_packet_age_seconds', 3600);
         $nonPeerIfaceIds = $this->fetchNonPeerInterfaceIds();
         if ($nonPeerIfaceIds !== []) {
@@ -145,13 +237,14 @@ trait RequestMaintenanceTrait
             $trimmedOutboundPackets += $deleteStaleOutboundPackets->rowCount();
         }
 
-        // Relay packets (announces, path requests, proofs) are fire-and-forget —
-        // they're forwarded once and never need to persist. Python drops them
-        // immediately after relay. We keep them just long enough to survive a
-        // single exchange cycle, then delete.
-        // Exception: 'relay' packets (link requests, data) going to peer
-        // interfaces must survive the wake/pull cycle — those use the general
-        // outbound TTL instead.
+        // ── Fire-and-forget relay packet cleanup ───────────────────────
+        // Relay packets (announces, path requests, proofs) are forwarded
+        // once and never need to persist. Python drops them immediately
+        // after relay. We keep them just long enough to survive a single
+        // exchange cycle (default 30s), then delete.
+        // IMPORTANT: 'relay' reason (link requests, data for peers) is
+        // NOT included here — those must survive the wake/pull cycle and
+        // use the general outbound TTL instead.
         $relayTtl = $this->maintenanceInt('relay_packet_ttl_seconds', 30);
         $relayTrimBefore = $now - $relayTtl;
         $deleteRelayOutbound = $this->db->prepare(
@@ -163,6 +256,7 @@ trait RequestMaintenanceTrait
         $deleteRelayOutbound->execute();
         $trimmedOutboundPackets += $deleteRelayOutbound->rowCount();
 
+        // ── Wake event TTL cleanup ────────────────────────────────────
         $deleteWakeEvents = $this->db->prepare(
             'DELETE FROM wake_events
              WHERE created_at < :trim_before
@@ -174,6 +268,9 @@ trait RequestMaintenanceTrait
 
         $failedOrphanedWakeClaims = $this->failOrphanedClaimedWakeEvents();
 
+        // ── Packet hash TTL cleanup ──────────────────────────────────
+        // Duplicate detection window. Default 30s is sufficient for the
+        // announcement flood dedup window.
         $deletePacketHashes = $this->db->prepare(
             'DELETE FROM packet_hashes WHERE first_seen_at < :trim_before'
         );
@@ -181,6 +278,7 @@ trait RequestMaintenanceTrait
         $deletePacketHashes->execute();
         $trimmedPacketHashes = $deletePacketHashes->rowCount();
 
+        // ── Expired path cleanup ─────────────────────────────────────
         $deleteExpiredPaths = $this->db->prepare(
             'DELETE FROM path_entries WHERE expires_at < :expires_before'
         );
@@ -199,6 +297,7 @@ trait RequestMaintenanceTrait
             $trimmedExpiredPaths += $deleteDeadInterfacePaths->rowCount();
         }
 
+        // ── Path request tag TTL cleanup ─────────────────────────────
         $deletePathRequestTags = $this->db->prepare(
             'DELETE FROM path_request_tags WHERE created_at < :trim_before'
         );
@@ -210,6 +309,7 @@ trait RequestMaintenanceTrait
         $deletePathRequestTags->execute();
         $trimmedPathRequestTags = $deletePathRequestTags->rowCount();
 
+        // ── Reverse path TTL cleanup ─────────────────────────────────
         $deleteReversePaths = $this->db->prepare(
             'DELETE FROM reverse_path_entries WHERE created_at < :trim_before'
         );
@@ -221,6 +321,9 @@ trait RequestMaintenanceTrait
         $deleteReversePaths->execute();
         $trimmedReversePaths = $deleteReversePaths->rowCount();
 
+        // ── Reverse paths for offline interfaces ──────────────────────
+        // Reverse paths through offline non-peer interfaces can never be
+        // used for return routing — drop them.
         if ($offlinePlaceholders !== '') {
             $deleteOfflineReversePaths = $this->db->prepare(
                 "DELETE FROM reverse_path_entries
@@ -231,6 +334,10 @@ trait RequestMaintenanceTrait
             $trimmedReversePaths += $deleteOfflineReversePaths->rowCount();
         }
 
+        // ── Link transport for offline interfaces ─────────────────────
+        // Link transport entries for offline non-peer interfaces are
+        // unreachable — drop them. Peer link transport is preserved
+        // (peers can come back online via auto-repair).
         if ($offlinePlaceholders !== '') {
             $deleteOfflineLinkTransport = $this->db->prepare(
                 "DELETE FROM link_transport_entries
@@ -243,6 +350,9 @@ trait RequestMaintenanceTrait
             $trimmedLinkTransport = 0;
         }
 
+        // ── Link transport validation ────────────────────────────────
+        // Validate links that have received proofs, and invalidate paths
+        // for links that expired without validation.
         $validatedLinkActiveAfter = $now - $this->maintenanceInt('link_transport_ttl_seconds', 900);
         $invalidatedPaths = $this->invalidatePathsForExpiredPendingLinks($now, $validatedLinkActiveAfter);
 

@@ -390,4 +390,21 @@ trait RequestDebugReportTrait
 
         return $rows;
     }
+
+    public function clearAllData(): void
+    {
+        $tables = [
+            'inbound_packets', 'inbound_batches',
+            'outbound_packets', 'outbound_batches',
+            'packet_hashes', 'path_request_tags',
+            'reverse_path_entries', 'link_transport_entries',
+            'path_entries', 'known_destinations', 'local_destinations',
+            'wake_events', 'php_peer_sessions', 'post_interface_peers',
+            'transport_state',
+            'interfaces',
+        ];
+        foreach ($tables as $table) {
+            $this->db->exec("DELETE FROM {$table}");
+        }
+    }
 }

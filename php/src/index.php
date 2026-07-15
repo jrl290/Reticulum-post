@@ -1475,6 +1475,15 @@ final class HttpApi
                 $this->respond(200, $this->storage->monitorData());
             }
 
+            if ($method === 'POST' && $path === '/v1/monitor/clear') {
+                $body = $this->readJsonBody();
+                if (($body['confirm'] ?? '') !== 'YES') {
+                    $this->respond(400, ['status' => 'error', 'error' => 'Type YES to confirm']);
+                }
+                $this->storage->clearAllData();
+                $this->respond(200, ['status' => 'ok']);
+            }
+
             if ($method === 'POST' && $path === '/v1/maintenance/flush') {
                 $body = $this->readJsonBody();
                 $force = !empty($body['force']);

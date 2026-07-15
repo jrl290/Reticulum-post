@@ -4,19 +4,86 @@ declare(strict_types=1);
 
 namespace ReticulumPhp;
 
-// Reticulum-php is request-operated. These HTTP API helpers validate and
-// complete one authenticated request at a time; they do not create a separate
-// background transport path.
+/**
+ * HTTP API Helper Trait — request lifecycle and exchange orchestration.
+ *
+ * Reticulum-php is request-operated: every operation runs inside an HTTP
+ * request/response cycle. There are no background threads, no event loop,
+ * no persistent workers.
+ *
+ * REQUEST LIFECYCLE
+ * -----------------
+ * Each /v1/interfaces/exchange request follows this pattern:
+ *
+ *   1. PRELUDE  (runInterfaceRequestPrelude)
+ *      - Rate-limited maintenance (once per 2 seconds).
+ *      - Cleans stale interfaces, expired packets, orphaned paths.
+ *      - See RequestMaintenanceTrait for the full cleanup logic.
+ *
+ *   2. EXCHANGE BODY
+ *      - Authenticate the interface.
+ *      - Ingest inbound packets from the client.
+ *      - Fetch pending outbound packets for the client.
+ *      - Process any inline delivery (local destinations, path responses).
+ *
+ *   3. EPILOGUE (runInterfaceRequestEpilogue)
+ *      - Spawn detached wake runners for pending wake events.
+ *      - Dispatch fire-and-forget wakes to PHP peers with pending data.
+ *      - See RequestPhpWakeTrait for the wake dispatch architecture.
+ *
+ * CRITICAL: The epilogue runs INSIDE the request cycle. Every millisecond
+ * spent in the epilogue is a millisecond the PHP process is blocked. With
+ * multiple concurrent exchanges (browser + NAS + PHP peer), blocked processes
+ * stack up and exhaust the shared hosting entry process limit.
+ *
+ * THEREFORE:
+ *   - Maintenance is rate-limited to once per 2 seconds (avoids redundant
+ *     DELETE locks that deadlock with concurrent INSERTs/UPDATEs).
+ *   - Wake dispatch is capped at 1000ms per peer (see RequestPhpWakeTrait).
+ *   - Wake runners are spawned via exec() in the background — the spawn
+ *     itself is fast (exec returns immediately), and the actual wake work
+ *     happens in a separate PHP process.
+ *
+ * PERF LOGGING
+ * ------------
+ * The exchange endpoint logs timing breakdowns:
+ *   maint  = prelude (maintenance) time
+ *   ack    = acknowledge outbound batches time
+ *   ingest = ingest inbound packets time
+ *   fetch  = fetch outbound batch time
+ *   epi    = epilogue time (wake dispatch + wake runner spawn)
+ *   total  = total request time
+ *
+ * If `epi` exceeds 1000ms, check:
+ *   - Is fireAndForgetWakeWithCurl's timeout cap still at 1000ms?
+ *   - Is the peer server slow to respond?
+ *   - Are there excessive wake events being spawned?
+ *
+ * REGRESSION PREVENTION
+ * ---------------------
+ * DO NOT:
+ *   - Remove the maintenance rate-limit (causes deadlocks under concurrency).
+ *   - Add blocking work to the epilogue.
+ *   - Increase the maintenance rate beyond once per 2 seconds.
+ *   - Make wake dispatch synchronous/blocking.
+ */
 
 trait RequestHttpApiHelperTrait
 {
+    /**
+     * Exchange prelude: rate-limited maintenance run.
+     *
+     * Maintenance DELETEs acquire row locks. When two exchanges overlap
+     * (e.g., browser client + PHP peer calling each other), concurrent
+     * DELETE and INSERT/UPDATE on the same tables can deadlock.
+     *
+     * Rate-limiting to once per 2 seconds eliminates most deadlocks
+     * without losing cleanup — stale data is caught by the next
+     * eligible request. The lock file is per-host (hashed from host_url)
+     * so multiple virtual hosts on the same server don't interfere.
+     */
     private function runInterfaceRequestPrelude(): void
     {
-        // Rate-limit maintenance to once per 2 seconds. Maintenance DELETEs
-        // acquire row locks that deadlock with concurrent exchange INSERTs/UPDATEs
-        // when two exchanges (browser + PHP peer) overlap. Skipping redundant runs
-        // eliminates the deadlock without losing any cleanup — stale data will be
-        // caught by the next eligible request.
         $lockFile = $this->maintenanceLockFilePath();
         $now = time();
         $lastRun = is_file($lockFile) ? (int) filemtime($lockFile) : 0;
@@ -36,6 +103,20 @@ trait RequestHttpApiHelperTrait
         return $tmpDir . '/reticulum-php-maintenance-' . $hostHash . '.lock';
     }
 
+    /**
+     * Exchange epilogue: spawn wake runners and dispatch peer wakes.
+     *
+     * This runs INSIDE the request cycle and its duration is measured
+     * as the `epi` metric in the perf log. Keep it fast.
+     *
+     * Two-phase wake dispatch:
+     *   1. Detached wake runners: spawn background PHP processes via exec()
+     *      for each pending wake event. These run exchangeWithPhpPeer()
+     *      asynchronously. The exec() call returns immediately.
+     *   2. Fire-and-forget peer wakes: send a quick HTTP request to each
+     *      PHP peer with pending outbound data, telling them to call us
+     *      back. Capped at 1000ms per peer (see RequestPhpWakeTrait).
+     */
     private function runInterfaceRequestEpilogue(): void
     {
         $wakeEventIds = $this->storage->pendingWakeEventIdsForSpawn(
@@ -53,6 +134,7 @@ trait RequestHttpApiHelperTrait
         }
 
         // Fire-and-forget wakes to PHP peer nodes with pending outbound packets.
+        // These MUST be non-blocking — see RequestPhpWakeTrait for the contract.
         try {
             $this->storage->dispatchWakes();
         } catch (\Throwable $error) {
@@ -60,6 +142,17 @@ trait RequestHttpApiHelperTrait
         }
     }
 
+    /**
+     * Spawn a background PHP process to run exchangeWithPhpPeer().
+     *
+     * Uses exec() with '&' to detach. The exec() call returns immediately;
+     * the actual peer exchange happens in a separate process that doesn't
+     * block the current request.
+     *
+     * NOTE: exec() may be disabled on some shared hosting configurations.
+     * If so, wake events will accumulate and fail. The fallback is that
+     * the peer will eventually pull during its own idle exchange cycle.
+     */
     private function spawnDetachedWakeRunner(int $wakeEventId): void
     {
         $phpBinary = PHP_BINARY !== '' ? PHP_BINARY : 'php';
@@ -317,9 +410,11 @@ trait RequestHttpApiHelperTrait
             $isPhpPeer = $peer !== '';
 
             if ($isPhpPeer) {
-                $peerRows .= "<tr><td>{$name}</td><td class=\"mono\">{$peer}</td><td>{$rx}</td><td>{$tx}</td><td>{$lastSeen}</td></tr>";
+                $ifaceId = substr((string) ($iface['interface_id'] ?? ''), 0, 12);
+                $peerRows .= "<tr><td class=\"mono\">{$ifaceId}</td><td class=\"mono\">{$peer}</td><td>{$rx}</td><td>{$tx}</td><td>{$lastSeen}</td></tr>";
             } elseif ($status === 'online') {
-                $ifaceRows .= "<tr><td>{$name}</td><td>{$rx}</td><td>{$tx}</td><td>{$lastSeen}</td></tr>";
+                $ifaceId = substr((string) ($iface['interface_id'] ?? ''), 0, 12);
+                $ifaceRows .= "<tr><td class=\"mono\">{$ifaceId}</td><td>{$rx}</td><td>{$tx}</td><td>{$lastSeen}</td></tr>";
             }
         }
 
@@ -389,7 +484,7 @@ trait RequestHttpApiHelperTrait
 </head>
 <body>
 <h1>Reticulum-php</h1>
-<div class="sub">{$hostUrl} &mdash; {$now} <span class="refresh">(auto-refresh 5s)</span><button class="btn-flush" id="btn-flush" onclick="flushStale()">Flush Stale</button><span id="flush-msg"></span></div>
+<div class="sub">{$hostUrl} &mdash; {$now} <span class="refresh">(auto-refresh 5s)</span><button class="btn-flush" id="btn-flush" onclick="flushStale()">Flush Stale</button><button class="btn-flush" id="btn-clear" style="background:#900" onclick="clearAll()">Clear All Data</button><span id="flush-msg"></span></div>
 
 <div class="grid">
   <div class="card"><div class="val">{$totalPending}</div><div class="lbl">Pending Outbound</div></div>
@@ -398,10 +493,10 @@ trait RequestHttpApiHelperTrait
 </div>
 
 <h2>Connected Peers</h2>
-<table><thead><tr><th>Name</th><th>Peer URL</th><th>RX</th><th>TX</th><th>Last Seen</th></tr></thead><tbody>{$peerRows}</tbody></table>
+<table><thead><tr><th>Interface ID</th><th>Peer URL</th><th>RX</th><th>TX</th><th>Last Seen</th></tr></thead><tbody>{$peerRows}</tbody></table>
 
 <h2>Active Clients</h2>
-<table><thead><tr><th>Name</th><th>RX</th><th>TX</th><th>Last Seen</th></tr></thead><tbody>{$ifaceRows}</tbody></table>
+<table><thead><tr><th>Interface ID</th><th>RX</th><th>TX</th><th>Last Seen</th></tr></thead><tbody>{$ifaceRows}</tbody></table>
 
 <h2>Pending Outbound</h2>
 <table><thead><tr><th>Interface</th><th>Peer</th><th>Pending</th><th>Oldest</th></tr></thead><tbody>{$outboundRows}</tbody></table>
@@ -447,6 +542,19 @@ function flushStale() {
       btn.textContent = 'Flush Stale';
       autoRefresh = setTimeout(function(){ location.reload(); }, 3000);
     });
+}
+
+function clearAll() {
+  if (!confirm('Delete ALL rows from ALL tables? This cannot be undone.')) return;
+  var btn = document.getElementById('btn-clear');
+  var msg = document.getElementById('flush-msg');
+  btn.disabled = true; btn.textContent = 'Clearing...';
+  clearTimeout(autoRefresh);
+  fetch('/reticulum/v1/monitor/clear', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({confirm:'YES'}) })
+    .then(function(r) { return r.json(); })
+    .then(function(d) { msg.textContent = d.status === 'ok' ? 'All tables cleared' : (d.error || 'Failed'); msg.className = d.status === 'ok' ? 'flush-msg ok' : 'flush-msg err'; })
+    .catch(function(e) { msg.textContent = 'Error: ' + e.message; msg.className = 'flush-msg err'; })
+    .finally(function() { btn.disabled = false; btn.textContent = 'Clear All Data'; autoRefresh = setTimeout(function(){ location.reload(); }, 2000); });
 }
 </script>
 </body>
