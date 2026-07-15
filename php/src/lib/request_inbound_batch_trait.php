@@ -214,16 +214,13 @@ trait RequestInboundBatchTrait
     {
         $destHash = (string) ($packet['destination_hash_hex'] ?? '');
         $pktType = (int) ($packet['packet_type'] ?? -1);
-        $dstType = (int) ($packet['destination_type'] ?? -1);
-        error_log("[local-deliver] ENTER type=$pktType dst_type=$dstType dest=" . substr($destHash,0,12) . " src=" . substr($sourceInterfaceId,0,10));
+        error_log("[deliverLocallyIfKnown] type=$pktType dest=" . substr($destHash,0,12) . " src=" . substr($sourceInterfaceId,0,10));
         if ($destHash === '') {
-            error_log("[local-deliver] FAIL: empty destHash");
             return false;
         }
 
-        // Check direct local destination registration.
         $localIface = $this->localDestinationInterface($destHash);
-        error_log("[local-deliver] direct lookup localIface=" . ($localIface ? substr($localIface,0,10) : 'null'));
+        error_log("[deliverLocallyIfKnown] localIface=" . ($localIface ? substr($localIface,0,10) : 'null'));
 
         // Fallback: if exact destination hash isn't registered, try to
         // match by identity. Different aspects of the same identity
@@ -231,7 +228,6 @@ trait RequestInboundBatchTrait
         // hashes but must route to the same endpoint.
         if ($localIface === null) {
             $destIdentityHex = $this->knownDestinationIdentityHash($destHash);
-            error_log("[local-deliver] identity fallback: identityHash=" . ($destIdentityHex ? substr($destIdentityHex,0,12) : 'null'));
             if ($destIdentityHex !== null) {
                 // Check all local destinations for one with the same identity
                 $stmt = $this->db->prepare(
@@ -247,23 +243,13 @@ trait RequestInboundBatchTrait
                 $row = $stmt->fetch(PDO::FETCH_ASSOC);
                 if (is_array($row)) {
                     $localIface = (string) ($row['interface_id'] ?? '');
-                    error_log("[local-deliver] identity fallback FOUND localIface=" . substr($localIface,0,10));
-                } else {
-                    error_log("[local-deliver] identity fallback: no local dest with this identity");
                 }
             }
         }
 
-        if ($localIface === null) {
-            error_log("[local-deliver] FAIL: no local interface found for dest");
+        if ($localIface === null || $localIface === $sourceInterfaceId) {
             return false;
         }
-        if ($localIface === $sourceInterfaceId) {
-            error_log("[local-deliver] FAIL: localIface == sourceInterfaceId (loop)");
-            return false;
-        }
-
-        error_log("[local-deliver] queuing local_delivery to iface=" . substr($localIface,0,10) . " src=" . substr($sourceInterfaceId,0,10));
 
         // Queue the packet as-is (no hop increment) for local delivery
         $queueReason = 'local_delivery';
@@ -297,7 +283,6 @@ trait RequestInboundBatchTrait
             // forwarded LINKREQUESTs, including to local clients.
             $destinationHashHex = (string) ($packet['destination_hash_hex'] ?? '');
             $linkIdHex = $this->linkIdHex($rawBase64, $packet);
-            error_log("[local-deliver] LINKREQUEST: linkIdHex=" . ($linkIdHex ? substr($linkIdHex,0,12) : 'null') . " destHash=" . substr($destinationHashHex,0,12) . " srcIface=" . substr($sourceInterfaceId,0,10) . " localIface=" . substr($localIface,0,10));
             if ($linkIdHex !== null && $linkIdHex !== '') {
                 $path = $this->usablePathEntry($destinationHashHex);
                 $remainingHops = $path !== null ? (int) ($path['hops'] ?? 0) : $this->transportObservedHops($packet);
@@ -312,9 +297,6 @@ trait RequestInboundBatchTrait
                     $takenHops,
                     $destinationHashHex
                 );
-                error_log("[local-deliver] LINKREQUEST: stored link transport entry rcv=" . substr($sourceInterfaceId,0,10) . " out=" . substr($localIface,0,10));
-            } else {
-                error_log("[local-deliver] LINKREQUEST: linkIdHex is null/empty, NOT storing entry");
             }
         }
 
@@ -451,35 +433,24 @@ trait RequestInboundBatchTrait
                     && in_array((int) ($packet['packet_type'] ?? -1), [0, 2], true)
                     && (int) ($packet['destination_type'] ?? -1) !== 3
                 ) {
-                    error_log("[dispatch] trying local delivery type=" . ($packet['packet_type']??'?') . " dest=" . substr((string)($packet['destination_hash_hex']??''),0,12) . " dst_type=" . ($packet['destination_type']??'?') . " src=" . substr($interfaceId,0,10));
                     $deliveredLocally = $this->deliverLocallyIfKnown($interfaceId, $normalizedRawBase64, $packet);
                     if ($deliveredLocally) {
-                        error_log("[dispatch] local delivery SUCCESS");
                         $summary['local_deliveries']++;
-                    } else {
-                        error_log("[dispatch] local delivery FAILED, will try relay cascade");
-                    }
-                } else {
-                    if ($filterStatus === 'accepted' && in_array((int) ($packet['packet_type'] ?? -1), [0, 2], true)) {
-                        error_log("[dispatch] skipped local delivery: dst_type=" . ($packet['destination_type']??'?') . " (must be !=3)");
                     }
                 }
 
                 if (!$deliveredLocally) {
                     if ($filterStatus === 'accepted' && $this->shouldTransportLinkRequestProofPacket($packet)) {
-                        error_log("[relay-cascade] LRPROOF matched, calling relayLinkRequestProofPacket src=" . substr($interfaceId,0,10) . " dest=" . substr((string)($packet['destination_hash_hex']??''),0,12));
+                        error_log("[relay-cascade] LRPROOF matched, calling relayLinkRequestProofPacket");
                         $summary['relay_packets_queued'] += $this->relayLinkRequestProofPacket($interfaceId, $normalizedRawBase64, $packet);
                     } elseif ($filterStatus === 'accepted' && $this->shouldRelayLinkTransportPacket($packet)) {
-                        error_log("[relay-cascade] link transport matched src=" . substr($interfaceId,0,10) . " dest=" . substr((string)($packet['destination_hash_hex']??''),0,12));
                         $summary['relay_packets_queued'] += $this->relayLinkTransportPacket($interfaceId, $normalizedRawBase64, $packet);
                     } elseif ($filterStatus === 'accepted' && $this->shouldReverseRouteProofPacket($packet)) {
-                        error_log("[relay-cascade] regular proof matched, calling relayProofPacket src=" . substr($interfaceId,0,10) . " dest=" . substr((string)($packet['destination_hash_hex']??''),0,12));
+                        error_log("[relay-cascade] regular proof matched, calling relayProofPacket");
                         $summary['relay_packets_queued'] += $this->relayProofPacket($interfaceId, $normalizedRawBase64, $packet);
                     } elseif ($filterStatus === 'accepted' && !$cacheRequestReplayed && $this->shouldRelayAcceptedPacket($packet)) {
-                        error_log("[relay-cascade] fallthrough to relayAcceptedPacket type=" . ($packet['packet_type']??'?') . " dest=" . substr((string)($packet['destination_hash_hex']??''),0,12) . " src=" . substr($interfaceId,0,10));
+                        error_log("[relay-cascade] fallthrough to relayAcceptedPacket type=" . ($packet['packet_type']??'?') . " dest=" . substr((string)($packet['destination_hash_hex']??''),0,12));
                         $summary['relay_packets_queued'] += $this->relayAcceptedPacket($interfaceId, $normalizedRawBase64, $packet);
-                    } else {
-                        error_log("[relay-cascade] NO MATCH: type=" . ($packet['packet_type']??'?') . " dest=" . substr((string)($packet['destination_hash_hex']??''),0,12) . " ctx=" . ($packet['context']??'?') . " src=" . substr($interfaceId,0,10));
                     }
                 }
 

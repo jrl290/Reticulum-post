@@ -777,8 +777,10 @@ trait RequestRelayRoutingTrait
         $flags = ord($raw[0]);
         $hashablePart = chr($flags & 0x0F);
         if ((int) ($packet['header_type'] ?? 0) === 1) {
-            $hashablePart .= substr($raw, 2);
+            // HEADER_2: skip flags(1) + hops(1) + transport_id(16) = 18 bytes
+            $hashablePart .= substr($raw, 18);
         } else {
+            // HEADER_1: skip flags(1) + hops(1) = 2 bytes
             $hashablePart .= substr($raw, 2);
         }
 
