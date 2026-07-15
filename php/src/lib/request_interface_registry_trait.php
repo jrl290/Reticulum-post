@@ -67,6 +67,41 @@ trait RequestInterfaceRegistryTrait
             }
         }
 
+        // RNS PostInterface dedup: non-peer interfaces with the same client
+        // type and name are the same transport singleton (e.g., NAS rnsd
+        // restarting). Reuse the existing interface instead of creating a
+        // duplicate that immediately becomes orphaned.
+        $clientType = (string) ($metadata['client'] ?? '');
+        if ($clientType !== '' && $clientType !== 'reticulum-php') {
+            $existing = $this->interfaceByNameAndClient($name, $clientType);
+            if ($existing !== null) {
+                $interfaceId = (string) $existing['interface_id'];
+                $updateStmt2 = $this->db->prepare(
+                    'UPDATE interfaces
+                     SET session_token = :session_token,
+                         bitrate = :bitrate,
+                         mtu = :mtu,
+                         status = :status,
+                         metadata_json = :metadata_json,
+                         last_seen_at = :last_seen_at
+                     WHERE interface_id = :interface_id'
+                );
+                $updateStmt2->bindValue(':session_token', $sessionToken, PDO::PARAM_STR);
+                $updateStmt2->bindValue(':bitrate', $bitrate, PDO::PARAM_INT);
+                $updateStmt2->bindValue(':mtu', $mtu, PDO::PARAM_INT);
+                $updateStmt2->bindValue(':status', 'online', PDO::PARAM_STR);
+                $updateStmt2->bindValue(':metadata_json', self::encodeJson($metadata), PDO::PARAM_STR);
+                $updateStmt2->bindValue(':last_seen_at', $now, PDO::PARAM_INT);
+                $updateStmt2->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
+                $updateStmt2->execute();
+
+                return [
+                    'interface_id' => $interfaceId,
+                    'session_token' => $sessionToken,
+                ];
+            }
+        }
+
         $interfaceId = bin2hex(random_bytes(16));
 
         $stmt = $this->db->prepare(
@@ -294,6 +329,23 @@ trait RequestInterfaceRegistryTrait
         }
 
         return null;
+    }
+
+    private function interfaceByNameAndClient(string $name, string $clientType): ?array
+    {
+        $stmt = $this->db->prepare(
+            "SELECT interface_id, name, metadata_json
+             FROM interfaces
+             WHERE name = :name
+               AND metadata_json LIKE :client_pattern
+             LIMIT 1"
+        );
+        $stmt->bindValue(':name', $name, PDO::PARAM_STR);
+        $stmt->bindValue(':client_pattern', '%"client":"' . $clientType . '"%', PDO::PARAM_STR);
+        $stmt->execute();
+        $row = $stmt->fetch(PDO::FETCH_ASSOC);
+
+        return is_array($row) ? $row : null;
     }
 
     public function touchPeerWakeSent(string $interfaceId): void
