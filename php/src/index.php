@@ -838,14 +838,53 @@ final class PacketParser
         ];
     }
 
+    /**
+     * Compute the hashable part of a raw RNS packet for SHA-256 hashing.
+     *
+     * This MUST match the equivalent in every RNS implementation:
+     *
+     *   Python (RNS.Packet):
+     *     hashable_part = bytes([flags & 0x0F]) + raw[2:]          # HEADER_1
+     *     hashable_part = bytes([flags & 0x0F]) + raw[18:]         # HEADER_2
+     *
+     *   JavaScript (packet.js getHashablePart()):
+     *     hashablePart = Buffer.from([raw[0] & 0x0F]);
+     *     if (headerType === HEADER_2) {
+     *       hashablePart = concat(hashablePart, raw.slice(16 + 2)); // byte 18
+     *     } else {
+     *       hashablePart = concat(hashablePart, raw.slice(2));
+     *     }
+     *
+     *   HEADER_2 wire layout (35+ bytes):
+     *     [0] flags  [1] hops  [2..17] transport_id (16 bytes)  [18..] dest+ctx+payload
+     *
+     *   HEADER_1 wire layout (19+ bytes):
+     *     [0] flags  [1] hops  [2..] dest+ctx+payload
+     *
+     * REGRESSION GUARD (2026-07-19):
+     *   Commit 92a7d48 (July 14) wrongly changed the HEADER_2 branch from
+     *   `self::DST_LEN + 2` (=18) to just `2`, causing every HEADER_2
+     *   inbound packet to get a wrong truncated_hash_hex. The mismatch
+     *   broke proof relay because proofs arriving from the browser (JS)
+     *   carry the correct hash and can't find the PHP-stored reverse path.
+     *   Reverted in 4db3a7a. DO NOT change these offsets without updating
+     *   php/tests/PacketParserHashTest.php and verifying against known-good
+     *   JS output.
+     *
+     * @see php/tests/PacketParserHashTest.php
+     * @see Retichat-js lib/rns/packet.js :: getHashablePart()
+     * @see DESIGN_PRINCIPLES.md (cross-implementation hash parity)
+     */
     private static function hashablePart(string $raw, int $headerType, int $flags): string
     {
         $hashablePart = chr($flags & 0b00001111);
 
         if ($headerType === self::HEADER_2) {
+            // Skip flags(1) + hops(1) + transport_id(16) = 18 bytes
             return $hashablePart . substr($raw, self::DST_LEN + 2);
         }
 
+        // Skip flags(1) + hops(1) = 2 bytes
         return $hashablePart . substr($raw, 2);
     }
 }
