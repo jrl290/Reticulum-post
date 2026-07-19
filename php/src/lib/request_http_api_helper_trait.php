@@ -393,6 +393,13 @@ trait RequestHttpApiHelperTrait
 
     private function log(string $level, string $message): void
     {
+        // Only write error and warning messages to the log.
+        // Debug/notice/info levels are suppressed to prevent unbounded
+        // log growth from per-exchange perf metrics (500k+ lines/day).
+        $allowed = ['error', 'warning'];
+        if (!in_array(strtolower($level), $allowed, true)) {
+            return;
+        }
         $line = sprintf("[%s] [%s] %s\n", date('Y-m-d H:i:s'), strtoupper($level), $message);
         file_put_contents((string) $this->config['storage']['log_path'], $line, FILE_APPEND | LOCK_EX);
     }

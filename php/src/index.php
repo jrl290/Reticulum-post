@@ -1501,7 +1501,7 @@ final class HttpApi
                 }
 
                 $elapsed = round((microtime(true) - $t0) * 1000);
-                @file_put_contents('/home/retichat/public_html/reticulum/var/router.log', sprintf("[%s] [NOTICE] [perf] initialize total=%dms\n", date('Y-m-d H:i:s'), $elapsed), FILE_APPEND | LOCK_EX);
+                $this->log('debug', "[perf] initialize total={$elapsed}ms");
 
                 $this->respond(200, $summary);
             }
@@ -1648,15 +1648,6 @@ final class HttpApi
                 $t5 = microtime(true);
 
                 try { $this->dispatchWakes(); } catch (\Throwable $e) {}
-
-                $elapsed = round(($t5 - $t0) * 1000);
-                $maint = round(($t1 - $t0) * 1000);
-                $ack = round(($t2 - $t1) * 1000);
-                $ingest = round(($t3 - $t2) * 1000);
-                $fetch = round(($t4 - $t3) * 1000);
-                $epi = round(($t5 - $t4) * 1000);
-                $ifaceShort = substr($interfaceId, 0, 8);
-                $this->log('notice', "[perf] exchange iface={$ifaceShort} total={$elapsed}ms maint={$maint}ms ack={$ack}ms ingest={$ingest}ms fetch={$fetch}ms epi={$epi}ms in_pkts=" . count($packets) . " out_pkts=" . count($delivery['packets'] ?? []));
 
                 $this->respond(200, [
                     'status' => 'accepted',
