@@ -400,8 +400,12 @@ trait RequestHttpApiHelperTrait
         if (!in_array(strtolower($level), $allowed, true)) {
             return;
         }
+        $logPath = (string) ($this->config['storage']['log_path'] ?? '');
+        if ($logPath === '') {
+            return;
+        }
         $line = sprintf("[%s] [%s] %s\n", date('Y-m-d H:i:s'), strtoupper($level), $message);
-        file_put_contents((string) $this->config['storage']['log_path'], $line, FILE_APPEND | LOCK_EX);
+        @file_put_contents($logPath, $line, FILE_APPEND | LOCK_EX);
     }
 
     public function renderMonitorPage(): never
