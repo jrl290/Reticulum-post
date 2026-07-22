@@ -1647,7 +1647,7 @@ final class HttpApi
                 $this->runInterfaceRequestEpilogue();
                 $t5 = microtime(true);
 
-                try { $this->dispatchWakes(); } catch (\Throwable $e) {}
+                try { $this->storage->dispatchWakes(); } catch (\Throwable $e) { error_log('[reticulum] dispatchWakes failed: ' . $e->getMessage()); }
 
                 $this->respond(200, [
                     'status' => 'accepted',
@@ -1694,7 +1694,7 @@ final class HttpApi
                 $acked = $this->storage->acknowledgeOutboundBatches($interfaceId, $ackBatchIds);
                 $batch = $this->storage->fetchOutboundBatch($interfaceId, $maxPackets);
                 $this->runInterfaceRequestEpilogue();
-                try { $this->dispatchWakes(); } catch (\Throwable $e) {}
+                try { $this->storage->dispatchWakes(); } catch (\Throwable $e) { error_log('[reticulum] dispatchWakes failed: ' . $e->getMessage()); }
 
                 $this->respond(200, [
                     'status' => 'ok',
@@ -1715,7 +1715,11 @@ final class HttpApi
             $this->respond($error->statusCode, $payload);
         } catch (\Throwable $error) {
             $this->log('error', 'Unhandled HTTP exception: ' . $error->getMessage());
-            $this->respond(500, ['error' => 'internal error']);
+            $this->respond(500, [
+                'error' => $error->getMessage(),
+                'file' => basename($error->getFile()),
+                'line' => $error->getLine(),
+            ]);
         }
     }
 }
@@ -2625,7 +2629,11 @@ if (realpath($_SERVER['SCRIPT_FILENAME'] ?? '') === __FILE__) {
         header('Access-Control-Allow-Origin: *');
         header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
         header('Access-Control-Allow-Headers: Content-Type, X-Interface-Id, X-Session-Token');
-        echo json_encode(['error' => 'internal error'], JSON_THROW_ON_ERROR);
+        echo json_encode([
+            'error' => $error->getMessage(),
+            'file' => basename($error->getFile()),
+            'line' => $error->getLine(),
+        ], JSON_THROW_ON_ERROR | JSON_PARTIAL_OUTPUT_ON_ERROR);
         exit;
     }
 }

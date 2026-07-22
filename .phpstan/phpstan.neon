@@ -1,0 +1,10 @@
+parameters:
+  level: 0
+  paths:
+    - php/src/
+  scanFiles:
+    - php/src/index.php
+  ignoreErrors:
+    - '#Call to an undefined method ReticulumPhp\\\w+::\w+\(\)#'
+    - '#Access to an undefined property#'
+    - '#Anonymous function should return#'

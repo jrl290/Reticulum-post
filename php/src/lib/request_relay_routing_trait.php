@@ -560,22 +560,17 @@ trait RequestRelayRoutingTrait
     private function relayProofPacket(string $sourceInterfaceId, string $rawBase64, array $packet): int
     {
         $destHashHex = (string) ($packet['destination_hash_hex'] ?? '');
-        $ctx = (int) ($packet['context'] ?? -1);
-        error_log("[relayProofPacket] dest=" . substr($destHashHex,0,12) . " ctx=$ctx src=" . substr($sourceInterfaceId,0,10) . " looking up reverse path...");
         // Use peek (non-destructive) so that subsequent proofs on the
         // same link (e.g. delivery confirmations after LRPROOF) can also
         // use the same reverse path. The entry is cleaned up by the
         // periodic maintenance task, not by individual proof relay.
         $reversePath = $this->peekReversePath($destHashHex, $sourceInterfaceId);
         if ($reversePath === null) {
-            error_log("[relayProofPacket] NO REVERSE PATH for dest=" . substr($destHashHex,0,12) . " src=" . substr($sourceInterfaceId,0,10));
             return 0;
         }
 
-        error_log("[relayProofPacket] FOUND reverse path, relaying to rcv_if=" . substr((string)($reversePath['received_interface_id']??''),0,10));
         $relayPacketBase64 = $this->proofRelayPacketBase64($rawBase64, $packet);
         $this->queueOutboundPacket((string) $reversePath['received_interface_id'], $relayPacketBase64, 'proof_relay', $sourceInterfaceId);
-        error_log("[relayProofPacket] queued proof_relay to iface=" . substr((string)($reversePath['received_interface_id']??''),0,10) . " src=" . substr($sourceInterfaceId,0,10));
 
         return 1;
     }
@@ -586,16 +581,13 @@ trait RequestRelayRoutingTrait
         // original LINKREQUEST — use it directly as the link ID.
         $linkIdHex = (string) ($packet['destination_hash_hex'] ?? '');
         if ($linkIdHex === '') {
-            error_log("[relayLinkRequestProofPacket] empty linkIdHex, returning 0");
             return 0;
         }
 
-        error_log("[relayLinkRequestProofPacket] linkId=" . substr($linkIdHex,0,12) . " src=" . substr($sourceInterfaceId,0,10) . " looking up link transport entry...");
         $linkEntry = $this->linkTransportEntryForOutbound($linkIdHex, $sourceInterfaceId);
         if ($linkEntry === null) {
             // Fallback: try reverse-path routing. Some RNS implementations
             // use a different link ID in the proof than what was stored.
-            error_log("[relayLinkRequestProofPacket] no link transport entry, falling back to relayProofPacket");
             $result = $this->relayProofPacket($sourceInterfaceId, $rawBase64, $packet);
             if ($result > 0) {
                 // The proof was relayed via reverse path. Create a validated
@@ -619,7 +611,6 @@ trait RequestRelayRoutingTrait
                             $linkIdHex
                         );
                         $this->touchLinkTransportEntry($linkIdHex, $outboundIface, true);
-                        error_log("[relayLinkRequestProofPacket] created validated link transport entry for linkId=" . substr($linkIdHex,0,12) . " rcv=" . substr($receivedIface,0,10) . " out=" . substr($outboundIface,0,10));
                     }
                 }
             }

@@ -385,7 +385,11 @@ trait RequestHttpApiHelperTrait
                 }
             }
             $this->log("error", $msg);
-            $encoded = json_encode(["error" => "internal error"]);
+            $encoded = json_encode([
+                'error' => 'json encode failed: ' . ($e->getMessage() ?? 'unknown'),
+                'file' => basename($e->getFile()),
+                'line' => $e->getLine(),
+            ]);
         }
         echo $encoded;
         exit;

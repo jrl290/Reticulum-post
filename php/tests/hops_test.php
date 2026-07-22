@@ -124,9 +124,12 @@ class MockRouter
         return ($now ?? $this->now) - 300;
     }
 
+    /** @var string|null Override for linkIdHex() return value in tests */
+    public ?string $linkIdHexReturn = null;
+
     public function linkIdHex(string $rawBase64, array $packet): ?string
     {
-        return $packet['destination_hash_hex'] ?? null;
+        return $this->linkIdHexReturn ?? ($packet['destination_hash_hex'] ?? null);
     }
 
     public function allOtherInterfaceIds(string $sourceInterfaceId): array { return []; }
@@ -440,6 +443,55 @@ assertEq('rejection reason', 'group_hops_exceeded', $reason);
 
 [$status, $reason] = $ref->invoke($router4, makePacket(['destination_type' => 1, 'packet_type' => 0, 'hops' => 1]));
 assertEq('GROUP hops=1 → accepted', 'accepted', $status);
+
+// ══════════════════════════════════════════════════════════════════════════
+// Test 8: Local LINKREQUEST remaining_hops uses transportObservedHops,
+//         NOT path table announce hops (regression for LRPROOF-DROP)
+// ══════════════════════════════════════════════════════════════════════════
+
+echo "\n── Test 8: Local LINKREQUEST remaining_hops ignores path table ──\n";
+
+$router5 = new MockRouter();
+$destHex = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab';
+$linkIdHex = '11111111111111111111111111111111';
+
+// Simulate a stale path table entry (announce propagated 3 hops)
+$router5->pathTable[$destHex] = [
+    'hops' => 3,
+    'next_hop_hex' => '22222222222222222222222222222222',
+    'interface_id' => 'iface_bridge',
+];
+
+// Register the destination as local (browser client)
+$router5->localDestinations[$destHex] = 'iface_browser';
+
+// Override linkIdHex to return a fixed value
+$router5->linkIdHexReturn = $linkIdHex;
+
+$pkt = makePacket([
+    'packet_type' => 2,       // LINKREQUEST
+    'hops' => 1,              // post-inbound (arrived from NAS with hops=0, +1)
+    'destination_hash_hex' => $destHex,
+    'truncated_hash_hex' => substr($linkIdHex, 0, 16),
+]);
+$rawB64 = makeRawBase64($pkt);
+
+$ref = new ReflectionMethod($router5, 'deliverLocallyIfKnown');
+$ref->setAccessible(true);
+$result = $ref->invoke($router5, 'iface_bridge', $rawB64, $pkt);
+assertTrue('deliverLocallyIfKnown returned true', $result === true);
+
+// The link transport entry should store remaining_hops = transportObservedHops (1),
+// NOT the path table hops (3). If the path table were used, remaining_hops=3
+// and the returning LRPROOF (observed=1) would be dropped.
+// Key is {linkIdHex}::{outbound_interface_id}
+$linkKey = "$linkIdHex::iface_browser";
+$entry = $router5->linkTransportTable[$linkKey] ?? null;
+assertTrue('link transport entry created for local delivery', $entry !== null);
+assertEq('remaining_hops from transportObservedHops (1), not path table (3)', 1, $entry['remaining_hops'] ?? -1);
+assertEq('taken_hops = observed hops (1)', 1, $entry['taken_hops'] ?? -1);
+assertEq('received_interface is bridge', 'iface_bridge', $entry['received_interface_id'] ?? '');
+assertEq('outbound_interface is browser', 'iface_browser', $entry['outbound_interface_id'] ?? '');
 
 // ══════════════════════════════════════════════════════════════════════════
 // Report

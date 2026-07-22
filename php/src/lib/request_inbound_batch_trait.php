@@ -214,13 +214,11 @@ trait RequestInboundBatchTrait
     {
         $destHash = (string) ($packet['destination_hash_hex'] ?? '');
         $pktType = (int) ($packet['packet_type'] ?? -1);
-        error_log("[deliverLocallyIfKnown] type=$pktType dest=" . substr($destHash,0,12) . " src=" . substr($sourceInterfaceId,0,10));
         if ($destHash === '') {
             return false;
         }
 
         $localIface = $this->localDestinationInterface($destHash);
-        error_log("[deliverLocallyIfKnown] localIface=" . ($localIface ? substr($localIface,0,10) : 'null'));
 
         // Fallback: if exact destination hash isn't registered, try to
         // match by identity. Different aspects of the same identity
@@ -300,7 +298,6 @@ trait RequestInboundBatchTrait
             }
         }
 
-        error_log("[deliverLocallyIfKnown] returning TRUE (queued local_delivery)");
         return true;
     }
 
@@ -327,7 +324,7 @@ trait RequestInboundBatchTrait
      */
     private function registerLinkLocalDestination(string $linkHashHex, string $localIface): void
     {
-        $stmt = $this->db->prepare($this->insertOrSql(
+        $stmt = $this->db->prepare(Database::insertOrSql($this->backend,
             'INSERT OR REPLACE INTO local_destinations (
                 destination_hash_hex, interface_id, registered_at
              ) VALUES (
@@ -446,15 +443,12 @@ trait RequestInboundBatchTrait
 
                 if (!$deliveredLocally) {
                     if ($filterStatus === 'accepted' && $this->shouldTransportLinkRequestProofPacket($packet)) {
-                        error_log("[relay-cascade] LRPROOF matched, calling relayLinkRequestProofPacket");
                         $summary['relay_packets_queued'] += $this->relayLinkRequestProofPacket($interfaceId, $normalizedRawBase64, $packet);
                     } elseif ($filterStatus === 'accepted' && $this->shouldRelayLinkTransportPacket($packet)) {
                         $summary['relay_packets_queued'] += $this->relayLinkTransportPacket($interfaceId, $normalizedRawBase64, $packet);
                     } elseif ($filterStatus === 'accepted' && $this->shouldReverseRouteProofPacket($packet)) {
-                        error_log("[relay-cascade] regular proof matched, calling relayProofPacket");
                         $summary['relay_packets_queued'] += $this->relayProofPacket($interfaceId, $normalizedRawBase64, $packet);
                     } elseif ($filterStatus === 'accepted' && !$cacheRequestReplayed && $this->shouldRelayAcceptedPacket($packet)) {
-                        error_log("[relay-cascade] fallthrough to relayAcceptedPacket type=" . ($packet['packet_type']??'?') . " dest=" . substr((string)($packet['destination_hash_hex']??''),0,12));
                         $summary['relay_packets_queued'] += $this->relayAcceptedPacket($interfaceId, $normalizedRawBase64, $packet);
                     }
                 }
