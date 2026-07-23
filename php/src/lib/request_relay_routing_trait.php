@@ -417,6 +417,16 @@ trait RequestRelayRoutingTrait
         $targets = $this->relayTargetsForAcceptedPacket($sourceInterfaceId, $packet);
         $queueReason = (int) ($packet['packet_type'] ?? -1) === 1 ? 'relay_announce' : 'relay';
 
+        // Standard RNS split-horizon (Transport.py line 1927):
+        // Announces arriving from a MODE_GATEWAY interface represent
+        // remote peers and must not be relayed to other gateway
+        // interfaces — only to MODE_ACCESS_POINT and MODE_FULL.
+        if ((int) ($packet['packet_type'] ?? -1) === 1 && $this->isGatewayMode($sourceInterfaceId)) {
+            $targets = array_values(array_filter($targets, function (string $targetId): bool {
+                return !$this->isGatewayMode($targetId);
+            }));
+        }
+
         if ($targets === []) {
             error_log("[relayAcceptedPacket] NO TARGETS for dest=" . substr((string)($packet['destination_hash_hex']??''),0,12) . " type=" . ($packet['packet_type']??'?'));
         }
@@ -441,6 +451,32 @@ trait RequestRelayRoutingTrait
         }
 
         return $queued;
+    }
+
+    /**
+     * Check whether an interface is a backbone (gateway-mode) interface.
+     *
+     * Standard RNS split-horizon: announces arriving from a MODE_GATEWAY
+     * interface represent remote peers and must not be relayed to other
+     * MODE_GATEWAY interfaces — only to MODE_ACCESS_POINT and MODE_FULL.
+     *
+     * Reference: RNS Python, PostInterface.py lines 96-108 and
+     * Transport.py line 1927.
+     */
+    private function isGatewayMode(string $interfaceId): bool
+    {
+        $stmt = $this->db->prepare(
+            "SELECT metadata_json FROM interfaces WHERE interface_id = :id"
+        );
+        $stmt->bindValue(':id', $interfaceId, PDO::PARAM_STR);
+        $stmt->execute();
+        $row = $stmt->fetch(PDO::FETCH_ASSOC);
+        if (!$row) {
+            return false;
+        }
+        $meta = self::decodeJson((string) ($row['metadata_json'] ?? ''));
+        // MODE_GATEWAY = 6 in the standard RNS interface mode enum
+        return (int) ($meta['mode'] ?? 0) === 6;
     }
 
     private function queueRelayPathRequestIfNeeded(string $sourceInterfaceId, array $packet): void

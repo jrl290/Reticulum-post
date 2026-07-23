@@ -481,7 +481,7 @@ trait RequestControlPlaneTrait
                 :announce_emitted,
                 :updated_at
             )
-            ON CONFLICT(destination_hash_hex) DO UPDATE SET
+            ON CONFLICT(destination_hash_hex, interface_id) DO UPDATE SET
                 next_hop_hex = excluded.next_hop_hex,
                 hops = excluded.hops,
                 expires_at = excluded.expires_at,

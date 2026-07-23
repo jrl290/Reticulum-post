@@ -324,7 +324,7 @@ trait RequestInboundBatchTrait
      */
     private function registerLinkLocalDestination(string $linkHashHex, string $localIface): void
     {
-        $stmt = $this->db->prepare(Database::insertOrSql($this->backend,
+        $stmt = $this->db->prepare($this->insertOrSql(
             'INSERT OR REPLACE INTO local_destinations (
                 destination_hash_hex, interface_id, registered_at
              ) VALUES (

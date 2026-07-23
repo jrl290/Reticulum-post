@@ -233,17 +233,17 @@ trait RequestMaintenanceTrait
 
         $batchSize = 1000;
         while (true) {
-            $stmt = $this->db->prepare(
-                "DELETE FROM {$pathTable}
+            // SQLite does not support LIMIT in DELETE. Use batched approach
+            // like deleteBatched(): LIMIT for MySQL, no LIMIT for SQLite.
+            $limitClause = $backend === 'mysql' ? " LIMIT {$batchSize}" : '';
+            $sql = "DELETE FROM {$pathTable}
                   WHERE interface_id IN (
                       SELECT interface_id FROM {$ifTable}
                        WHERE status = 'offline'
                          AND updated_at < :cutoff
-                  )
-                  LIMIT :batch_size"
-            );
+                  ){$limitClause}";
+            $stmt = $this->db->prepare($sql);
             $stmt->bindValue(':cutoff', $staleCutoff, PDO::PARAM_INT);
-            $stmt->bindValue(':batch_size', $batchSize, PDO::PARAM_INT);
 
             try {
                 Database::executeWithRetry($stmt, 'deleteOrphanedPaths');
@@ -405,9 +405,13 @@ trait RequestMaintenanceTrait
         $batchSize = $backend === 'mysql' ? 500 : 1000;
         $totalDeleted = 0;
 
-        // MySQL: DELETE ... LIMIT batchSize
-        // SQLite: DELETE ... (no LIMIT needed — single-writer serialization)
+        // MySQL: DELETE ... ORDER BY ... LIMIT batchSize
+        // SQLite: DELETE ... (no ORDER BY or LIMIT — single-writer serialization)
         $limitClause = $backend === 'mysql' ? " LIMIT {$batchSize}" : '';
+        // Strip ORDER BY for SQLite — SQLite doesn't support ORDER BY in DELETE
+        if ($backend === 'sqlite') {
+            $whereClause = preg_replace('/\s+ORDER\s+BY\s+\S+(\s+(ASC|DESC))?\s*$/i', '', $whereClause);
+        }
 
         while (true) {
             $sql = "DELETE FROM {$table} WHERE {$whereClause}{$limitClause}";
