@@ -8,8 +8,8 @@ Supports two modes:
   - Poll mode (no wake_url): polls the PHP node on a timer
   - Wake mode (wake_url set): bidirectional peer connection. The bridge
     runs a lightweight HTTP server to receive /v1/wake calls from the
-    PHP node, triggering immediate exchange. Polling runs as a low-frequency
-    fallback.
+    PHP node, triggering immediate exchange. Outbound packets also
+    trigger immediate exchange. No polling fallback.
 
 Place this file in ~/.reticulum/interfaces/ and add to config:
 
@@ -312,11 +312,16 @@ class PostInterface(Interface):
     def process_outgoing(self, data):
         """Called by RNS when it wants to send a packet through this interface.
         We queue it for the next exchange with the PHP node.
+        In wake mode, also signals the poll loop to trigger an immediate exchange.
         """
         if self.online:
             with self._queue_lock:
                 self._outgoing_queue.append(data)
             self.txb += len(data)
+            # In wake mode, trigger immediate exchange (matches Rust behaviour).
+            if self.wake_url:
+                with self._wake_lock:
+                    self._pending_wake = True
             if len(data) >= 18:
                 dest = data[2:18].hex() if len(data) >= 18 else '?'
                 pkt_type = data[0] & 0x03 if data else -1
@@ -391,13 +396,12 @@ class PostInterface(Interface):
         """Background thread that periodically exchanges packets with the PHP node.
 
         In poll mode (no wake_url): polls at the configured interval.
-        In wake mode (wake_url set): polls at a much lower frequency as a
-        fallback. The primary trigger is the PHP node waking us via /v1/wake,
-        which sets _pending_wake for immediate exchange.
+        In wake mode (wake_url set): purely event-driven.  Exchange is
+        triggered by an incoming wake from the PHP node or by an outbound
+        packet queued via process_outgoing().  No timer-based fallback.
         """
         last_exchange = 0
         _min_interval = 3.0
-        _wake_fallback_interval = 60.0
 
         while self._running:
             now = time.time()
@@ -408,11 +412,15 @@ class PostInterface(Interface):
                 self._pending_wake = False
 
             if not triggered:
-                # Determine poll interval.
+                if self.wake_url is not None:
+                    # Wake mode: no polling.  Exchange only when triggered
+                    # by an incoming wake or an outbound packet.
+                    time.sleep(0.5)
+                    continue
+
+                # Poll mode: determine interval for timed exchange.
                 if self._poll_interval is not None:
                     interval = max(self._poll_interval, _min_interval)
-                elif self.wake_url is not None:
-                    interval = _wake_fallback_interval
                 else:
                     interval = max(self._idle_ms / 1000.0, _min_interval)
 
