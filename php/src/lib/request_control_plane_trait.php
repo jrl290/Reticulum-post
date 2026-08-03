@@ -409,18 +409,6 @@ trait RequestControlPlaneTrait
             $currentInterfaceId = (string) ($current['interface_id'] ?? '');
             $incomingTransportIdHex = $packet['transport_id_hex'] === null ? null : strtolower((string) $packet['transport_id_hex']);
             $metadata = $this->interfaceMetadata($interfaceId);
-            $preserveTransportPath = $currentUsable
-                && $currentInterfaceId !== ''
-                && hash_equals($currentInterfaceId, $interfaceId)
-                && (string) ($metadata['transport'] ?? '') === 'http-exchange'
-                && $currentNextHopHex !== ''
-                && !hash_equals($currentNextHopHex, $normalizedDestinationHashHex)
-                && $incomingTransportIdHex === null
-                && $hops <= 1;
-
-            if ($preserveTransportPath) {
-                return ['validated', 'transport_path_preserved'];
-            }
 
             $randomBlobs = self::decodeJson((string) $current['random_blobs_json']);
             $blobSeen = in_array($randomHashHex, $randomBlobs, true);
@@ -428,11 +416,36 @@ trait RequestControlPlaneTrait
             $existingHops = (int) $current['hops'];
             $pathTimebase = $this->randomBlobTimebase($randomBlobs);
 
+            // A genuinely newer announce (unseen random blob, emission not
+            // older than anything we've recorded) always carries information
+            // we must not discard — even if it would otherwise qualify for the
+            // transport-path preservation shortcut below. This is the guard
+            // against getting stuck on stale routing state: fresh info wins.
+            $isNewerAnnounce = !$blobSeen && $announceEmitted >= $pathTimebase;
+
+            $preserveTransportPath = $currentUsable
+                && $currentInterfaceId !== ''
+                && hash_equals($currentInterfaceId, $interfaceId)
+                && (string) ($metadata['transport'] ?? '') === 'http-exchange'
+                && $currentNextHopHex !== ''
+                && !hash_equals($currentNextHopHex, $normalizedDestinationHashHex)
+                && $incomingTransportIdHex === null
+                && $hops <= 1
+                && !$isNewerAnnounce;
+
+            if ($preserveTransportPath) {
+                return ['validated', 'transport_path_preserved'];
+            }
+
             if (!$currentUsable) {
                 $shouldAdd = true;
                 $reason = 'unusable_path_replaced';
             } elseif ($hops <= $existingHops) {
-                if (!$blobSeen && $announceEmitted > $pathTimebase) {
+                // Use >= so a re-announce emitted at the same tick (or with
+                // minor clock skew on the announcer) still refreshes the path
+                // rather than being silently dropped. The random-blob check
+                // above already provides replay protection.
+                if ($isNewerAnnounce) {
                     $shouldAdd = true;
                     $reason = 'better_or_equal_hops_newer_announce';
                 }
@@ -440,7 +453,7 @@ trait RequestControlPlaneTrait
                 if ($now >= $pathExpires && !$blobSeen) {
                     $shouldAdd = true;
                     $reason = 'expired_path_replaced';
-                } elseif (!$blobSeen && $announceEmitted > (int) $current['announce_emitted']) {
+                } elseif (!$blobSeen && $announceEmitted >= (int) $current['announce_emitted']) {
                     $shouldAdd = true;
                     $reason = 'newer_announce_replaced';
                 }
