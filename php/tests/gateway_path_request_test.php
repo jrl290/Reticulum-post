@@ -21,6 +21,18 @@ require_once __DIR__ . '/../src/lib/request_relay_routing_trait.php';
 require_once __DIR__ . '/../src/lib/request_path_state_trait.php';
 require_once __DIR__ . '/stubs/PacketParser.php';
 
+// Declared in src/index.php, which the traits cannot pull in on their own.
+final class TransportConstantsStub
+{
+    public const APP_NAME = 'rnstransport';
+    public const PATH_REQUEST_ASPECT_1 = 'path';
+    public const PATH_REQUEST_ASPECT_2 = 'request';
+    public const DEFAULT_PER_HOP_TIMEOUT_SECONDS = 6;
+    public const PATH_REQUEST_MI = 20;
+    public const PATH_REQUEST_TIMEOUT = 15;
+}
+class_alias('TransportConstantsStub', 'ReticulumPhp\\TransportConstants');
+
 // ── Minimal stubs for traits we don't need ───────────────────────────────
 
 // ── Minimal stubs for traits we don't need ───────────────────────────────
@@ -62,6 +74,9 @@ class GatewayMockRouter
     /** @var array<string, bool> */
     public array $pathRequestTags = [];
 
+    /** @var array<string, int> */
+    public array $pathRequestThrottle = [];
+
     /** @var array<string, array> */
     public array $pathTable = [];
 
@@ -84,6 +99,17 @@ class GatewayMockRouter
             return false;
         }
         $this->pathRequestTags[$tagKeyHex] = true;
+        return true;
+    }
+
+    public function claimPathRequestSlot(string $throttleKey, int $minIntervalSeconds): bool
+    {
+        $now = time();
+        $last = $this->pathRequestThrottle[$throttleKey] ?? null;
+        if ($last !== null && $now - $last < $minIntervalSeconds) {
+            return false;
+        }
+        $this->pathRequestThrottle[$throttleKey] = $now;
         return true;
     }
 
@@ -322,6 +348,41 @@ assertTrue('iface_peer NOT a target', !in_array('iface_peer', $targetIds, true))
 assertTrue('iface_backbone NOT a target', !in_array('iface_backbone', $targetIds, true));
 
 // ══════════════════════════════════════════════════════════════════════════
+// Test 2b: Transit retry for the same destination → suppressed
+//
+// Python only reaches the local-clients branch after should_search_for_unknown
+// has checked Transport.discovery_path_requests (Transport.py:2913-2918), so a
+// destination already being searched for is not re-flooded. Each retry carries
+// a fresh random tag, so tag dedup alone never catches these.
+// ══════════════════════════════════════════════════════════════════════════
+
+echo "\n── Test 2b: Transit retry for same destination → suppressed ──\n";
+
+$queuedBefore = count($router->outboundQueue);
+$retry = makePathRequestPacket('bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb');
+$retryRawB64 = makeRawBase64ForPacket($retry);
+$retry['normalized_raw_base64'] = $retryRawB64;
+
+assertTrue('retry carries a different tag', $retry['payload_base64'] !== $pkt['payload_base64']);
+
+[$status, $reason, $queued] = $router->testProcessPathRequest('iface_backbone', $retryRawB64, $retry);
+
+assertEq('status is ignored', 'ignored', $status);
+assertEq('reason is path_request_already_pending', 'path_request_already_pending', $reason);
+assertEq('queued is 0', 0, $queued);
+assertEq('nothing added to the outbound queue', $queuedBefore, count($router->outboundQueue));
+
+// A different destination must still be searched for.
+$other = makePathRequestPacket('dddddddddddddddddddddddddddddddd');
+$otherRawB64 = makeRawBase64ForPacket($other);
+$other['normalized_raw_base64'] = $otherRawB64;
+
+[$status, $reason, $queued] = $router->testProcessPathRequest('iface_backbone', $otherRawB64, $other);
+
+assertEq('a different destination is still forwarded', 'forwarded', $status);
+assertEq('queued to 2 local clients', 2, $queued);
+
+// ══════════════════════════════════════════════════════════════════════════
 // Test 3: Transit, no local clients → IGNORE
 // ══════════════════════════════════════════════════════════════════════════
 
@@ -522,10 +583,10 @@ assertTrue('iface_peer excluded (is source)', !in_array('iface_peer', $targetIds
 assertTrue('local_client_1 included', count($targetIds) === 1 && $targetIds[0] === 'local_client_1');
 
 // ══════════════════════════════════════════════════════════════════════════
-// Test 10: Known path but cached announce missing → IGNORE
+// Test 10: Known path but cached announce missing → treat as unknown
 // ══════════════════════════════════════════════════════════════════════════
 
-echo "\n── Test 10: Known path, missing cached announce → IGNORE ──\n";
+echo "\n── Test 10: Known path, missing cached announce → DISCOVER ──\n";
 
 $router = new GatewayMockRouter();
 $router->ifaceMetadata['local_client_1'] = ['client' => 'rns-js', 'mode' => 1];
@@ -550,9 +611,14 @@ $pkt['normalized_raw_base64'] = $rawB64;
 
 [$status, $reason, $queued] = $router->testProcessPathRequest('local_client_1', $rawB64, $pkt);
 
-assertEq('status is ignored', 'ignored', $status);
-assertEq('reason is cached_announce_not_found', 'cached_announce_not_found', $reason);
-assertEq('queued is 0', 0, $queued);
+// A path entry outlives the announce it cached (days vs. an hour), so a
+// dangling reference is expected rather than exceptional. There is nothing to
+// answer with, so the request must fall through to discovery — answering
+// nothing would black-hole every request for this destination until the entry
+// expired, which is what stranded rfed.distro.register for 99 minutes.
+assertEq('status is forwarded', 'forwarded', $status);
+assertEq('reason is unknown_destination_forwarded', 'unknown_destination_forwarded', $reason);
+assertEq('queued is 2', 2, $queued);
 
 // ══════════════════════════════════════════════════════════════════════════
 

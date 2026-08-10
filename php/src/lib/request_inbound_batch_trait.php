@@ -229,12 +229,17 @@ trait RequestInboundBatchTrait
             if ($destIdentityHex !== null) {
                 // Check all local destinations for one with the same identity
                 $stmt = $this->db->prepare(
-                    'SELECT ld.interface_id
+                    "SELECT ld.interface_id
                      FROM local_destinations ld
                      INNER JOIN known_destinations kd
                        ON kd.destination_hash_hex = ld.destination_hash_hex
+                     INNER JOIN interfaces i
+                       ON i.interface_id = ld.interface_id
                      WHERE kd.identity_hash_hex = :id_hash
-                     LIMIT 1'
+                       AND (i.status = 'online'
+                            OR (i.peer_url IS NOT NULL AND i.peer_interface_id IS NOT NULL))
+                     ORDER BY ld.registered_at DESC
+                     LIMIT 1"
                 );
                 $stmt->bindValue(':id_hash', $destIdentityHex, PDO::PARAM_STR);
                 $stmt->execute();
@@ -324,7 +329,7 @@ trait RequestInboundBatchTrait
      */
     private function registerLinkLocalDestination(string $linkHashHex, string $localIface): void
     {
-        $stmt = $this->db->prepare($this->insertOrSql(
+        $stmt = $this->db->prepare(Database::insertOrSql($this->backend,
             'INSERT OR REPLACE INTO local_destinations (
                 destination_hash_hex, interface_id, registered_at
              ) VALUES (

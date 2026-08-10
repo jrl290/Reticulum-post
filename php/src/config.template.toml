@@ -23,6 +23,9 @@ packet_hash_ttl_seconds = 86400
 path_request_tag_ttl_seconds = 86400
 reverse_path_ttl_seconds = 480
 link_transport_ttl_seconds = 900
+inbound_packet_ttl_seconds = 3600
+outbound_packet_ttl_seconds = 86400
+packet_storage_max_bytes = 300000000
 
 [transport]
 rns_mtu = 500

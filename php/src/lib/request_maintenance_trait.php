@@ -72,6 +72,17 @@ use RuntimeException;
  *
  * batch_ttl_seconds: How long to retain batch records after they're fully
  *   processed (all packets acked/delivered). Default: 86400 (24h).
+ *
+ * inbound_packet_ttl_seconds: How long to retain parsed inbound packet
+ *   diagnostics. Default: 3600 (1h).
+ *
+ * outbound_packet_ttl_seconds: How long to retain acknowledged outbound
+ *   packet history. Default: 86400 (24h). Pending packets are never expired.
+ *
+ * packet_storage_max_bytes: Maximum combined payload storage for
+ *   inbound_packets and outbound_packets. Inbound and acknowledged outbound
+ *   history are removed oldest-first before pending outbound queue entries.
+ *   Default: 300000000 (300 MB). Set to 0 to disable.
  */
 
 trait RequestMaintenanceTrait
@@ -97,10 +108,16 @@ trait RequestMaintenanceTrait
             'orphaned_paths' => 0,
             'expired_packet_hashes' => 0,
             'expired_batches' => 0,
+            'expired_inbound_packets' => 0,
+            'expired_outbound_packets' => 0,
             'expired_path_request_tags' => 0,
             'expired_reverse_paths' => 0,
             'expired_link_transport' => 0,
             'expired_wake_events' => 0,
+            'packet_storage_bytes_before' => 0,
+            'packet_storage_bytes_after' => 0,
+            'trimmed_inbound_packets' => 0,
+            'trimmed_outbound_packets' => 0,
             'lock_acquired' => false,
             'deadlock_retries' => 0,
         ];
@@ -136,6 +153,17 @@ trait RequestMaintenanceTrait
                 $summary
             );
 
+            // Phase 2b: Orphaned local destinations for stale interfaces.
+            // A local destination is only reachable while the interface it was
+            // registered on is connected. If the row survives the interface,
+            // relayTargetsForAcceptedPacket() keeps choosing local delivery
+            // over the path entry and the traffic is black-holed — even after
+            // the destination reappears on another node.
+            $summary['orphaned_local_destinations'] = $this->deleteOrphanedLocalDestinationsForStaleInterfaces(
+                $staleCutoff,
+                $backend
+            );
+
             // Phase 3: Expire old packet hashes
             $packetHashTtl = $this->maintenanceConfigInt('packet_hash_ttl_seconds', 86400);
             $summary['expired_packet_hashes'] = $this->deleteExpiredPacketHashes(
@@ -152,7 +180,19 @@ trait RequestMaintenanceTrait
                 $summary
             );
 
-            // Phase 5: Expire path request tags
+            // Phase 5: Expire packet history. Inbound rows are diagnostics;
+            // outbound rows are removable only after delivery acknowledgement.
+            $inboundPacketTtl = $this->maintenanceConfigInt('inbound_packet_ttl_seconds', 3600);
+            $outboundPacketTtl = $this->maintenanceConfigInt('outbound_packet_ttl_seconds', 86400);
+            [$summary['expired_inbound_packets'], $summary['expired_outbound_packets']] =
+                $this->deleteExpiredPacketHistory(
+                    $now - max(0, $inboundPacketTtl),
+                    $now - max(0, $outboundPacketTtl),
+                    $backend,
+                    $summary
+                );
+
+            // Phase 6: Expire path request tags
             $pathRequestTagTtl = $this->maintenanceConfigInt('path_request_tag_ttl_seconds', 86400);
             $summary['expired_path_request_tags'] = $this->deleteExpiredPathRequestTags(
                 $now - $pathRequestTagTtl,
@@ -160,7 +200,7 @@ trait RequestMaintenanceTrait
                 $summary
             );
 
-            // Phase 6: Expire reverse path entries
+            // Phase 7: Expire reverse path entries
             $reversePathTtl = $this->maintenanceConfigInt('reverse_path_ttl_seconds', 480);
             $summary['expired_reverse_paths'] = $this->deleteExpiredReversePaths(
                 $now - $reversePathTtl,
@@ -168,7 +208,7 @@ trait RequestMaintenanceTrait
                 $summary
             );
 
-            // Phase 7: Expire link transport entries
+            // Phase 8: Expire link transport entries
             $linkTransportTtl = $this->maintenanceConfigInt('link_transport_ttl_seconds', 900);
             $summary['expired_link_transport'] = $this->deleteExpiredLinkTransportEntries(
                 $now - $linkTransportTtl,
@@ -176,13 +216,20 @@ trait RequestMaintenanceTrait
                 $summary
             );
 
-            // Phase 8: Expire old wake events
+            // Phase 9: Expire old wake events
             $wakeEventTtl = $this->maintenanceConfigInt('wake_event_ttl_seconds', 86400);
             $summary['expired_wake_events'] = $this->deleteExpiredWakeEvents(
                 $now - $wakeEventTtl,
                 $backend,
                 $summary
             );
+
+            // Phase 10: Bound combined packet payload storage.
+            $packetStorageMaxBytes = max(
+                0,
+                $this->maintenanceConfigInt('packet_storage_max_bytes', 300_000_000)
+            );
+            $this->trimPacketStorage($packetStorageMaxBytes, $backend, $summary);
         } finally {
             // Always release the advisory lock, even on failure.
             Database::releaseAdvisoryLock($this->db, $backend, $lockName);
@@ -193,6 +240,24 @@ trait RequestMaintenanceTrait
 
     // ─── Phase 1: Stale interfaces ───────────────────────────────────────
 
+    /**
+     * `updated_at` records when the row was last marked offline, so Phase 2 can
+     * apply a grace period before purging its paths. Staleness must therefore be
+     * judged on `last_seen_at`, which every exchange/register path refreshes.
+     *
+     * NEVER compare `updated_at` here. It is written by this method alone, so an
+     * actively polling interface keeps whatever value it had when it was last
+     * marked offline (or 0, the column default from the migration that added
+     * it). `updated_at < now - 15` is then permanently true and every online
+     * interface is marked offline on the very next maintenance pass, 2 seconds
+     * later. Because peekReversePath() requires BOTH the receiving and the
+     * outbound interface to be status='online', every PROOF and LRPROOF that
+     * lands in one of those gaps is silently dropped, and 15 seconds later
+     * Phase 2 deletes the live client's path_entries and local_destinations.
+     * That is the cause of the intermittent "direct proof not received in 5s",
+     * the missing LRPROOF on inbound link requests, "link closed before a
+     * response", and the path-request storms.
+     */
     private function markStaleInterfacesOffline(int $staleCutoff, string $backend): int
     {
         $table = Database::quoteTable($backend, 'interfaces');
@@ -201,7 +266,7 @@ trait RequestMaintenanceTrait
                 SET status = 'offline',
                     updated_at = :now
               WHERE status = 'online'
-                AND updated_at < :cutoff"
+                AND last_seen_at < :cutoff"
         );
         $stmt->bindValue(':now', time(), PDO::PARAM_INT);
         $stmt->bindValue(':cutoff', $staleCutoff, PDO::PARAM_INT);
@@ -263,6 +328,37 @@ trait RequestMaintenanceTrait
         return $totalDeleted;
     }
 
+    /**
+     * Delete local_destinations rows registered on stale/offline interfaces.
+     *
+     * Mirrors deleteOrphanedPathsForStaleInterfaces(): a destination announced
+     * by a browser is local only for as long as that browser's interface is
+     * online. Once the interface disappears the row must go too, otherwise
+     * relayTargetsForAcceptedPacket() keeps choosing local delivery over the
+     * path entry and black-holes traffic for a destination that has since
+     * moved to another node.
+     */
+    private function deleteOrphanedLocalDestinationsForStaleInterfaces(
+        int $staleCutoff,
+        string $backend
+    ): int {
+        $ifTable = Database::quoteTable($backend, 'interfaces');
+        $localTable = Database::quoteTable($backend, 'local_destinations');
+
+        $stmt = $this->db->prepare(
+            "DELETE FROM {$localTable}
+              WHERE interface_id IN (
+                  SELECT interface_id FROM {$ifTable}
+                   WHERE status = 'offline'
+                     AND updated_at < :cutoff
+              )"
+        );
+        $stmt->bindValue(':cutoff', $staleCutoff, PDO::PARAM_INT);
+        Database::executeWithRetry($stmt, 'deleteOrphanedLocalDestinations');
+
+        return $stmt->rowCount();
+    }
+
     // ─── Phase 3: Expired packet hashes ──────────────────────────────────
 
     private function deleteExpiredPacketHashes(
@@ -309,7 +405,68 @@ trait RequestMaintenanceTrait
         return $total;
     }
 
-    // ─── Phase 5: Expired path request tags ──────────────────────────────
+    // ─── Phase 5: Expired packet history ────────────────────────────────
+
+    private function deleteExpiredPacketHistory(
+        int $inboundCutoff,
+        int $outboundCutoff,
+        string $backend,
+        array &$summary
+    ): array {
+        // A path entry stores only the packet_hash of the announce that taught
+        // us the path, and re-reads the packet body from inbound_packets to
+        // answer a path request. Path entries live ~7 days, this history only
+        // an hour, so purging purely on age strands the path entry pointing at
+        // a row that no longer exists. processAcceptedPathRequest() then finds
+        // a known path but no announce to send, and answers nothing — for the
+        // remaining week of that entry's life. Python keeps the path table and
+        // its packet cache together and treats a missing packet as an error
+        // (Transport.py:2845), so keep the referenced rows.
+        $pathEntries = Database::quoteTable($backend, 'path_entries');
+        $inboundTable = Database::quoteTable($backend, 'inbound_packets');
+        $inboundDeleted = $this->deleteSingleBatch(
+            $inboundTable,
+            "created_at < :cutoff
+               AND NOT EXISTS (
+                   SELECT 1 FROM {$pathEntries} pe
+                    WHERE pe.packet_hash_hex = {$inboundTable}.packet_hash_hex
+               )
+             ORDER BY created_at",
+            [':cutoff' => $inboundCutoff],
+            $backend,
+        );
+
+        $outboundDeleted = $this->deleteSingleBatch(
+            Database::quoteTable($backend, 'outbound_packets'),
+            'acked_at IS NOT NULL AND acked_at < :cutoff ORDER BY acked_at',
+            [':cutoff' => $outboundCutoff],
+            $backend,
+        );
+
+        return [$inboundDeleted, $outboundDeleted];
+    }
+
+    private function deleteSingleBatch(
+        string $table,
+        string $whereClause,
+        array $params,
+        string $backend
+    ): int {
+        $limitClause = $backend === 'mysql' ? ' LIMIT 1000' : '';
+        if ($backend === 'sqlite') {
+            $whereClause = preg_replace('/\s+ORDER\s+BY\s+\S+(\s+(ASC|DESC))?\s*$/i', '', $whereClause);
+        }
+
+        $stmt = $this->db->prepare("DELETE FROM {$table} WHERE {$whereClause}{$limitClause}");
+        foreach ($params as $name => $value) {
+            $stmt->bindValue($name, $value, is_int($value) ? PDO::PARAM_INT : PDO::PARAM_STR);
+        }
+        Database::executeWithRetry($stmt, 'deleteSingleBatch:' . $table);
+
+        return $stmt->rowCount();
+    }
+
+    // ─── Phase 6: Expired path request tags ──────────────────────────────
 
     private function deleteExpiredPathRequestTags(
         int $cutoff,
@@ -317,16 +474,29 @@ trait RequestMaintenanceTrait
         array &$summary
     ): int {
         $table = Database::quoteTable($backend, 'path_request_tags');
-        return $this->deleteBatched(
+        $deleted = $this->deleteBatched(
             $table,
             'created_at < :cutoff ORDER BY created_at',
             [':cutoff' => $cutoff],
             $backend,
             $summary
         );
+
+        // The throttle rows only need to outlive their own interval, so the
+        // tag cutoff is comfortably conservative.
+        $throttleTable = Database::quoteTable($backend, 'path_request_throttle');
+        $deleted += $this->deleteBatched(
+            $throttleTable,
+            'last_requested_at < :cutoff ORDER BY last_requested_at',
+            [':cutoff' => $cutoff],
+            $backend,
+            $summary
+        );
+
+        return $deleted;
     }
 
-    // ─── Phase 6: Expired reverse paths ──────────────────────────────────
+    // ─── Phase 7: Expired reverse paths ──────────────────────────────────
 
     private function deleteExpiredReversePaths(
         int $cutoff,
@@ -343,7 +513,7 @@ trait RequestMaintenanceTrait
         );
     }
 
-    // ─── Phase 7: Expired link transport entries ─────────────────────────
+    // ─── Phase 8: Expired link transport entries ─────────────────────────
 
     private function deleteExpiredLinkTransportEntries(
         int $cutoff,
@@ -360,7 +530,7 @@ trait RequestMaintenanceTrait
         );
     }
 
-    // ─── Phase 8: Expired wake events ────────────────────────────────────
+    // ─── Phase 9: Expired wake events ────────────────────────────────────
 
     private function deleteExpiredWakeEvents(
         int $cutoff,
@@ -375,6 +545,103 @@ trait RequestMaintenanceTrait
             $backend,
             $summary
         );
+    }
+
+    // ─── Phase 10: Packet storage cap ────────────────────────────────────
+
+    private function trimPacketStorage(int $maxBytes, string $backend, array &$summary): void
+    {
+        $inboundTable = Database::quoteTable($backend, 'inbound_packets');
+        $outboundTable = Database::quoteTable($backend, 'outbound_packets');
+        $inboundBytes = "COALESCE(LENGTH(raw_base64), 0) + COALESCE(LENGTH(payload_base64), 0)";
+        $outboundBytes = "COALESCE(LENGTH(packet_base64), 0)";
+
+        $totalSql = "SELECT
+            (SELECT COALESCE(SUM({$inboundBytes}), 0) FROM {$inboundTable}) +
+            (SELECT COALESCE(SUM({$outboundBytes}), 0) FROM {$outboundTable})";
+        $totalBytes = (int) $this->db->query($totalSql)->fetchColumn();
+        $summary['packet_storage_bytes_before'] = $totalBytes;
+        $summary['packet_storage_bytes_after'] = $totalBytes;
+
+        if ($maxBytes === 0 || $totalBytes <= $maxBytes) {
+            return;
+        }
+
+        $candidateBatchSize = 500;
+
+        while ($totalBytes > $maxBytes) {
+            $candidateSql = "SELECT packet_table, packet_id, stored_bytes
+                FROM (
+                    SELECT 'inbound' AS packet_table,
+                           packet_record_id AS packet_id,
+                           created_at AS stored_at,
+                           0 AS prune_priority,
+                           {$inboundBytes} AS stored_bytes
+                      FROM {$inboundTable}
+                    UNION ALL
+                    SELECT 'outbound' AS packet_table,
+                           packet_id,
+                           queued_at AS stored_at,
+                           CASE WHEN acked_at IS NULL THEN 1 ELSE 0 END AS prune_priority,
+                           {$outboundBytes} AS stored_bytes
+                      FROM {$outboundTable}
+                ) AS packet_storage
+                ORDER BY prune_priority ASC, stored_at ASC, packet_table ASC, packet_id ASC
+                LIMIT {$candidateBatchSize}";
+            $candidates = $this->db->query($candidateSql)->fetchAll(PDO::FETCH_ASSOC);
+            if ($candidates === []) {
+                break;
+            }
+
+            $inboundIds = [];
+            $outboundIds = [];
+            $selectedBytes = 0;
+            foreach ($candidates as $candidate) {
+                $packetId = (int) ($candidate['packet_id'] ?? 0);
+                if ($packetId <= 0) {
+                    continue;
+                }
+
+                if (($candidate['packet_table'] ?? '') === 'inbound') {
+                    $inboundIds[] = $packetId;
+                } else {
+                    $outboundIds[] = $packetId;
+                }
+                $selectedBytes += (int) ($candidate['stored_bytes'] ?? 0);
+
+                if ($selectedBytes >= $totalBytes - $maxBytes) {
+                    break;
+                }
+            }
+
+            $inboundDeleted = $this->deletePacketRowsByIds($inboundTable, 'packet_record_id', $inboundIds);
+            $outboundDeleted = $this->deletePacketRowsByIds($outboundTable, 'packet_id', $outboundIds);
+            $summary['trimmed_inbound_packets'] += $inboundDeleted;
+            $summary['trimmed_outbound_packets'] += $outboundDeleted;
+
+            if ($inboundDeleted + $outboundDeleted === 0) {
+                break;
+            }
+
+            $totalBytes = (int) $this->db->query($totalSql)->fetchColumn();
+            $summary['packet_storage_bytes_after'] = $totalBytes;
+        }
+    }
+
+    private function deletePacketRowsByIds(string $table, string $idColumn, array $ids): int
+    {
+        if ($ids === []) {
+            return 0;
+        }
+
+        $placeholders = implode(',', array_fill(0, count($ids), '?'));
+        $stmt = $this->db->prepare("DELETE FROM {$table} WHERE {$idColumn} IN ({$placeholders})");
+        foreach ($ids as $index => $id) {
+            $stmt->bindValue($index + 1, $id, PDO::PARAM_INT);
+        }
+        Database::executeWithRetry($stmt, 'trimPacketStorage:' . $table);
+
+        return $stmt->rowCount();
     }
 
     // ─── Batched DELETE helper ───────────────────────────────────────────

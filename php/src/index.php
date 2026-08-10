@@ -133,6 +133,9 @@ final class Config
                 'path_request_tag_ttl_seconds' => 86400,
                 'reverse_path_ttl_seconds' => 480,
                 'link_transport_ttl_seconds' => 900,
+                'inbound_packet_ttl_seconds' => 3600,
+                'outbound_packet_ttl_seconds' => 86400,
+                'packet_storage_max_bytes' => 300000000,
             ],
             'transport' => [
                 'rns_mtu' => 500,
@@ -1035,6 +1038,9 @@ final class IfacCodec
 
 final class AnnounceValidator
 {
+    /** Clock-skew allowance for an announce's self-reported emission time. */
+    private const ANNOUNCE_EMITTED_SKEW_SECONDS = 86_400;
+
     private const KEY_SIZE = 64;
     private const NAME_HASH_LEN = 10;
     private const RANDOM_HASH_LEN = 10;
@@ -1121,7 +1127,17 @@ final class AnnounceValidator
     private static function announceEmitted(string $randomHash): int
     {
         $timestampBytes = substr($randomHash, 5, 5);
-        return unpack('J', "\x00\x00\x00" . $timestampBytes)[1];
+        $emitted = unpack('J', "\x00\x00\x00" . $timestampBytes)[1];
+
+        // The emission time is attacker- and bug-controlled input from the
+        // network. It is only ever used to decide whether an announce is
+        // fresher than what we already hold, so a value in the future would
+        // pin the comparison baseline forever and make the destination
+        // permanently unrefreshable. Treat anything beyond a small clock-skew
+        // allowance as unusable rather than authoritative.
+        $ceiling = time() + self::ANNOUNCE_EMITTED_SKEW_SECONDS;
+
+        return $emitted > $ceiling ? 0 : $emitted;
     }
 }
 
@@ -1131,6 +1147,13 @@ final class TransportConstants
     public const PATH_REQUEST_ASPECT_1 = 'path';
     public const PATH_REQUEST_ASPECT_2 = 'request';
     public const DEFAULT_PER_HOP_TIMEOUT_SECONDS = 6;
+
+    // Transport.py:81 — minimum interval between automated path requests.
+    public const PATH_REQUEST_MI = 20;
+
+    // Transport.py:78 — how long a discovery path request stays pending, i.e.
+    // how long Transport.discovery_path_requests suppresses a repeat search.
+    public const PATH_REQUEST_TIMEOUT = 15;
 }
 
 final class WakeConfig

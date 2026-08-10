@@ -100,6 +100,17 @@ trait RequestControlPlaneTrait
         }
 
         $path = $this->usablePathEntry($destinationHashHex);
+        if ($path !== null) {
+            $announceRaw = $this->announceRawByPacketHash((string) $path['packet_hash_hex']);
+            if ($announceRaw === null) {
+                // Known path, but the announce it cached has been purged, so
+                // there is nothing to answer with. Treat it as no path at all
+                // and let the discovery branches below ask the network, rather
+                // than silently answering nothing until the entry expires.
+                $path = null;
+            }
+        }
+
         if ($path === null) {
             // Python Transport.path_request() gateway procedure
             // (Transport.py lines 2910-2940):
@@ -128,6 +139,17 @@ trait RequestControlPlaneTrait
             }
 
             // Case 2: transit → forward to local clients only
+            //
+            // Python reaches its equivalent branch only after the
+            // should_search_for_unknown gate (Transport.py:2913-2918), which
+            // refuses to start a second search while one is already pending for
+            // the destination. Without that gate every retry — each carrying a
+            // fresh random tag, so tag dedup never fires — re-floods every
+            // local client.
+            if (!$this->claimPathRequestSlot('discovery:' . $destinationHashHex, TransportConstants::PATH_REQUEST_TIMEOUT)) {
+                return ['ignored', 'path_request_already_pending', 0];
+            }
+
             $localClientIds = $this->onlineLocalClientInterfaceIds($interfaceId);
             if ($localClientIds !== []) {
                 $relayPacketBase64 = $this->relayPacketBase64($rawBase64, $packet);
@@ -147,11 +169,6 @@ trait RequestControlPlaneTrait
         $nextHopHex = (string) $path['next_hop_hex'];
         if ($requestorTransportHex !== null && hash_equals($requestorTransportHex, $nextHopHex)) {
             return ['ignored', 'requestor_is_next_hop', 0];
-        }
-
-        $announceRaw = $this->announceRawByPacketHash((string) $path['packet_hash_hex']);
-        if ($announceRaw === null) {
-            return ['ignored', 'cached_announce_not_found', 0];
         }
 
         $responseRaw = $this->buildPathResponsePacket(
@@ -305,7 +322,7 @@ trait RequestControlPlaneTrait
             }
         }
 
-        $stmt = $this->db->prepare($this->insertOrSql(
+        $stmt = $this->db->prepare(Database::insertOrSql($this->backend,
             'INSERT OR IGNORE INTO local_destinations (destination_hash_hex, interface_id, registered_at)
              VALUES (:dest, :iface, :ts)'
         ));
@@ -327,24 +344,32 @@ trait RequestControlPlaneTrait
 
     private function localDestinationInterface(string $destinationHashHex): ?string
     {
+        // A local destination is only deliverable while the interface it was
+        // registered on is still reachable. Stale rows outlive the browser
+        // that registered them, and local delivery is decided before the path
+        // table is consulted — so an unfiltered lookup black-holes traffic for
+        // a destination that has since moved to another node.
         $stmt = $this->db->prepare(
-            'SELECT interface_id FROM local_destinations WHERE destination_hash_hex = :dest LIMIT 1'
+            "SELECT ld.interface_id
+               FROM local_destinations ld
+               INNER JOIN interfaces i ON i.interface_id = ld.interface_id
+              WHERE ld.destination_hash_hex = :dest
+                AND (i.status = 'online'
+                     OR (i.peer_url IS NOT NULL AND i.peer_interface_id IS NOT NULL))
+              ORDER BY ld.registered_at DESC
+              LIMIT 1"
         );
         $stmt->bindValue(':dest', $destinationHashHex, PDO::PARAM_STR);
-        $row = $stmt->execute(); $row = $stmt->fetch(PDO::FETCH_ASSOC);
+        $stmt->execute();
+        $row = $stmt->fetch(PDO::FETCH_ASSOC);
 
         if (!is_array($row)) {
             return null;
         }
 
         $ifaceId = (string) ($row['interface_id'] ?? '');
-        // Verify the interface still exists
-        $metadata = $this->interfaceMetadata($ifaceId);
-        if ($metadata === []) {
-            return null;
-        }
 
-        return $ifaceId;
+        return $ifaceId === '' ? null : $ifaceId;
     }
 
     private function relayTargetsForAcceptedPacket(string $sourceInterfaceId, array $packet): array
@@ -440,6 +465,18 @@ trait RequestControlPlaneTrait
             if (!$currentUsable) {
                 $shouldAdd = true;
                 $reason = 'unusable_path_replaced';
+            } elseif ($hops < $existingHops) {
+                // A strictly-shorter path is always better routing information.
+                // The blob-seen replay guard must NOT block a hop improvement:
+                // the same announce (same random blob) often arrives via both a
+                // short direct peer and a longer transit route.  Whichever is
+                // recorded first claims the blob; without this branch the longer
+                // path can win and the relay gets stuck routing via a worse
+                // next-hop (observed: retichat.com kept a 6-hop gateway path to
+                // a selectiv-local destination instead of the 2-hop direct peer,
+                // dropping direct retichat→selectiv messages at the gateway).
+                $shouldAdd = true;
+                $reason = 'shorter_path_replaced';
             } elseif ($hops <= $existingHops) {
                 // Use >= so a re-announce emitted at the same tick (or with
                 // minor clock skew on the announcer) still refreshes the path

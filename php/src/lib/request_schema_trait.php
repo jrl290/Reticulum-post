@@ -33,6 +33,7 @@ trait RequestSchemaTrait
 
         $this->ensureTables($summary);
         $this->ensureColumns($summary);
+        $this->ensurePrimaryKeys($summary);
         $this->ensureIndexes($summary);
 
         return $summary;
@@ -155,6 +156,16 @@ trait RequestSchemaTrait
                     PRIMARY KEY (tag_key_hex)
                 ){$engine}",
 
+            // Persistent stand-in for Transport.path_requests and
+            // Transport.discovery_path_requests, which are in-memory dicts in
+            // the Python daemon but must survive between requests here.
+            'path_request_throttle' => "
+                CREATE TABLE IF NOT EXISTS path_request_throttle (
+                    throttle_key VARCHAR(96) NOT NULL,
+                    last_requested_at INT NOT NULL DEFAULT 0,
+                    PRIMARY KEY (throttle_key)
+                ){$engine}",
+
             'reverse_path_entries' => "
                 CREATE TABLE IF NOT EXISTS reverse_path_entries (
                     truncated_hash_hex VARCHAR(32) NOT NULL,
@@ -176,7 +187,7 @@ trait RequestSchemaTrait
                     validated TINYINT NOT NULL DEFAULT 0,
                     proof_expires_at INT DEFAULT NULL,
                     updated_at INT NOT NULL DEFAULT 0,
-                    PRIMARY KEY (link_id_hex, outbound_interface_id)
+                    PRIMARY KEY (link_id_hex, outbound_interface_id, remaining_hops)
                 ){$engine}",
 
             'path_entries' => "
@@ -324,6 +335,45 @@ trait RequestSchemaTrait
         }
     }
 
+    /**
+     * A destination reachable over several concurrent paths delivers the same
+     * LINKREQUEST at different hop counts. Keyed only by (link, interface) the
+     * variants collapse and the last writer wins, so the LRPROOF returning on
+     * any other fork fails the exact-hop check and is dropped. Keying by hop
+     * count keeps each variant addressable while preserving exact matching.
+     */
+    private function ensurePrimaryKeys(array &$summary): void
+    {
+        if ($this->backend !== 'mysql') {
+            return; // SQLite builds the table with the current key already.
+        }
+
+        try {
+            $stmt = $this->db->query(
+                "SELECT COUNT(*) FROM information_schema.STATISTICS
+                  WHERE TABLE_SCHEMA = DATABASE()
+                    AND TABLE_NAME = 'link_transport_entries'
+                    AND INDEX_NAME = 'PRIMARY'
+                    AND COLUMN_NAME = 'remaining_hops'"
+            );
+            if ($stmt === false || (int) $stmt->fetchColumn() > 0) {
+                return;
+            }
+
+            $this->db->exec(
+                'ALTER TABLE `link_transport_entries`
+                   DROP PRIMARY KEY,
+                   ADD PRIMARY KEY (link_id_hex, outbound_interface_id, remaining_hops)'
+            );
+            $summary['indexes_added']++;
+        } catch (PDOException $e) {
+            $code = (int) ($e->errorInfo[1] ?? 0);
+            if ($code !== 1146) {
+                $summary['errors'][] = 'primary_key link_transport_entries: ' . $e->getMessage();
+            }
+        }
+    }
+
     private function ensureIndexes(array &$summary): void
     {
         $indexes = [
@@ -331,8 +381,13 @@ trait RequestSchemaTrait
             'CREATE INDEX idx_packet_hashes_seen ON packet_hashes (first_seen_at)',
             'CREATE INDEX idx_inbound_batches_created ON inbound_batches (created_at)',
             'CREATE INDEX idx_inbound_batches_unprocessed ON inbound_batches (processed_at)',
+            'CREATE INDEX idx_inbound_packets_created ON inbound_packets (created_at)',
             'CREATE INDEX idx_outbound_batches_created ON outbound_batches (created_at)',
             'CREATE INDEX idx_path_request_tags_created ON path_request_tags (created_at)',
+            'CREATE INDEX idx_path_request_throttle_at ON path_request_throttle (last_requested_at)',
+            // Lets the Phase 5 purge check "is this packet still a path
+            // entry's cached announce?" without scanning path_entries per row.
+            'CREATE INDEX idx_path_entries_packet_hash ON path_entries (packet_hash_hex)',
             'CREATE INDEX idx_reverse_path_created ON reverse_path_entries (created_at)',
             'CREATE INDEX idx_link_transport_updated ON link_transport_entries (updated_at)',
             'CREATE INDEX idx_wake_events_created ON wake_events (created_at)',

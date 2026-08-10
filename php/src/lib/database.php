@@ -247,7 +247,7 @@ final class Database
         $stmt->execute();
         $row = $stmt->fetch(PDO::FETCH_ASSOC);
 
-        return ($row['acquired'] ?? 0) === 1;
+        return (int) ($row['acquired'] ?? 0) === 1;
     }
 
     /**
@@ -266,7 +266,7 @@ final class Database
         $stmt->execute();
         $row = $stmt->fetch(PDO::FETCH_ASSOC);
 
-        return ($row['released'] ?? 0) === 1;
+        return (int) ($row['released'] ?? 0) === 1;
     }
 
     /**

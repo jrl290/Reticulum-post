@@ -194,7 +194,7 @@ trait RequestRelayRoutingTrait
                 :proof_expires_at,
                 :updated_at
             )
-            ON CONFLICT(link_id_hex, outbound_interface_id) DO UPDATE SET
+            ON CONFLICT(link_id_hex, outbound_interface_id, remaining_hops) DO UPDATE SET
                 received_interface_id = excluded.received_interface_id,
                 next_hop_hex = excluded.next_hop_hex,
                 remaining_hops = excluded.remaining_hops,
@@ -217,16 +217,20 @@ trait RequestRelayRoutingTrait
         $stmt->execute();
     }
 
-    private function linkTransportEntryForOutbound(string $linkIdHex, string $outboundInterfaceId): ?array
-    {
+    private function linkTransportEntryForOutbound(
+        string $linkIdHex,
+        string $outboundInterfaceId,
+        ?int $remainingHops = null
+    ): ?array {
         $now = time();
+        $hopClause = $remainingHops === null ? '' : ' AND lte.remaining_hops = :remaining_hops';
         $stmt = $this->db->prepare(
                         "SELECT lte.*
                          FROM link_transport_entries AS lte
                          JOIN interfaces AS received_if ON received_if.interface_id = lte.received_interface_id
                          JOIN interfaces AS outbound_if ON outbound_if.interface_id = lte.outbound_interface_id
                          WHERE lte.link_id_hex = :link_id_hex
-                             AND lte.outbound_interface_id = :outbound_interface_id
+                             AND lte.outbound_interface_id = :outbound_interface_id{$hopClause}
                              AND lte.validated = 0
                              AND received_if.status = 'online'
                              AND outbound_if.status = 'online'
@@ -237,6 +241,9 @@ trait RequestRelayRoutingTrait
         );
         $stmt->bindValue(':link_id_hex', $linkIdHex, PDO::PARAM_STR);
         $stmt->bindValue(':outbound_interface_id', $outboundInterfaceId, PDO::PARAM_STR);
+        if ($remainingHops !== null) {
+            $stmt->bindValue(':remaining_hops', $remainingHops, PDO::PARAM_INT);
+        }
         $stmt->bindValue(':now', $now, PDO::PARAM_INT);
         $stmt->bindValue(':active_after', $this->validatedLinkTransportActiveAfter($now), PDO::PARAM_INT);
         $stmt->execute(); $row = $stmt->fetch(PDO::FETCH_ASSOC);
@@ -303,8 +310,12 @@ trait RequestRelayRoutingTrait
         return $row !== false;
     }
 
-    private function touchLinkTransportEntry(string $linkIdHex, string $outboundInterfaceId, ?bool $validated = null): void
-    {
+    private function touchLinkTransportEntry(
+        string $linkIdHex,
+        string $outboundInterfaceId,
+        ?bool $validated = null,
+        ?int $remainingHops = null
+    ): void {
         $query = 'UPDATE link_transport_entries SET updated_at = :updated_at';
         if ($validated !== null) {
             $query .= ', validated = :validated';
@@ -313,6 +324,9 @@ trait RequestRelayRoutingTrait
             }
         }
         $query .= ' WHERE link_id_hex = :link_id_hex AND outbound_interface_id = :outbound_interface_id';
+        if ($remainingHops !== null) {
+            $query .= ' AND remaining_hops = :remaining_hops';
+        }
 
         $stmt = $this->db->prepare($query);
         $stmt->bindValue(':updated_at', time(), PDO::PARAM_INT);
@@ -321,6 +335,9 @@ trait RequestRelayRoutingTrait
         }
         $stmt->bindValue(':link_id_hex', $linkIdHex, PDO::PARAM_STR);
         $stmt->bindValue(':outbound_interface_id', $outboundInterfaceId, PDO::PARAM_STR);
+        if ($remainingHops !== null) {
+            $stmt->bindValue(':remaining_hops', $remainingHops, PDO::PARAM_INT);
+        }
         $stmt->execute();
     }
 
@@ -490,6 +507,12 @@ trait RequestRelayRoutingTrait
             return;
         }
 
+        // Transport.py:488-494 throttles automated path requests for the same
+        // destination to one per PATH_REQUEST_MI.
+        if (!$this->claimPathRequestSlot('auto:' . $destinationHashHex, TransportConstants::PATH_REQUEST_MI)) {
+            return;
+        }
+
         $destinationHash = hex2bin($destinationHashHex);
         $controlHash = hex2bin($this->pathRequestControlHashHex());
         if (!is_string($destinationHash) || strlen($destinationHash) !== 16) {
@@ -620,7 +643,10 @@ trait RequestRelayRoutingTrait
             return 0;
         }
 
-        $linkEntry = $this->linkTransportEntryForOutbound($linkIdHex, $sourceInterfaceId);
+        $observedHops = $this->transportObservedHops($packet);
+        // Select the fork the proof actually came back on. Each hop-count
+        // variant is stored separately, so this still matches exactly.
+        $linkEntry = $this->linkTransportEntryForOutbound($linkIdHex, $sourceInterfaceId, $observedHops);
         if ($linkEntry === null) {
             // Fallback: try reverse-path routing. Some RNS implementations
             // use a different link ID in the proof than what was stored.
@@ -636,7 +662,6 @@ trait RequestRelayRoutingTrait
                     $receivedIface = (string)($reversePath['received_interface_id'] ?? '');
                     $outboundIface = (string)($reversePath['outbound_interface_id'] ?? '');
                     if ($receivedIface !== '' && $outboundIface !== '') {
-                        $observedHops = $this->transportObservedHops($packet);
                         $this->rememberLinkTransportEntry(
                             $linkIdHex,
                             $receivedIface,
@@ -646,7 +671,7 @@ trait RequestRelayRoutingTrait
                             $observedHops,
                             $linkIdHex
                         );
-                        $this->touchLinkTransportEntry($linkIdHex, $outboundIface, true);
+                        $this->touchLinkTransportEntry($linkIdHex, $outboundIface, true, $observedHops);
                     }
                 }
             }
@@ -660,7 +685,6 @@ trait RequestRelayRoutingTrait
         //   if packet.hops != remaining_hops { ... return; }
         // See HOPS.md §5 Bugs #1, #2.
         $expectedHops = (int) ($linkEntry['remaining_hops'] ?? -1);
-        $observedHops = $this->transportObservedHops($packet);
         if ($expectedHops >= 0 && $observedHops !== $expectedHops) {
             error_log("[LRPROOF-DROP] linkId=" . substr($linkIdHex,0,12)
                 . " hop_mismatch: observed=$observedHops expected=$expectedHops");
@@ -674,7 +698,7 @@ trait RequestRelayRoutingTrait
 
         $relayPacketBase64 = $this->proofRelayPacketBase64($rawBase64, $packet);
         $this->queueOutboundPacket((string) $linkEntry['received_interface_id'], $relayPacketBase64, 'lrproof_relay', $sourceInterfaceId);
-        $this->touchLinkTransportEntry($linkIdHex, $sourceInterfaceId, true);
+        $this->touchLinkTransportEntry($linkIdHex, $sourceInterfaceId, true, $observedHops);
 
         return 1;
     }

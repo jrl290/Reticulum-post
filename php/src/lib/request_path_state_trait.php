@@ -110,6 +110,51 @@ trait RequestPathStateTrait
         return $stmt->rowCount() > 0;
     }
 
+    /**
+     * Per-destination rate limit for path requests, returning true if the
+     * caller may emit one now.
+     *
+     * The Python daemon holds this state in memory: Transport.path_requests
+     * throttles automated requests to one per PATH_REQUEST_MI (Transport.py:81,
+     * :490), and Transport.discovery_path_requests suppresses a repeat search
+     * for a destination that already has one pending, for PATH_REQUEST_TIMEOUT
+     * (Transport.py:2915-2918). This node is request-operated and keeps no
+     * process memory between requests, so the same state lives in a table.
+     *
+     * Without it, tag deduplication is the only guard, and every retry carries
+     * a fresh random tag (Transport.py:2669), so a destination with no path is
+     * re-flooded to every local client on every single retry.
+     */
+    private function claimPathRequestSlot(string $throttleKey, int $minIntervalSeconds): bool
+    {
+        $now = time();
+
+        $update = $this->db->prepare(
+            'UPDATE path_request_throttle
+                SET last_requested_at = :now
+              WHERE throttle_key = :throttle_key
+                AND last_requested_at <= :cutoff'
+        );
+        $update->bindValue(':now', $now, PDO::PARAM_INT);
+        $update->bindValue(':throttle_key', $throttleKey, PDO::PARAM_STR);
+        $update->bindValue(':cutoff', $now - $minIntervalSeconds, PDO::PARAM_INT);
+        $update->execute();
+
+        if ($update->rowCount() > 0) {
+            return true;
+        }
+
+        $insert = $this->db->prepare(Database::insertOrSql($this->backend,
+            'INSERT OR IGNORE INTO path_request_throttle (throttle_key, last_requested_at)
+             VALUES (:throttle_key, :now)'
+        ));
+        $insert->bindValue(':throttle_key', $throttleKey, PDO::PARAM_STR);
+        $insert->bindValue(':now', $now, PDO::PARAM_INT);
+        $insert->execute();
+
+        return $insert->rowCount() > 0;
+    }
+
     private function pathRequestControlHashHex(): string
     {
         $expanded = TransportConstants::APP_NAME
@@ -195,6 +240,11 @@ trait RequestPathStateTrait
 
     private function randomBlobTimebase(array $randomBlobs): int
     {
+        // Ignore emission times beyond a small clock-skew allowance: a single
+        // announce carrying a far-future timestamp would otherwise raise the
+        // baseline permanently and make every subsequent announce for this
+        // destination look stale.
+        $ceiling = time() + 86_400;
         $max = 0;
         foreach ($randomBlobs as $blobHex) {
             if (!is_string($blobHex)) {
@@ -206,7 +256,12 @@ trait RequestPathStateTrait
                 continue;
             }
 
-            $max = max($max, unpack('J', "\x00\x00\x00" . substr($blob, 5, 5))[1]);
+            $emitted = unpack('J', "\x00\x00\x00" . substr($blob, 5, 5))[1];
+            if ($emitted > $ceiling) {
+                continue;
+            }
+
+            $max = max($max, $emitted);
         }
 
         return $max;
