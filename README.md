@@ -38,7 +38,14 @@ The HTTP exchange router daemon. Accepts POST requests from both browser clients
 - **Storage**: SQLite (`var/reticulum.db`) — interface registry, packet queues, path cache
 
 ### Client: Browser JS
-The browser-side RNS protocol stack used by [Retichat Web](https://github.com/jrl290/Retichat-js). Pure ES modules loaded via import maps — no npm, no build step. Implements identities, destinations, links, announces, LXMF messaging, and the HTTP exchange transport client. Lives in `js/`.
+The browser-side RNS protocol stack lives in [Retichat-js](https://github.com/jrl290/Retichat-js) (`lib/rns/`) — pure ES modules loaded via import maps, no npm, no build step. It implements identities, destinations, links, resources, announces, LXMF messaging, and the HTTP exchange transport client (`lib/rns/interfaces/post_interface.js`), and it is the only maintained copy.
+
+> A snapshot of that stack used to live in this repo under `js/`. It was removed
+> on 2026-08-17: it had drifted six weeks behind (no `resource.js`, no link
+> watchdog, pre-rework timeouts) while this README presented it as current —
+> which made it a trap for exactly the kind of silent regression this project
+> works hard to prevent. If you need the history, it is in git before this
+> commit.
 
 ### Bridge: Python (`python/`)
 A `PostInterface` extension for Python RNS nodes. Drop into `~/.reticulum/interfaces/` to connect a standard Python `rnsd` to a Reticulum-post router over HTTP. The Python node registers as an interface and exchanges packets via the same HTTP API as browser clients.
