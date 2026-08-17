@@ -79,10 +79,18 @@ use RuntimeException;
  * outbound_packet_ttl_seconds: How long to retain acknowledged outbound
  *   packet history. Default: 86400 (24h). Pending packets are never expired.
  *
- * packet_storage_max_bytes: Maximum combined payload storage for
- *   inbound_packets and outbound_packets. Inbound and acknowledged outbound
- *   history are removed oldest-first before pending outbound queue entries.
- *   Default: 300000000 (300 MB). Set to 0 to disable.
+ * packet_storage_max_bytes: Maximum combined *payload* storage for
+ *   inbound_packets and outbound_packets — the length of the base64 columns
+ *   only. Inbound and acknowledged outbound history are removed oldest-first
+ *   before pending outbound queue entries. Default: 300000000 (300 MB).
+ *   Set to 0 to disable.
+ *
+ *   This is a cheap first line of defence, not the storage cap. Payload length
+ *   ignores indexes, row overhead, and the batch/path/destination tables, and
+ *   on retichat.com it under-reported the real footprint by more than 7x — 143
+ *   MB of counted payload against 1053 MB of allocated tables. The cap that
+ *   actually bounds disk is storage_max_bytes, enforced in Phase 11 by
+ *   RequestStorageBudgetTrait.
  */
 
 trait RequestMaintenanceTrait
@@ -95,11 +103,16 @@ trait RequestMaintenanceTrait
      *
      * @param  int   $interfaceStaleAfterSeconds  Mark interfaces offline after this many seconds unseen
      * @param  int   $batchTtlSeconds             Delete fully-processed batches older than this
+     * @param  bool  $allowReclaim                Permit InnoDB table rebuilds in Phase 11. Only the
+     *                                            CLI passes true: rebuilding a multi-hundred-MB table
+     *                                            runs far past max_execution_time, and a request that
+     *                                            dies mid-ALTER just wastes the whole rebuild.
      * @return array Summary of operations performed
      */
     public function runMaintenance(
         int $interfaceStaleAfterSeconds = 15,
         int $batchTtlSeconds = 86400,
+        bool $allowReclaim = false,
     ): array {
         $backend = $this->backend;
         $lockName = 'reticulum_php_maintenance';
@@ -118,6 +131,11 @@ trait RequestMaintenanceTrait
             'packet_storage_bytes_after' => 0,
             'trimmed_inbound_packets' => 0,
             'trimmed_outbound_packets' => 0,
+            'storage_bytes_before' => 0,
+            'storage_bytes_estimated_after' => 0,
+            'storage_budget_bytes' => 0,
+            'storage_log_bytes_trimmed' => 0,
+            'storage_pruned' => [],
             'lock_acquired' => false,
             'deadlock_retries' => 0,
         ];
@@ -230,6 +248,9 @@ trait RequestMaintenanceTrait
                 $this->maintenanceConfigInt('packet_storage_max_bytes', 300_000_000)
             );
             $this->trimPacketStorage($packetStorageMaxBytes, $backend, $summary);
+
+            // Phase 11: Bound the total on-disk footprint.
+            $this->runStorageBudgetPhase($backend, $allowReclaim, $summary);
         } finally {
             // Always release the advisory lock, even on failure.
             Database::releaseAdvisoryLock($this->db, $backend, $lockName);

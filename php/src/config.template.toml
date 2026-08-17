@@ -25,7 +25,27 @@ reverse_path_ttl_seconds = 480
 link_transport_ttl_seconds = 900
 inbound_packet_ttl_seconds = 3600
 outbound_packet_ttl_seconds = 86400
+
+# Payload-length guard on the two packet tables. Cheap, but it counts only the
+# base64 columns — not indexes, row overhead, or the batch/path tables. Treat it
+# as a first line of defence, not as the disk cap.
 packet_storage_max_bytes = 300000000
+
+# Total disk Reticulum-php may occupy: every table it owns plus its log files.
+# This is the cap that actually bounds the hosting account. 0 disables it.
+storage_max_bytes = 300000000
+storage_log_max_bytes = 16000000
+storage_check_interval_seconds = 60
+storage_prune_max_rows_per_pass = 200000
+# Rows younger than this are never pruned by the budget, at any pressure.
+storage_prune_min_age_seconds = 300
+# Absolute ceiling on an undelivered outbound packet. TTL expiry only removes
+# acknowledged rows, so without this a peer that stops acking pins its queue.
+outbound_pending_max_age_seconds = 86400
+# Reclaiming space means rebuilding the table (InnoDB frees pages to the
+# tablespace, not to the filesystem). Only `php index.php once` does this.
+storage_reclaim_min_free_bytes = 64000000
+storage_reclaim_min_interval_seconds = 3600
 
 [transport]
 rns_mtu = 500

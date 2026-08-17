@@ -14,7 +14,21 @@ trait RequestDebugReportTrait
 {
     public function healthSummary(): array
     {
+        // Storage is reported here because the cap is silent when it works. If
+        // storage_bytes sits near storage_budget_bytes while database_free_bytes
+        // is large, the pruning is keeping up but no reclaim has run — the space
+        // is recoverable, and only `php index.php once` recovers it.
+        $footprint = $this->storageFootprint();
+
         return [
+            'storage_bytes' => $footprint['total_bytes'],
+            'storage_database_bytes' => $footprint['database_bytes'],
+            'storage_database_free_bytes' => $footprint['database_free_bytes'],
+            'storage_log_bytes' => $footprint['log_bytes'],
+            'storage_budget_bytes' => (int) (
+                ($this->config['maintenance'] ?? $this->config['worker'] ?? [])['storage_max_bytes']
+                ?? 300000000
+            ),
             'interfaces' => $this->countByQuery('SELECT COUNT(*) FROM interfaces'),
             'interfaces_online' => $this->countByQuery("SELECT COUNT(*) FROM interfaces WHERE status = 'online'"),
             'inbound_batches' => $this->countByQuery('SELECT COUNT(*) FROM inbound_batches'),

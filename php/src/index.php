@@ -23,6 +23,7 @@ require_once __DIR__ . '/lib/request_packet_ingest_trait.php';
 require_once __DIR__ . '/lib/request_path_state_trait.php';
 require_once __DIR__ . '/lib/request_relay_routing_trait.php';
 require_once __DIR__ . '/lib/request_schema_trait.php';
+require_once __DIR__ . '/lib/request_storage_budget_trait.php';
 require_once __DIR__ . '/lib/request_wake_dispatch_trait.php';
 require_once __DIR__ . '/lib/request_php_wake_trait.php';
 
@@ -136,6 +137,16 @@ final class Config
                 'inbound_packet_ttl_seconds' => 3600,
                 'outbound_packet_ttl_seconds' => 86400,
                 'packet_storage_max_bytes' => 300000000,
+                // Total disk Reticulum-php may occupy: every table it owns plus
+                // its log files. See RequestStorageBudgetTrait.
+                'storage_max_bytes' => 300000000,
+                'storage_log_max_bytes' => 16000000,
+                'storage_check_interval_seconds' => 60,
+                'storage_prune_max_rows_per_pass' => 200000,
+                'storage_prune_min_age_seconds' => 300,
+                'outbound_pending_max_age_seconds' => 86400,
+                'storage_reclaim_min_free_bytes' => 64000000,
+                'storage_reclaim_min_interval_seconds' => 3600,
             ],
             'transport' => [
                 'rns_mtu' => 500,
@@ -1480,6 +1491,7 @@ final class Storage
     use RequestPathStateTrait;
     use RequestRelayRoutingTrait;
     use RequestSchemaTrait;
+    use RequestStorageBudgetTrait;
     use RequestWakeDispatchTrait;
     use RequestPhpWakeTrait;
 
@@ -2575,9 +2587,14 @@ function runIndexCli(string $projectRoot, array $argv): int
     $maintenanceConfig = $reticulumPhpConfig['maintenance'] ?? $reticulumPhpConfig['worker'] ?? [];
 
     if ($mode === 'once') {
+        // The CLI is the only caller allowed to rebuild tables. Deleting rows
+        // hands InnoDB's pages back to the tablespace free list, not to the
+        // filesystem, so without a rebuild here the account quota never falls
+        // no matter how much history is pruned. Run this from cron.
         $maintenance = $reticulumPhpStorage->runMaintenance(
             (int) ($maintenanceConfig['interface_stale_after_seconds'] ?? 15),
             (int) ($maintenanceConfig['batch_ttl_seconds'] ?? 86400),
+            true,
         );
 
         $wake = $reticulumPhpStorage->dispatchPendingWakeEvents(
@@ -2594,6 +2611,16 @@ function runIndexCli(string $projectRoot, array $argv): int
         ];
 
         fwrite(STDOUT, json_encode($summary, JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR) . PHP_EOL);
+        return 0;
+    }
+
+    if ($mode === 'reclaim') {
+        // Spawned detached by the storage budget when freed pages need to be
+        // returned to the filesystem. Rebuilding a table outlives a request, so
+        // it happens here — but it is still triggered by the node's own
+        // operation, not by a scheduler.
+        $result = $reticulumPhpStorage->reclaimStorage();
+        fwrite(STDOUT, json_encode($result, JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR) . PHP_EOL);
         return 0;
     }
 
