@@ -48,7 +48,7 @@ trait RequestInboundBatchTrait
             $stmt->bindValue(':byte_count', $byteCount, PDO::PARAM_INT);
             $stmt->bindValue(':payload_json', self::encodeJson($packets), PDO::PARAM_STR);
             $stmt->bindValue(':created_at', time(), PDO::PARAM_INT);
-            $stmt->execute();
+            Database::executeWithRetry($stmt, 'storeInboundBatch');
         } catch (\PDOException $e) {
             // Race: another request inserted the same batch between our
             // duplicate check and this insert. Treat as duplicate.
@@ -109,7 +109,7 @@ trait RequestInboundBatchTrait
         $claim->bindValue(':created_at', $now, PDO::PARAM_INT);
         $claim->bindValue(':processed_at', 0, PDO::PARAM_INT);
         try {
-            $claim->execute();
+            Database::executeWithRetry($claim, 'claimInboundBatch');
         } catch (\PDOException $e) {
             if (str_contains($e->getMessage(), 'Duplicate entry') || str_contains($e->getMessage(), 'UNIQUE constraint')) {
                 return [
@@ -520,7 +520,7 @@ trait RequestInboundBatchTrait
         $update->bindValue(':processing_summary_json', self::encodeJson($batchSummary), PDO::PARAM_STR);
         $update->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
         $update->bindValue(':batch_id', $batchId, PDO::PARAM_STR);
-        $update->execute();
+        Database::executeWithRetry($update, 'markInboundBatchProcessed');
     }
 
     private function batchByteCount(array $packets): int
@@ -548,6 +548,6 @@ trait RequestInboundBatchTrait
         $counterStmt->bindValue(':last_seen_at', time(), PDO::PARAM_INT);
         $counterStmt->bindValue(':status', 'online', PDO::PARAM_STR);
         $counterStmt->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
-        $counterStmt->execute();
+        Database::executeWithRetry($counterStmt, 'incrementInterfaceRxCounters');
     }
 }

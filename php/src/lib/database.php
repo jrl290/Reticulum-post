@@ -24,12 +24,66 @@ use RuntimeException;
  *   - Advisory locks (GET_LOCK) serialize maintenance across processes
  *   - READ COMMITTED isolation reduces gap/next-key locking
  *   - Native prepared statements avoid emulated-prepare locking quirks
+ *
+ * On the retry itself, and DESIGN_PRINCIPLES.md §3
+ * ------------------------------------------------
+ * §3 forbids application-level retries, and it is right to: a retry that
+ * "usually works the second time" is a race someone decided to live with.
+ * This is the narrow case that is not that. When InnoDB detects a deadlock it
+ * picks a victim and rolls it back *completely* — the statement had no effect,
+ * and the server's own error text is "try restarting transaction". Reissuing is
+ * not re-attempting partially-applied work in the hope of better luck; it is
+ * completing an operation the database aborted unilaterally for scheduling
+ * reasons of its own. The retry is a floor, not a fix.
+ *
+ * The actual fix remains §5: make the conflicting statements take their locks
+ * in one order. That was undiagnosable until 2026-08-17 — the node logged
+ * "Unhandled HTTP exception: ... 1213 Deadlock found" with no indication of
+ * which statement, so nobody could act on eight failures a day. Every retry now
+ * logs its label and SQL, so the conflicting pair can be named and ordered.
+ * When you have that pair, fix the order and the retry stops firing; if the
+ * retry log ever goes quiet, that is the signal the real fix landed.
  */
 
 final class Database
 {
     private const DEADLOCK_ERRORS = [1213, 1205];
     private const MAX_RETRIES = 3;
+
+    /**
+     * Log destination for deadlock diagnostics, captured in connect().
+     *
+     * RequestHttpApiHelperTrait::log() is a private instance method and this is
+     * a static class, so it cannot be reused here. The line format is kept
+     * identical so both sources interleave readably in one file.
+     */
+    private static ?string $logPath = null;
+
+    /**
+     * Record a deadlock so the conflicting statement pair can be identified.
+     *
+     * Without this, a deadlock reaches the log as an unattributed
+     * "Unhandled HTTP exception" and no one can tell which query to reorder —
+     * which is why eight failures a day went unaddressed. Warnings are written
+     * for survived retries too: those never surface as errors, so they are
+     * otherwise completely invisible while still costing a request 100-700ms.
+     */
+    private static function logDeadlock(string $message): void
+    {
+        if (self::$logPath === null || self::$logPath === '') {
+            return;
+        }
+        $line = sprintf("[%s] [%s] %s\n", date('Y-m-d H:i:s'), 'WARNING', $message);
+        @file_put_contents(self::$logPath, $line, FILE_APPEND | LOCK_EX);
+    }
+
+    /** One-line, length-capped SQL for a log entry. */
+    private static function describeSql(string $sql): string
+    {
+        $flat = trim((string) preg_replace('/\s+/', ' ', $sql));
+
+        return strlen($flat) > 160 ? substr($flat, 0, 157) . '...' : $flat;
+    }
 
     /**
      * Determine the active storage backend from config.
@@ -58,6 +112,7 @@ final class Database
     {
         $storage = $config['storage'] ?? [];
         $backend = self::backend($config);
+        self::$logPath = (string) ($storage['log_path'] ?? '') ?: null;
 
         if ($backend === 'mysql') {
             $host = $storage['mysql_host'] ?? '127.0.0.1';
@@ -163,10 +218,24 @@ final class Database
                 }
 
                 $attempt++;
+                self::logDeadlock(sprintf(
+                    'deadlock retry %d/%d [%s] sql=%s',
+                    $attempt,
+                    self::MAX_RETRIES,
+                    $label !== '' ? $label : 'unlabelled',
+                    self::describeSql($stmt->queryString)
+                ));
                 $delayUs = (100 * (1 << ($attempt - 1))) * 1000; // 100ms, 200ms, 400ms
                 usleep($delayUs);
             }
         }
+
+        self::logDeadlock(sprintf(
+            'deadlock EXHAUSTED after %d retries [%s] sql=%s',
+            self::MAX_RETRIES,
+            $label !== '' ? $label : 'unlabelled',
+            self::describeSql($stmt->queryString)
+        ));
 
         throw new RuntimeException(
             sprintf(
@@ -206,10 +275,24 @@ final class Database
                 }
 
                 $attempt++;
+                self::logDeadlock(sprintf(
+                    'deadlock retry %d/%d [%s] sql=%s',
+                    $attempt,
+                    self::MAX_RETRIES,
+                    $label !== '' ? $label : 'unlabelled',
+                    self::describeSql($sql)
+                ));
                 $delayUs = (100 * (1 << ($attempt - 1))) * 1000;
                 usleep($delayUs);
             }
         }
+
+        self::logDeadlock(sprintf(
+            'deadlock EXHAUSTED after %d retries [%s] sql=%s',
+            self::MAX_RETRIES,
+            $label !== '' ? $label : 'unlabelled',
+            self::describeSql($sql)
+        ));
 
         throw new RuntimeException(
             sprintf(

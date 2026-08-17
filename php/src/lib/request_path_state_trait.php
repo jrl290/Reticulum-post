@@ -94,7 +94,7 @@ trait RequestPathStateTrait
     {
         $stmt = $this->db->prepare('DELETE FROM path_entries WHERE destination_hash_hex = :destination_hash_hex');
         $stmt->bindValue(':destination_hash_hex', $destinationHashHex, PDO::PARAM_STR);
-        $stmt->execute();
+        Database::executeWithRetry($stmt, 'deletePathEntries');
     }
 
     private function rememberPathRequestTag(string $tagKeyHex): bool
@@ -138,7 +138,7 @@ trait RequestPathStateTrait
         $update->bindValue(':now', $now, PDO::PARAM_INT);
         $update->bindValue(':throttle_key', $throttleKey, PDO::PARAM_STR);
         $update->bindValue(':cutoff', $now - $minIntervalSeconds, PDO::PARAM_INT);
-        $update->execute();
+        Database::executeWithRetry($update, 'updatePathRequestThrottle');
 
         if ($update->rowCount() > 0) {
             return true;

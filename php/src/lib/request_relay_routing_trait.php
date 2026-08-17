@@ -214,7 +214,7 @@ trait RequestRelayRoutingTrait
         $stmt->bindValue(':destination_hash_hex', $destinationHashHex, PDO::PARAM_STR);
         $stmt->bindValue(':proof_expires_at', $proofExpiresAt, PDO::PARAM_INT);
         $stmt->bindValue(':updated_at', time(), PDO::PARAM_INT);
-        $stmt->execute();
+        Database::executeWithRetry($stmt, 'storeLinkTransportEntry');
     }
 
     private function linkTransportEntryForOutbound(
@@ -347,7 +347,7 @@ trait RequestRelayRoutingTrait
             'DELETE FROM link_transport_entries WHERE link_id_hex = :link_id_hex'
         );
         $stmt->bindValue(':link_id_hex', $linkIdHex, PDO::PARAM_STR);
-        $stmt->execute();
+        Database::executeWithRetry($stmt, 'deleteLinkTransportEntry');
     }
 
     private function rememberReversePath(string $truncatedHashHex, string $receivedInterfaceId, string $outboundInterfaceId): void
@@ -373,7 +373,7 @@ trait RequestRelayRoutingTrait
         $stmt->bindValue(':received_interface_id', $receivedInterfaceId, PDO::PARAM_STR);
         $stmt->bindValue(':outbound_interface_id', $outboundInterfaceId, PDO::PARAM_STR);
         $stmt->bindValue(':created_at', time(), PDO::PARAM_INT);
-        $stmt->execute();
+        Database::executeWithRetry($stmt, 'storeReversePathEntry');
     }
 
     private function popReversePath(string $truncatedHashHex, string $outboundInterfaceId): ?array
@@ -402,7 +402,7 @@ trait RequestRelayRoutingTrait
         );
         $delete->bindValue(':truncated_hash_hex', $truncatedHashHex, PDO::PARAM_STR);
         $delete->bindValue(':outbound_interface_id', $outboundInterfaceId, PDO::PARAM_STR);
-        $delete->execute();
+        Database::executeWithRetry($delete, 'deleteReversePathEntries');
 
         return $row;
     }

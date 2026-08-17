@@ -128,7 +128,7 @@ trait RequestOutboundBatchTrait
             $updateBatch->bindValue(':acked_at', $now, PDO::PARAM_INT);
             $updateBatch->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
             $updateBatch->bindValue(':batch_id', $batchId, PDO::PARAM_STR);
-            $updateBatch->execute();
+            Database::executeWithRetry($updateBatch, 'ackOutboundBatch');
 
             foreach ($packetIds as $packetId) {
                 $updatePacket = $this->db->prepare(
@@ -141,7 +141,7 @@ trait RequestOutboundBatchTrait
                 $updatePacket->bindValue(':delivered_at', $now, PDO::PARAM_INT);
                 $updatePacket->bindValue(':packet_id', (int) $packetId, PDO::PARAM_INT);
                 $updatePacket->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
-                $updatePacket->execute();
+                Database::executeWithRetry($updatePacket, 'ackOutboundPackets');
             }
 
             $acked++;
@@ -198,7 +198,7 @@ trait RequestOutboundBatchTrait
         $insertBatch->bindValue(':batch_id', $batchId, PDO::PARAM_STR);
         $insertBatch->bindValue(':packet_ids_json', self::encodeJson($packetIds), PDO::PARAM_STR);
         $insertBatch->bindValue(':created_at', $now, PDO::PARAM_INT);
-        $insertBatch->execute();
+        Database::executeWithRetry($insertBatch, 'storeOutboundBatch');
 
         $txBytes = 0;
         foreach ($packets as $packetBase64) {
@@ -341,7 +341,7 @@ trait RequestOutboundBatchTrait
         $stmt->bindValue(':packet_base64', $packetBase64, PDO::PARAM_STR);
         $stmt->bindValue(':packet_id', $packetId, PDO::PARAM_INT);
         $stmt->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
-        $stmt->execute();
+        Database::executeWithRetry($stmt, 'reserveOutboundPackets');
     }
 
     private function existingUnackedOutboundBatch(string $interfaceId): ?array
@@ -380,7 +380,7 @@ trait RequestOutboundBatchTrait
         );
         $stmt->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
         $stmt->bindValue(':batch_id', $batchId, PDO::PARAM_STR);
-        $stmt->execute();
+        Database::executeWithRetry($stmt, 'markOutboundPacketsAcked');
 
         $stmt2 = $this->db->prepare(
             'UPDATE outbound_batches SET acked_at = :now WHERE interface_id = :interface_id AND batch_id = :batch_id'
@@ -388,7 +388,7 @@ trait RequestOutboundBatchTrait
         $stmt2->bindValue(':now', time(), PDO::PARAM_INT);
         $stmt2->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
         $stmt2->bindValue(':batch_id', $batchId, PDO::PARAM_STR);
-        $stmt2->execute();
+        Database::executeWithRetry($stmt2, 'markOutboundBatchAcked');
     }
 
     private function outboundBatchPacketIds(string $interfaceId, string $batchId): array
@@ -457,7 +457,7 @@ trait RequestOutboundBatchTrait
             $update->bindValue(':delivered_batch_id', $batchId, PDO::PARAM_STR);
             $update->bindValue(':packet_id', $packetId, PDO::PARAM_INT);
             $update->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
-            $update->execute();
+            Database::executeWithRetry($update, 'requeueOutboundPackets');
         }
     }
 
@@ -484,7 +484,7 @@ trait RequestOutboundBatchTrait
         $updateCounters->bindValue(':last_seen_at', $now, PDO::PARAM_INT);
         $updateCounters->bindValue(':status', 'online', PDO::PARAM_STR);
         $updateCounters->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
-        $updateCounters->execute();
+        Database::executeWithRetry($updateCounters, 'incrementInterfaceTxCounters');
     }
 
     private function outboundProofCandidates(string $proofDestinationHashHex): array
@@ -560,7 +560,7 @@ trait RequestOutboundBatchTrait
         );
         $stmt->bindValue(':proofed_at', $proofedAt, PDO::PARAM_INT);
         $stmt->bindValue(':packet_id', $packetId, PDO::PARAM_INT);
-        $stmt->execute();
+        Database::executeWithRetry($stmt, 'expireOutboundPackets');
     }
 
     private function interfaceRxPackets(string $interfaceId): int
