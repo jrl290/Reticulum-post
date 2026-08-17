@@ -565,6 +565,17 @@ trait RequestStorageBudgetTrait
             ));
         }
 
+        if ($summary['storage_pruned'] !== []) {
+            // Re-measure before choosing what to rebuild. Reclaim targets are
+            // picked by free space, and the pruning above is precisely what
+            // creates it — so a footprint taken beforehand skips exactly the
+            // tables that just emptied. Observed on selectivesubconscious.com:
+            // a pass pruned 41,235 rows from inbound_packets and then rebuilt
+            // three other tables, leaving inbound_packets allocated at 422 MB
+            // with its freed pages still charged to the account.
+            $footprint = $this->storageFootprint($backend, true);
+        }
+
         $this->requestStorageReclaim($footprint, $backend, $allowReclaim, $summary);
     }
 
