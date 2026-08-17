@@ -134,6 +134,114 @@ rns.addInterface(iface);
 | **js/** | Modern browser with ES module support |
 | **python/** | Python 3.9+, RNS (`pip install rns`) |
 
+## Deploying
+
+```bash
+source deploy.env        # see deploy.env.example
+./deploy.sh              # test, deploy HEAD to both nodes, verify
+./verify-deploy.sh       # just ask: do the nodes match HEAD?
+```
+
+`deploy.sh` refuses a dirty working tree, refuses a red test suite, deploys from
+`git archive <ref>` rather than from your filesystem, syntax-checks what landed,
+and hash-verifies every file afterwards. `./deploy.sh <old-ref>` is the rollback.
+
+This exists because on 2026-08-17 the working tree held a copy of five lib files
+that was `HEAD` with the newest commit's fixes surgically removed — content in no
+commit and on no server. `scp`ing it would have silently reverted the
+`last_seen_at` staleness fix, the orphaned-local-destination cleanup and the
+path-request throttle. Three of this repo's own tests fail instantly against
+those files; nothing ran them. The lesson is not "be more careful" — the defence
+already existed. It is that **the checks have to be attached to the act of
+deploying**, and that deploying from a directory instead of a ref is what makes
+an unreviewed local edit shippable in the first place.
+
+Corollary, learned the same day: `verify-deploy.sh` found both live nodes running
+a `request_http_api_helper_trait.php` that returns exception message, file and
+line to HTTP clients, while the hardened version had been sitting committed in
+git. Drift runs in both directions — a fix that is committed but never deployed
+is just as invisible as a regression that is deployed but never committed.
+
+## Storage Budget
+
+The router caps the total disk it occupies — every table it owns plus its log
+files — at `maintenance.storage_max_bytes`, default **300 MB**. When the
+footprint exceeds the budget, maintenance prunes oldest-first through tiers,
+cheapest data before the most valuable:
+
+1. `inbound_packets` — parse diagnostics (announces a live path entry still
+   points at are exempt)
+2. `outbound_packets` where `acked_at IS NOT NULL` — delivered history
+3. `inbound_batches` / `outbound_batches` — processed envelopes
+4. `outbound_packets` where `acked_at IS NULL` — queued traffic, only past
+   `outbound_pending_max_age_seconds` (24h)
+5. `known_destinations`, then expired `path_entries`
+
+Nothing younger than `storage_prune_min_age_seconds` (300s) is ever pruned, at
+any pressure. If every tier hits its floor and the node is still over budget, it
+logs the shortfall rather than eating live traffic.
+
+### Reclaiming space — no scheduler involved
+
+**Pruning rows does not shrink the database.** With `innodb_file_per_table`, a
+DELETE returns pages to the tablespace free list, not to the filesystem — the
+`.ibd` file, and therefore the hosting account's disk usage, stays exactly where
+it was. Only a table rebuild shrinks it.
+
+A rebuild outlives a web request, so it cannot run inline. It is still the
+node's own job, not a scheduler's: when maintenance sees enough reclaimable
+space, it **spawns a detached `php index.php reclaim`** and returns immediately
+— the same mechanism already used for wake dispatch. The throttle window is
+claimed by the parent before spawning, so requests arriving during a rebuild do
+not pile up more of them.
+
+Every operation therefore polices its own storage:
+
+| Where | What runs | Cost |
+|---|---|---|
+| Every exchange | Log trim; maintenance TTL expiry | stat() + bounded DELETEs |
+| Every 60s (`storage_check_interval_seconds`) | `ANALYZE`, measure, prune tiers | one indexed pass per tier |
+| When free space ≥ 64 MB, at most hourly | Detached rebuild | out of band |
+
+`php index.php once` still does everything inline, including the rebuild, if you
+ever want to force a pass by hand. Nothing requires it on a timer.
+
+Check the current state at `/health`:
+
+```
+storage_bytes                 total footprint (database + logs)
+storage_database_free_bytes   freed pages awaiting a rebuild
+storage_budget_bytes          the configured cap
+```
+
+If `storage_database_free_bytes` stays large across several minutes, reclaim is
+not completing — check `error_log` for a spawn failure. On a host where `exec()`
+is disabled the budget records `storage_reclaim_deferred` and pruning still
+bounds row growth, but the freed pages stay charged until a rebuild runs.
+
+### Statistics must be refreshed before they are believed
+
+`information_schema.TABLES` serves cached data-dictionary statistics, and with
+`innodb_stats_on_metadata = 0` (the default since 8.0) nothing refreshes them on
+read. They can be wrong by the entire size of a table. Measured here immediately
+after an `OPTIMIZE` that really did shrink the tablespace from 1053 MB to
+16.6 MB:
+
+```
+before ANALYZE:  outbound_packets  703.9 MB   <- the pre-rebuild figure
+after  ANALYZE:  outbound_packets    0.2 MB   <- the truth
+```
+
+The budget therefore runs `ANALYZE TABLE` before every measurement it acts on.
+Skipping it would have the pruner delete every tier down to its retention floor
+to recover space that was already free.
+
+> `maintenance.packet_storage_max_bytes` is a separate, older guard that caps the
+> length of the base64 payload columns only. It ignores indexes, row overhead,
+> and the batch/path/destination tables; on a production node it under-reported
+> the real footprint by more than 7×. Keep it, but do not rely on it as the disk
+> cap.
+
 ## HTTP Exchange Protocol
 
 All three components speak the same HTTP exchange protocol:

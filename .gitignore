@@ -28,3 +28,8 @@ Thumbs.db
 *.key
 id_rsa*
 chat.history
+
+# Deploy credentials — sourced by deploy.sh / verify-deploy.sh.
+# See deploy.env.example. Never commit the real one.
+deploy.env
+.deploy.log
