@@ -251,6 +251,15 @@ trait RequestMaintenanceTrait
 
             // Phase 11: Bound the total on-disk footprint.
             $this->runStorageBudgetPhase($backend, $allowReclaim, $summary);
+
+            // Phase 12: Re-establish configured peer sessions that have died.
+            // Peering used to be a one-shot bootstrap behind GET /v1/initialize;
+            // when Phase 1/2 (correctly) reaped a dead peer interface, nothing
+            // ever re-created it, and on 2026-08-17 that left selectiv with no
+            // route to the mesh for 9 hours. Self-healing rides maintenance so
+            // it runs on ordinary request traffic — no scheduler — and is
+            // throttled through transport_state inside the call.
+            $this->ensureConfiguredPeerSessions($now, $summary);
         } finally {
             // Always release the advisory lock, even on failure.
             Database::releaseAdvisoryLock($this->db, $backend, $lockName);

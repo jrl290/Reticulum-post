@@ -298,9 +298,13 @@ trait RequestInterfaceRegistryTrait
     {
         $peerUrl = rtrim($peerUrl, '/');
 
-        // Try exact match first.
+        // Try exact match first. status/last_seen_at ride along so callers can
+        // judge whether the session is actually alive — connectToPeer treating
+        // "a row exists" as "we are connected" is what left selectiv cut off
+        // from the mesh for 9 hours on 2026-08-17.
         $stmt = $this->db->prepare(
-            'SELECT interface_id, peer_url, peer_interface_id, peer_session_token
+            'SELECT interface_id, peer_url, peer_interface_id, peer_session_token,
+                    status, last_seen_at
              FROM interfaces
              WHERE peer_url = :peer_url
              LIMIT 1'

@@ -505,17 +505,124 @@ trait RequestPhpWakeTrait
         return $summary;
     }
 
+    /**
+     * Is a peer-session interface row an actual live session?
+     *
+     * A row merely existing is NOT connectivity. On 2026-08-17 selectiv held
+     * an interfaces row for retichat.com that had been offline since 06:32;
+     * connectToPeer() saw the row, said "already_connected", and refused to
+     * re-register — while on the retichat side the stale-interface cleanup had
+     * (correctly) pruned the dead row entirely. Result: selectiv's only route
+     * to the mesh was gone for 9 hours, browsers connected to its exchange and
+     * then waited forever for announces that could not arrive ("getting stuck
+     * on links"), and the remedy was a manual GET /v1/initialize that nothing
+     * would ever have issued on its own.
+     *
+     * Pure function so the boundary is testable without a database.
+     */
+    public static function phpPeerRowIsLive(?array $row, int $now, int $staleAfterSeconds = 900): bool
+    {
+        if (!is_array($row)) {
+            return false;
+        }
+        if (($row['status'] ?? '') !== 'online') {
+            return false;
+        }
+        $lastSeen = (int) ($row['last_seen_at'] ?? 0);
+
+        return $lastSeen > 0 && ($now - $lastSeen) <= $staleAfterSeconds;
+    }
+
+    /**
+     * Re-establish configured peer sessions that have died. Called from
+     * maintenance (Phase 12), so it runs on ordinary request traffic — no
+     * scheduler, per the operations-police-themselves rule. Throttled through
+     * transport_state so concurrent requests do not stampede the peer.
+     */
+    public function ensureConfiguredPeerSessions(int $now, array &$summary): void
+    {
+        $interfaces = $this->config['interfaces'] ?? [];
+        if (!is_array($interfaces) || $interfaces === []) {
+            return;
+        }
+        $hostUrl = $this->config['host_url'] ?? ($this->config['http']['advertise_url'] ?? null);
+        if (!is_string($hostUrl) || trim($hostUrl) === '') {
+            return;
+        }
+
+        // Claim the throttle window BEFORE doing network work, so parallel
+        // requests running maintenance do not each re-register.
+        $key = 'peer_session_checked_at';
+        $minInterval = $this->maintenanceConfigInt('peer_session_check_seconds', 300);
+        $stmt = $this->db->prepare('SELECT state_value FROM transport_state WHERE state_key = :k');
+        $stmt->bindValue(':k', $key, PDO::PARAM_STR);
+        $stmt->execute();
+        $row = $stmt->fetch(PDO::FETCH_ASSOC);
+        $last = is_array($row) ? (int) $row['state_value'] : 0;
+        if (($now - $last) < $minInterval) {
+            return;
+        }
+        if (is_array($row)) {
+            $up = $this->db->prepare('UPDATE transport_state SET state_value = :v, updated_at = :t WHERE state_key = :k');
+        } else {
+            $up = $this->db->prepare('INSERT INTO transport_state (state_key, state_value, updated_at) VALUES (:k, :v, :t)');
+        }
+        $up->bindValue(':k', $key, PDO::PARAM_STR);
+        $up->bindValue(':v', (string) $now, PDO::PARAM_STR);
+        $up->bindValue(':t', $now, PDO::PARAM_INT);
+        Database::executeWithRetry($up, 'claimPeerSessionWindow');
+
+        $hostUrl = rtrim(trim($hostUrl), '/');
+        foreach ($interfaces as $ifaceName => $ifaceConfig) {
+            if (!is_array($ifaceConfig)) {
+                continue;
+            }
+            $exchangeUrl = $ifaceConfig['node_url'] ?? $ifaceConfig['peer_url'] ?? null;
+            if (!is_string($exchangeUrl) || trim($exchangeUrl) === '') {
+                continue;
+            }
+            $exchangeUrl = rtrim(trim($exchangeUrl), '/');
+            $existing = $this->phpPeerInterfaceByPeerUrl($exchangeUrl);
+            if (self::phpPeerRowIsLive($existing, $now)) {
+                continue;
+            }
+
+            $wakeUrl = $ifaceConfig['wake_url'] ?? null;
+            $wakeUrl = (is_string($wakeUrl) && trim($wakeUrl) !== '')
+                ? trim($wakeUrl)
+                : $exchangeUrl . '/v1/wake';
+
+            $result = $this->connectToPeer($exchangeUrl, $wakeUrl, $hostUrl, (string) $ifaceName);
+            $summary['peer_sessions_healed'][] = $result;
+            $this->log('warning', sprintf(
+                '[peer] session to %s was dead (%s) — re-registered: %s',
+                $exchangeUrl,
+                $existing === null ? 'no row' : 'row ' . ($existing['status'] ?? '?'),
+                $result['status'] ?? '?'
+            ));
+        }
+    }
+
     private function connectToPeer(string $exchangeUrl, string $wakeUrl, string $hostUrl, string $name): array
     {
-        // Check if already connected.
+        // Only a LIVE session counts as connected. A dead row must not block
+        // re-registration — see phpPeerRowIsLive for the outage this caused.
         $existing = $this->phpPeerInterfaceByPeerUrl($exchangeUrl);
-        if ($existing !== null) {
+        if (self::phpPeerRowIsLive($existing, time())) {
             return [
                 'peer_url' => $exchangeUrl,
                 'wake_url' => $wakeUrl,
                 'status' => 'already_connected',
                 'interface_id' => $existing['interface_id'],
             ];
+        }
+        if ($existing !== null) {
+            // Remove the corpse so the fresh registration below fully replaces
+            // it; leaving it would keep two rows claiming the same peer_url,
+            // with lookups free to return either.
+            $del = $this->db->prepare('DELETE FROM interfaces WHERE interface_id = :id');
+            $del->bindValue(':id', (string) $existing['interface_id'], PDO::PARAM_STR);
+            Database::executeWithRetry($del, 'removeDeadPeerRow');
         }
 
         // Pre-generate credentials for the peer to call us.
