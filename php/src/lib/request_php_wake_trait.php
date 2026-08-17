@@ -583,8 +583,25 @@ trait RequestPhpWakeTrait
             }
             $exchangeUrl = rtrim(trim($exchangeUrl), '/');
             $existing = $this->phpPeerInterfaceByPeerUrl($exchangeUrl);
-            if (self::phpPeerRowIsLive($existing, $now)) {
-                continue;
+
+            // Heal on: no row at all, or a row that has been offline for a
+            // long time. NOT on merely-offline: wake-based peers are
+            // legitimately offline whenever no traffic has flowed for 15s
+            // (Phase 1's browser-grade staleness), and healing that state
+            // would re-register an idle-but-healthy peer every throttle
+            // window all night — churning session credentials that in-flight
+            // exchanges may still be using. An idle peer costs nothing;
+            // a dead one (wakes rejected because the far side lost the
+            // session) looks identical for the first hour and is healed at
+            // the hour mark. The 2026-08-17 outage shapes were "no row"
+            // (heals immediately) and "offline for 9 hours" (heals at +1h).
+            if ($existing !== null) {
+                $lastSeen = (int) ($existing['last_seen_at'] ?? 0);
+                $healAfter = $this->maintenanceConfigInt('peer_session_heal_after_seconds', 3600);
+                $isOnline = ($existing['status'] ?? '') === 'online';
+                if ($isOnline || ($now - $lastSeen) < $healAfter) {
+                    continue;
+                }
             }
 
             $wakeUrl = $ifaceConfig['wake_url'] ?? null;

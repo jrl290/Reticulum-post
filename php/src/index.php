@@ -2590,7 +2590,16 @@ function runIndexCli(string $projectRoot, array $argv): int
         // The CLI is the only caller allowed to rebuild tables. Deleting rows
         // hands InnoDB's pages back to the tablespace free list, not to the
         // filesystem, so without a rebuild here the account quota never falls
-        // no matter how much history is pruned. Run this from cron.
+        // no matter how much history is pruned.
+        //
+        // Run this MANUALLY (`php index.php once`) when the quota needs
+        // reclaiming — not from cron. This deployment deliberately has no
+        // scheduler: every routine bound rides request traffic (the 2-second
+        // prelude), and a cron entry is a second operational surface that can
+        // be absent, misconfigured, or silently dead. The one case request
+        // traffic cannot cover is a *decommissioned* node still holding data
+        // (no requests → no maintenance), and that is a deliberate manual
+        // decision anyway.
         $maintenance = $reticulumPhpStorage->runMaintenance(
             (int) ($maintenanceConfig['interface_stale_after_seconds'] ?? 15),
             (int) ($maintenanceConfig['batch_ttl_seconds'] ?? 86400),

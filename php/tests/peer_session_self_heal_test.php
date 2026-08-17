@@ -102,13 +102,24 @@ if (!str_contains($maint, 'ensureConfiguredPeerSessions(')) {
 
 // The self-healer must claim its throttle window before network work.
 $healStart = strpos($source, 'public function ensureConfiguredPeerSessions(');
-$healBody = substr($source, $healStart, 3000);
+$healBody = substr($source, $healStart, 5000);
 $claimPos = strpos($healBody, 'claimPeerSessionWindow');
 $connectPos = strpos($healBody, 'connectToPeer(');
 if ($claimPos === false || $connectPos === false || $claimPos > $connectPos) {
     $failures[] = 'ensureConfiguredPeerSessions must claim the transport_state '
         . 'window BEFORE calling connectToPeer, or concurrent requests stampede '
         . 'the peer with duplicate registrations';
+}
+
+// The healer must NOT churn idle wake-peers. Wake-based peers are marked
+// offline by Phase 1 within 15s of the last exchange — that is their normal
+// idle state, not a failure. Healing on merely-offline would re-register a
+// healthy peer every throttle window all night, cycling session credentials
+// that in-flight exchanges may still be using. Only a MISSING row or a row
+// offline past peer_session_heal_after_seconds may trigger reconnection.
+if (!str_contains($healBody, 'peer_session_heal_after_seconds')) {
+    $failures[] = 'ensureConfiguredPeerSessions lost its heal-after window — '
+        . 'it will now churn every idle wake-peer each throttle interval';
 }
 
 if ($failures !== []) {
