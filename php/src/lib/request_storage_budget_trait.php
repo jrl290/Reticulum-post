@@ -751,18 +751,39 @@ trait RequestStorageBudgetTrait
      * MySQL reports free space per table, so each qualifying table is its own
      * target. SQLite has one file and no per-table accounting, so the whole
      * database is a single target keyed off its freelist.
+     *
+     * A table qualifies on either an absolute or a proportional test:
+     *
+     *   free >= minFree                       — worth it in its own right
+     *   free >= half of what the table holds  — worth it relative to its size
+     *
+     * The absolute test alone leaves small-but-mostly-empty tables bloated
+     * forever. Observed on selectivesubconscious.com: packet_hashes sat at
+     * 61.3 MB allocated with 41 MB free — 67% waste — permanently below a
+     * 64 MB threshold. The ratio test carries a floor of its own so that a
+     * nearly-empty 200 KB table is not rebuilt for nothing.
      */
     private function storageReclaimTargets(array $footprint, int $minFree): array
     {
+        $ratioFloor = 8_000_000;
+        $qualifies = static function (int $free, int $allocated) use ($minFree, $ratioFloor): bool {
+            if ($free >= $minFree) {
+                return true;
+            }
+
+            return $free >= $ratioFloor && $allocated > 0 && $free * 2 >= $allocated;
+        };
+
         if (($footprint['per_table'] ?? []) === []) {
-            return (int) ($footprint['database_free_bytes'] ?? 0) >= $minFree
-                ? ['sqlite:vacuum']
-                : [];
+            return $qualifies(
+                (int) ($footprint['database_free_bytes'] ?? 0),
+                (int) ($footprint['database_bytes'] ?? 0)
+            ) ? ['sqlite:vacuum'] : [];
         }
 
         $targets = [];
         foreach ($footprint['per_table'] as $tableName => $stats) {
-            if ((int) ($stats['free_bytes'] ?? 0) >= $minFree) {
+            if ($qualifies((int) ($stats['free_bytes'] ?? 0), (int) ($stats['bytes'] ?? 0))) {
                 $targets[] = $tableName;
             }
         }

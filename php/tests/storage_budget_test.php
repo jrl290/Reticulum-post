@@ -308,8 +308,33 @@ check(
 );
 check(
     [],
-    $harness->reclaimTargets(['database_free_bytes' => 1_000, 'per_table' => []], 64_000_000),
+    $harness->reclaimTargets(['database_free_bytes' => 1_000, 'database_bytes' => 500_000_000, 'per_table' => []], 64_000_000),
     'nothing is rebuilt when there is no slack to recover'
+);
+
+// A table well under the absolute threshold but mostly empty must still be
+// rebuilt, or it stays bloated forever. packet_hashes sat at 61.3 MB with
+// 41 MB free — 67% waste — permanently invisible to a 64 MB test.
+check(
+    ['packet_hashes'],
+    $harness->reclaimTargets([
+        'database_free_bytes' => 0,
+        'per_table' => [
+            'packet_hashes' => ['bytes' => 64_270_336, 'free_bytes' => 42_991_616],
+            'path_entries' => ['bytes' => 26_738_688, 'free_bytes' => 6_291_456],
+        ],
+    ], 64_000_000),
+    'a mostly-empty table qualifies on ratio even under the absolute threshold'
+);
+
+// ...but a tiny table is not worth a rebuild however empty it looks.
+check(
+    [],
+    $harness->reclaimTargets([
+        'database_free_bytes' => 0,
+        'per_table' => ['wake_events' => ['bytes' => 200_000, 'free_bytes' => 180_000]],
+    ], 64_000_000),
+    'the ratio test has a floor so trivial tables are left alone'
 );
 
 // ── 12. information_schema column case ─────────────────────────────────
