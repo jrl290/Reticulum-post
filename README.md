@@ -219,6 +219,23 @@ not completing — check `error_log` for a spawn failure. On a host where `exec(
 is disabled the budget records `storage_reclaim_deferred` and pruning still
 bounds row growth, but the freed pages stay charged until a rebuild runs.
 
+Two limitations worth knowing:
+
+**An idle node does not police itself.** Enforcement rides on the exchange
+prelude, so a node receiving no traffic never runs maintenance. That is mostly
+benign — a node with no traffic is not accumulating either — but a node that was
+busy, filled up, and then went quiet keeps everything until it is used again.
+selectivesubconscious.com was in exactly that state: 686 MB of legacy data,
+frozen counters, and `interfaces_online` still reporting 2 because
+`markStaleInterfacesOffline()` had not run in days. Run `php index.php once` by
+hand to clean up a node you have taken out of service.
+
+**Convergence takes more than one pass.** InnoDB's purge is asynchronous, so
+immediately after a large DELETE `data_free` still under-reports and the table
+is not yet a reclaim candidate. The next pass picks it up. Driving
+selectivesubconscious.com from 686 MB to 64.7 MB took three passes, after which
+it holds steady as a no-op.
+
 ### Statistics must be refreshed before they are believed
 
 `information_schema.TABLES` serves cached data-dictionary statistics, and with
