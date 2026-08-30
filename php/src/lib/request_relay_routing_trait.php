@@ -444,7 +444,12 @@ trait RequestRelayRoutingTrait
             }));
         }
 
-        if ($targets === []) {
+        // Having no relay target is the normal resting state of a leaf node,
+        // not an error. Unconditionally it wrote one error_log line per accepted
+        // packet: 93 MB on selectivesubconscious.com between 21 Jul and 30 Aug
+        // 2026, every byte of it this one message. Keep it for diagnosis, behind
+        // the same debug.enabled flag that gates /debug.
+        if ($targets === [] && ($this->config['debug']['enabled'] ?? false) === true) {
             error_log("[relayAcceptedPacket] NO TARGETS for dest=" . substr((string)($packet['destination_hash_hex']??''),0,12) . " type=" . ($packet['packet_type']??'?'));
         }
 

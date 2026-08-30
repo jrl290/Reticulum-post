@@ -45,11 +45,14 @@ use RuntimeException;
  *      removed, so that loop would delete every row in the database before it
  *      terminated. Instead each pass estimates bytes-per-row from the allocated
  *      size and deletes a bounded, computed number of rows.
- *   2. Reclamation is a separate, throttled step. It only runs from the CLI
- *      (`php index.php once`), never from a web request: rebuilding a 700 MB
- *      table takes far longer than max_execution_time, and losing the
- *      connection mid-ALTER just rolls the rebuild back after doing all the
- *      work. Run it from cron.
+ *   2. Reclamation is a separate, throttled step, and it never runs *inline*
+ *      on a web request: rebuilding a 700 MB table takes far longer than
+ *      max_execution_time, and losing the connection mid-ALTER just rolls the
+ *      rebuild back after doing all the work. The request path instead spawns a
+ *      detached `php index.php reclaim` (spawnDetachedStorageReclaim); the CLI,
+ *      which has no request to hold open, does the rebuild inline. Either way
+ *      the operation that noticed the waste is the one that schedules the
+ *      cleanup — there is no cron.
  *
  * CONFIG (all under [maintenance])
  * ================================
@@ -283,6 +286,12 @@ trait RequestStorageBudgetTrait
      *                           before acting on the numbers — see
      *                           refreshStorageStatistics(). Callers that only
      *                           report (e.g. /health) pass false to stay cheap.
+     * total_bytes is what the account is charged: live bytes, the free pages
+     * still held inside the tablespaces, and the managed logs. database_bytes
+     * is the live subset, and it is that subset — not the total — that decides
+     * how much to prune, because deleting rows moves bytes from one to the
+     * other rather than returning them.
+     *
      * @return array{database_bytes:int, database_free_bytes:int, log_bytes:int, total_bytes:int, per_table:array<string,array{bytes:int, free_bytes:int}>}
      */
     public function storageFootprint(?string $backend = null, bool $refreshStats = false): array
@@ -344,7 +353,15 @@ trait RequestStorageBudgetTrait
             'database_bytes' => $databaseBytes,
             'database_free_bytes' => $databaseFreeBytes,
             'log_bytes' => $logBytes,
-            'total_bytes' => $databaseBytes + $logBytes,
+            // The host bills the size of the .ibd files, and with
+            // innodb_file_per_table=1 that is data + index + free. Excluding the
+            // free pages made this number describe rows rather than disk, and
+            // the two can differ by the whole quota: on 2026-08-30
+            // selectivesubconscious.com reported 135.9 MB against a 300 MB
+            // budget while occupying 1,068.9 MB — 42.4 MB live and 1,026.6 MB
+            // of pages freed by an earlier prune that nothing had rebuilt. A
+            // cap that cannot see the thing the host charges for is not a cap.
+            'total_bytes' => $databaseBytes + $databaseFreeBytes + $logBytes,
             'per_table' => $perTable,
         ];
     }
@@ -473,6 +490,12 @@ trait RequestStorageBudgetTrait
             return;
         }
 
+        // Pruning is measured against live bytes, never against total_bytes,
+        // even though total_bytes is the number the host charges. A DELETE moves
+        // bytes from database_bytes to database_free_bytes and leaves the total
+        // untouched, so a pruner driven by the total would delete every row in
+        // the database and still believe itself over budget. Free pages are
+        // reclaim's problem, and reclaim is offered on both branches below.
         $databaseBudget = $budgetBytes - (int) ($footprint['log_bytes'] ?? 0);
         $databaseBytes = (int) ($footprint['database_bytes'] ?? 0);
         $overBy = $databaseBytes - $databaseBudget;

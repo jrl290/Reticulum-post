@@ -109,6 +109,24 @@ final class StorageBudgetHarness
     }
 
     /** Drive the pruner with a footprint the SQLite file could never produce. */
+    /**
+     * Grow the database, then delete it back down, leaving pages on the
+     * freelist — SQLite's equivalent of InnoDB's data_free. Nothing returns
+     * them to the file until a VACUUM, which is exactly the situation the
+     * footprint has to be able to see.
+     */
+    public function stageFreePages(): void
+    {
+        $stmt = $this->db->prepare(
+            'INSERT INTO inbound_packets (packet_record_id, packet_hash_hex, created_at) VALUES (?, ?, ?)'
+        );
+        $filler = str_repeat('a', 2_000);
+        for ($i = 1; $i <= 500; $i++) {
+            $stmt->execute([$i, $filler, 0]);
+        }
+        $this->db->exec('DELETE FROM inbound_packets');
+    }
+
     public function enforce(int $budgetBytes, array $footprint): array
     {
         $summary = [];
@@ -158,7 +176,7 @@ function footprint(int $databaseBytes, int $logBytes = 0, int $freeBytes = 0): a
         'database_bytes' => $databaseBytes,
         'database_free_bytes' => $freeBytes,
         'log_bytes' => $logBytes,
-        'total_bytes' => $databaseBytes + $logBytes,
+        'total_bytes' => $databaseBytes + $freeBytes + $logBytes,
         'per_table' => [],
     ];
 }
@@ -361,6 +379,42 @@ check(
     ['budget_table' => 'x', 'budget_data_length' => 1],
     $harness->normalizeRows([['budget_table' => 'x', 'budget_data_length' => 1]])[0],
     'already-lower-cased rows pass through unchanged'
+);
+
+// ── The footprint total must be what the host charges ──────────────────
+//
+// total_bytes excluded database_free_bytes until 2026-08-30. With
+// innodb_file_per_table=1 those freed pages stay inside the .ibd files and are
+// still billed, so the cap was measuring rows while the host measured disk. On
+// selectivesubconscious.com the two read 135.9 MB and 1,068.9 MB — the budget
+// saw a healthy node sitting on its entire 1 GB quota. Asserted here on SQLite,
+// where a freelist can actually be staged, because the identity is the point
+// and it is backend-independent.
+$harness = new StorageBudgetHarness();
+$harness->stageFreePages();
+$measured = $harness->storageFootprint('sqlite', false);
+
+check(
+    true,
+    $measured['database_free_bytes'] > 0,
+    'deleting rows leaves free pages behind (test setup produced no freelist)'
+);
+check(
+    $measured['database_bytes'] + $measured['database_free_bytes'] + $measured['log_bytes'],
+    $measured['total_bytes'],
+    'total_bytes counts freed-but-allocated pages, which the host still bills'
+);
+
+// Pruning, by contrast, must stay keyed on live bytes. A DELETE moves bytes
+// from database_bytes to database_free_bytes; a pruner driven by the total
+// would never see its own work land and would empty the database chasing it.
+$harness = new StorageBudgetHarness();
+$harness->insertInbound(1, $old);
+$summary = $harness->enforce(1_000_000, footprint(500_000, 0, 5_000_000));
+check(
+    [],
+    $summary['storage_pruned'],
+    'free pages alone never trigger pruning — that is reclaim\'s job, not the pruner\'s'
 );
 
 if ($failures > 0) {

@@ -14,10 +14,11 @@ trait RequestDebugReportTrait
 {
     public function healthSummary(): array
     {
-        // Storage is reported here because the cap is silent when it works. If
-        // storage_bytes sits near storage_budget_bytes while database_free_bytes
-        // is large, the pruning is keeping up but no reclaim has run — the space
-        // is recoverable, and only `php index.php once` recovers it.
+        // Storage is reported here because the cap is silent when it works.
+        // storage_bytes is what the account is charged, so it includes
+        // storage_database_free_bytes. When the two are close, almost nothing
+        // here is live data: pruning has kept up but no reclaim has rebuilt the
+        // tablespaces, and the space is recoverable by a reclaim pass.
         $footprint = $this->storageFootprint();
 
         return [

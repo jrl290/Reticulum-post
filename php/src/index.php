@@ -1707,6 +1707,19 @@ final class HttpApi
                     throw new ApiError(400, 'wake requires waker_url', ['error' => 'wake requires waker_url']);
                 }
 
+                // Maintenance rides the request path, and a node whose only
+                // traffic is wakes has no other request to ride. Until 2026-08-30
+                // the prelude hung off /v1/interfaces/exchange, /tx and /poll
+                // only, so selectivesubconscious.com — which serves wakes and
+                // nothing else — ran no maintenance for 12.8 days while this
+                // handler kept ingesting packets and appending to error_log. It
+                // finished with 1,026 MB of freed-but-unreclaimed InnoDB pages
+                // against a 1 GB account quota, and a 93 MB error_log, while its
+                // own budget reported a healthy 135 MB. Wakes are the pulse of a
+                // peer-only node; give them the same 2-second-rate-limited pass
+                // every other packet-carrying endpoint gets.
+                $this->runInterfaceRequestPrelude();
+
                 // The wake caller has already dropped the connection.
                 // We call the peer's exchange endpoint inline to pull any pending packets.
                 try { $result = $this->storage->exchangeWithPhpPeer($wakerUrl); } catch (\Throwable $e) { $result = ["status" => "exchange_error", "message" => $e->getMessage(), "file" => $e->getFile(), "line" => $e->getLine()]; }
