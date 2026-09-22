@@ -18,6 +18,7 @@ Place this file in ~/.reticulum/interfaces/ and add to config:
     enabled = yes
     node_url = https://selectivesubconscious.com/reticulum
     name = PHP Node Bridge
+    mode = full                                      # RNS interface mode; also sent to the PHP router
     wake_url = https://my-bridge.example.com/wake   # URL the PHP node calls to wake us
     wake_listen_host = 0.0.0.0                       # bind address for wake server
     wake_listen_port = 8080                          # port for wake server
@@ -58,15 +59,26 @@ class PostInterface(Interface):
     _wake_server = None
     _wake_server_thread = None
     _pending_wake = False
-    _wake_lock = threading.Lock()
     _running = False
-    _outgoing_queue = []
-    _queue_lock = threading.Lock()
-    _ack_ids = []
     _batch_seq = 0
 
     def __init__(self, owner, configuration):
+        # Interface.__init__() establishes every attribute the RNS Transport
+        # reads off an interface (ingress_control, gravity, bootstrap_only,
+        # recursive_prs, announces_from_internal/to_internal, parent_interface,
+        # spawned_interfaces, tunnel_id, the announce/path-request frequency
+        # deques, the traffic counters). It must run before anything else.
         super().__init__()
+
+        # Per-instance queue state. These were class attributes, which meant
+        # every PostInterface in a process shared one outgoing queue and one
+        # wake lock.
+        self._outgoing_queue = []
+        self._queue_lock     = threading.Lock()
+        self._ack_ids        = []
+        self._wake_lock      = threading.Lock()
+        self._pending_wake   = False
+        self._batch_seq      = 0
 
         ifconf = Interface.get_config_obj(configuration)
         name = ifconf["name"]
@@ -127,9 +139,14 @@ class PostInterface(Interface):
             except (ValueError, TypeError):
                 pass
 
+        # Reticulum injects "selected_interface_mode" and "configured_bitrate"
+        # into the configuration of every interface it builds from a config
+        # file, and applies the full attribute set again once __init__ returns.
+        # Their presence is how we tell a configured interface from one that
+        # application code constructed directly.
+        self._from_config = "selected_interface_mode" in ifconf
+
         self.IN = True
-        self.OUT = True
-        self.mode = RNS.Interfaces.Interface.Interface.MODE_FULL
         self.online = False
         self._running = True
         self._poll_thread = None
@@ -141,14 +158,13 @@ class PostInterface(Interface):
             RNS.log(f"PostInterface[{self.name}]: Registration failed: {e}", RNS.LOG_ERROR)
             raise e
 
-        # Verify we're in the transport interfaces list
-        if hasattr(RNS.Transport, 'interfaces') and self in RNS.Transport.interfaces:
-            RNS.log(f"PostInterface[{self.name}]: Registered in Transport.interfaces (OUT={self.OUT}, IN={self.IN})", RNS.LOG_NOTICE)
-        else:
-            RNS.log(f"PostInterface[{self.name}]: NOT in Transport.interfaces! Attempting self-registration...", RNS.LOG_ERROR)
-            if hasattr(RNS.Transport, 'interfaces'):
-                RNS.Transport.interfaces.append(self)
-                RNS.log(f"PostInterface[{self.name}]: Self-registered in Transport.interfaces", RNS.LOG_NOTICE)
+        # Establish the interface attributes Reticulum applies to a configured
+        # interface, then register through Transport. Both happen before the
+        # exchange thread starts, because that thread hands packets straight to
+        # Transport.inbound(), which reads several of those attributes without
+        # a hasattr() guard.
+        self._apply_interface_defaults(ifconf)
+        self._register_with_transport()
 
         # Mark as online and start the exchange poll thread
         self.online = True
@@ -162,6 +178,99 @@ class PostInterface(Interface):
         poll_info = f"poll_interval={self._poll_interval}s" if self._poll_interval is not None else f"idle_ms={self._idle_ms}"
         mode_info = "wake" if self.wake_url else "poll"
         RNS.log(f"PostInterface[{self.name}]: Online ({mode_info} mode, {poll_info})", RNS.LOG_NOTICE)
+
+    # ---- Transport registration ----
+
+    def _default_gravity(self):
+        """The gravity Reticulum._add_interface() would apply.
+
+        Reticulum.Reticulum._default_gravity() exists from RNS 1.4 onwards;
+        on older releases the concept does not exist and gravity is 0.
+        """
+        try:
+            instance = RNS.Reticulum.get_instance()
+            if instance is not None and hasattr(instance, "_default_gravity"):
+                return instance._default_gravity()
+        except Exception:
+            pass
+        return getattr(Interface, "DEFAULT_GRAVITY", 0)
+
+    def _apply_interface_defaults(self, ifconf):
+        """Apply what Reticulum._add_interface() sets on a configured interface.
+
+        A PostInterface constructed directly by application code never passes
+        through Reticulum's interface loader, so nothing else establishes these.
+        Transport reads some of them with no hasattr() guard — ifac_size on
+        every inbound frame, announce_rate_target on every inbound announce —
+        so the interface is not a valid Transport interface without them.
+
+        For an interface built from a config file this runs first and
+        Reticulum overwrites it with the configured values immediately after
+        __init__ returns; the defaults used here are the same ones it would
+        apply for an unspecified option.
+        """
+        # A mode given as "mode = gateway" in [interfaces] is parsed by
+        # Reticulum itself and handed back as selected_interface_mode; it takes
+        # precedence over the PostInterface-specific mode key, which is what
+        # the PHP router is told about in the register metadata.
+        selected_mode = ifconf.get("selected_interface_mode") if self._from_config else None
+        if selected_mode is not None:
+            try:
+                self.mode = int(selected_mode)
+            except (ValueError, TypeError):
+                self.mode = self._rns_mode
+        else:
+            self.mode = self._rns_mode
+
+        self.OUT            = True
+        self.gravity        = self._default_gravity()
+        self.bootstrap_only = False
+        self.optimise_mtu()
+
+        self.ifac_size      = self.DEFAULT_IFAC_SIZE
+        self.ifac_netname   = None
+        self.ifac_netkey    = None
+        self.ifac_identity  = None
+        self.ifac_key       = None
+        self.ifac_signature = None
+
+        self.recursive_prs           = False
+        self.announces_from_internal = True
+        self.announces_to_internal   = None
+        self.announce_cap            = RNS.Reticulum.ANNOUNCE_CAP / 100.0
+        self.announce_rate_target    = None
+        self.announce_rate_grace     = None
+        self.announce_rate_penalty   = None
+        self.announce_allowed_at     = 0
+        self.announce_queue          = []
+
+    def _register_with_transport(self):
+        """Register through the canonical Transport entry point.
+
+        Transport.add_interface() takes Transport.interfaces_lock and ignores
+        an interface that is already registered, so calling it here is safe
+        even though Reticulum calls it again for a config-file interface.
+        Releases before RNS 1.5 have no add_interface() and their interface
+        loader appends unconditionally, so there we only register ourselves
+        when no loader is going to do it for us.
+        """
+        try:
+            if hasattr(RNS.Transport, "add_interface"):
+                RNS.Transport.add_interface(self)
+            elif not self._from_config and self not in RNS.Transport.interfaces:
+                RNS.Transport.interfaces.append(self)
+
+            if not self._from_config:
+                self.final_init()
+
+        except Exception as e:
+            RNS.log(f"PostInterface[{self.name}]: Transport registration failed: {e}", RNS.LOG_ERROR)
+            return
+
+        if self in RNS.Transport.interfaces:
+            RNS.log(f"PostInterface[{self.name}]: Registered in Transport.interfaces (OUT={self.OUT}, IN={self.IN}, mode={self.mode})", RNS.LOG_NOTICE)
+        elif not self._from_config:
+            RNS.log(f"PostInterface[{self.name}]: Not in Transport.interfaces after registration", RNS.LOG_ERROR)
 
     def _register(self):
         """Register this interface with the PHP node.
@@ -476,6 +585,30 @@ class PostInterface(Interface):
 
         return resp
 
+    def detach(self):
+        """Stop the exchange loop and the wake server.
+
+        Transport.detach_interfaces() calls this on every interface that is
+        not already detached when RNS shuts down.
+        """
+        self.detached = True
+        self.online   = False
+        self._running = False
+
+        if self._wake_server is not None:
+            try:
+                self._wake_server.shutdown()
+                self._wake_server.server_close()
+            except Exception as e:
+                RNS.log(f"PostInterface[{self.name}]: Error while stopping wake server: {e}", RNS.LOG_WARNING)
+            self._wake_server = None
+
+        RNS.log(f"PostInterface[{self.name}]: Detached", RNS.LOG_NOTICE)
+
+    # The exchange with the PHP node is already batched and rate limited at
+    # the far end, so there is nothing for ingress control to protect here.
+    # Returning False unconditionally is what the other link-local RNS
+    # interfaces do (LocalInterface, SerialInterface, KISSInterface).
     def should_ingress_limit(self):
         return False
 
