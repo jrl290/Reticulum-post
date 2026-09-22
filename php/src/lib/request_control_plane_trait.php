@@ -332,6 +332,51 @@ trait RequestControlPlaneTrait
         $stmt->execute();
     }
 
+    /**
+     * A destination registered as local on one interface that announces again
+     * through a different interface has moved (RNS: the newer announce wins,
+     * Transport.py:2229-2252). Drop the local row so delivery follows the path
+     * table instead of a browser that is no longer here.
+     *
+     * The announce must be genuinely new: an echo of the browser's own announce
+     * comes back through the backbone with the SAME random hash (blobSeen), and
+     * rfed's replay of a pre-signed distro announce likewise; neither moves the
+     * destination. On 2026-09-22 a browser that had been on retichat.com and
+     * re-attached to selectiv stayed registered as local on retichat.com for the
+     * whole interface_stale_after_seconds window (300 s there), and a message
+     * for it was queued as local_delivery to the dead interface instead of
+     * being relayed over the peer link.
+     */
+    private function evictLocalDestinationIfMoved(
+        string $destinationHashHex,
+        string $announcingInterfaceId,
+        bool $blobSeen,
+        int $announceEmitted,
+        int $currentAnnounceEmitted
+    ): void {
+        if ($blobSeen || $announceEmitted < $currentAnnounceEmitted) {
+            return;
+        }
+        $existing = $this->localDestinationRaw($destinationHashHex);
+        if ($existing === null) {
+            return;
+        }
+        $existingIface = (string) ($existing['interface_id'] ?? '');
+        if ($existingIface === '' || $existingIface === $announcingInterfaceId) {
+            return;
+        }
+        $del = $this->db->prepare('DELETE FROM local_destinations WHERE destination_hash_hex = :dest AND interface_id = :iface');
+        $del->bindValue(':dest', $destinationHashHex, PDO::PARAM_STR);
+        $del->bindValue(':iface', $existingIface, PDO::PARAM_STR);
+        $del->execute();
+        if (method_exists($this, 'log')) {
+            $this->log(sprintf(
+                '[local_destinations] %s moved: newer announce via %s evicts local registration on %s',
+                substr($destinationHashHex, 0, 12), substr($announcingInterfaceId, 0, 8), substr($existingIface, 0, 8)
+            ));
+        }
+    }
+
     private function localDestinationRaw(string $destinationHashHex): ?array
     {
         $stmt = $this->db->prepare(
@@ -447,6 +492,13 @@ trait RequestControlPlaneTrait
             // transport-path preservation shortcut below. This is the guard
             // against getting stuck on stale routing state: fresh info wins.
             $isNewerAnnounce = !$blobSeen && $announceEmitted >= $pathTimebase;
+            $this->evictLocalDestinationIfMoved(
+                $destinationHashHex,
+                $interfaceId,
+                $blobSeen,
+                $announceEmitted,
+                (int) ($current['announce_emitted'] ?? 0),
+            );
 
             $preserveTransportPath = $currentUsable
                 && $currentInterfaceId !== ''
