@@ -157,6 +157,14 @@ if [[ -z "$ONLY_NODE" || "$ONLY_NODE" == "selectiv" ]]; then
   verify_node "selectivesubconscious.com" SELECTIV_SSH_HOST SELECTIV_SSH_PASS
 fi
 
+# Zero files checked is not a pass. Without deploy.env sourced every node is
+# skipped and this used to print a green "every node matches HEAD (0 files
+# checked)" — a verification that verified nothing, reported as success.
+if [[ $checked_total -eq 0 ]]; then
+  echo "${RED}✗ no files were checked — source deploy.env (RETICHAT_SSH_HOST / SELECTIV_SSH_HOST) first${NC}"
+  exit 2
+fi
+
 if [[ $drift_total -eq 0 ]]; then
   echo "${GREEN}✓ every node matches ${REF} (${checked_total} files checked)${NC}"
   exit 0

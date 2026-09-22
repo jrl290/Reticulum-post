@@ -37,9 +37,14 @@ final class PacketStorageCapHarness
                 packet_id INTEGER PRIMARY KEY,
                 packet_base64 TEXT,
                 queued_at INTEGER NOT NULL,
-                acked_at INTEGER
+                acked_at INTEGER,
+                interface_id TEXT NOT NULL DEFAULT \'iface\'
             )'
         );
+        // Phase 5 also drops packets whose interface row is gone; every
+        // packet in this harness belongs to a live one.
+        $this->db->exec("CREATE TABLE interfaces (interface_id TEXT PRIMARY KEY)");
+        $this->db->exec("INSERT INTO interfaces VALUES ('iface')");
         // Expiry must not orphan the announce a live path entry points at.
         $this->db->exec(
             'CREATE TABLE path_entries (
@@ -166,9 +171,13 @@ $historyHarness->insertOutbound(2, 100, 10, false);
 $historyHarness->insertOutbound(3, 300, 10, true);
 [$expiredInbound, $expiredOutbound] = $historyHarness->expireHistory(200, 200);
 assertSameValue(1, $expiredInbound, 'expired inbound diagnostic history is removed');
-assertSameValue(1, $expiredOutbound, 'only acknowledged outbound history is expired');
+// Until 2026-09-22 this asserted 1: "only acknowledged outbound history is
+// expired". That rule kept every packet nobody ever collected forever (512 of
+// them on retichat.com for offline interfaces). Past the outbound TTL an
+// unacked packet expires like an acked one; only fresh rows are kept.
+assertSameValue(2, $expiredOutbound, 'outbound history past the TTL is expired whether acked or not');
 assertSameValue([2], $historyHarness->ids('inbound_packets', 'packet_record_id'), 'new inbound history remains');
-assertSameValue([2, 3], $historyHarness->ids('outbound_packets', 'packet_id'), 'pending and new acknowledged outbound rows remain');
+assertSameValue([3], $historyHarness->ids('outbound_packets', 'packet_id'), 'only the fresh outbound row remains');
 
 // A path entry keeps only the packet_hash of the announce that taught it the
 // path and re-reads the body to answer path requests. Path entries outlive this

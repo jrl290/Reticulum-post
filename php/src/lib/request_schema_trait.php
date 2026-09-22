@@ -33,6 +33,7 @@ trait RequestSchemaTrait
 
         $this->ensureTables($summary);
         $this->ensureColumns($summary);
+        $this->ensureColumnTypes($summary);
         $this->ensurePrimaryKeys($summary);
         $this->ensureIndexes($summary);
 
@@ -330,6 +331,45 @@ trait RequestSchemaTrait
                 $code = (int) ($e->errorInfo[1] ?? 0);
                 if ($code !== 1060 && $code !== 1146) {
                     $summary['errors'][] = "add_column {$table}.{$column}: " . $e->getMessage();
+                }
+            }
+        }
+    }
+
+    /**
+     * Widen counters that older installs created as 32-bit.
+     *
+     * ensureTables() declares the interface byte/packet counters BIGINT, but a
+     * table that already existed keeps whatever type it was created with, and
+     * ensureColumns() only adds columns that are missing. Both production
+     * nodes had INT counters; the bridge interface's rx_bytes sat at exactly
+     * 2147483647 — MySQL clamps on overflow — so the counter had been lying
+     * for weeks. MySQL only: SQLite INTEGER is already 64-bit.
+     */
+    private function ensureColumnTypes(array &$summary): void
+    {
+        if ($this->backend !== 'mysql') {
+            return;
+        }
+        $wanted = [
+            'interfaces' => ['rx_packets', 'tx_packets', 'rx_bytes', 'tx_bytes'],
+        ];
+        foreach ($wanted as $table => $columns) {
+            foreach ($columns as $column) {
+                try {
+                    $stmt = $this->db->prepare(
+                        'SELECT DATA_TYPE FROM information_schema.COLUMNS
+                          WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :t AND COLUMN_NAME = :c'
+                    );
+                    $stmt->execute([':t' => $table, ':c' => $column]);
+                    $type = strtolower((string) ($stmt->fetchColumn() ?: ''));
+                    if ($type === '' || $type === 'bigint') {
+                        continue;
+                    }
+                    $this->db->exec("ALTER TABLE `{$table}` MODIFY `{$column}` BIGINT NOT NULL DEFAULT 0");
+                    $summary['columns_widened'] = ($summary['columns_widened'] ?? 0) + 1;
+                } catch (PDOException $e) {
+                    $summary['errors'][] = "widen_column {$table}.{$column}: " . $e->getMessage();
                 }
             }
         }

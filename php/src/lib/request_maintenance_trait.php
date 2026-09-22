@@ -199,7 +199,8 @@ trait RequestMaintenanceTrait
             );
 
             // Phase 5: Expire packet history. Inbound rows are diagnostics;
-            // outbound rows are removable only after delivery acknowledgement.
+            // outbound rows go after delivery acknowledgement, or unacked after
+            // the same TTL, or at once if their interface no longer exists.
             $inboundPacketTtl = $this->maintenanceConfigInt('inbound_packet_ttl_seconds', 3600);
             $outboundPacketTtl = $this->maintenanceConfigInt('outbound_packet_ttl_seconds', 86400);
             [$summary['expired_inbound_packets'], $summary['expired_outbound_packets']] =
@@ -466,10 +467,33 @@ trait RequestMaintenanceTrait
             $backend,
         );
 
+        $outboundTable = Database::quoteTable($backend, 'outbound_packets');
         $outboundDeleted = $this->deleteSingleBatch(
-            Database::quoteTable($backend, 'outbound_packets'),
+            $outboundTable,
             'acked_at IS NOT NULL AND acked_at < :cutoff ORDER BY acked_at',
             [':cutoff' => $outboundCutoff],
+            $backend,
+        );
+
+        // A packet that was never acked is not exempt from the TTL. Until
+        // 2026-09-22 only acked packets expired, so anything queued for an
+        // interface that went offline and never came back — a closed browser
+        // tab, a bridge that was replaced — stayed forever: retichat.com held
+        // 512 such rows for offline interfaces, and 5 for interfaces
+        // maintenance had already deleted. The TTL is the same one; a
+        // packet nobody collected in a day is as dead as one they acked a day
+        // ago. Orphans (interface row gone) go regardless of age.
+        $ifTable = Database::quoteTable($backend, 'interfaces');
+        $outboundDeleted += $this->deleteSingleBatch(
+            $outboundTable,
+            'acked_at IS NULL AND queued_at < :cutoff ORDER BY queued_at',
+            [':cutoff' => $outboundCutoff],
+            $backend,
+        );
+        $outboundDeleted += $this->deleteSingleBatch(
+            $outboundTable,
+            "interface_id NOT IN (SELECT interface_id FROM {$ifTable})",
+            [],
             $backend,
         );
 
