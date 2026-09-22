@@ -43,6 +43,10 @@ $hotPathTraits = [
     'request_path_state_trait.php',
     'request_relay_routing_trait.php',
     'request_packet_ingest_trait.php',
+    // The busiest writer in the node - queueOutboundPacket and the queue cap
+    // run on every exchange - was missing from this list until 2026-09-22,
+    // with four bare writes nobody could see.
+    'request_interface_runtime_trait.php',
 ];
 
 $failures = [];

@@ -465,6 +465,7 @@ trait RequestMaintenanceTrait
              ORDER BY created_at",
             [':cutoff' => $inboundCutoff],
             $backend,
+            'packet_record_id',
         );
 
         $outboundTable = Database::quoteTable($backend, 'outbound_packets');
@@ -473,6 +474,7 @@ trait RequestMaintenanceTrait
             'acked_at IS NOT NULL AND acked_at < :cutoff ORDER BY acked_at',
             [':cutoff' => $outboundCutoff],
             $backend,
+            'packet_id',
         );
 
         // A packet that was never acked is not exempt from the TTL. Until
@@ -489,23 +491,56 @@ trait RequestMaintenanceTrait
             'acked_at IS NULL AND queued_at < :cutoff ORDER BY queued_at',
             [':cutoff' => $outboundCutoff],
             $backend,
+            'packet_id',
         );
         $outboundDeleted += $this->deleteSingleBatch(
             $outboundTable,
             "interface_id NOT IN (SELECT interface_id FROM {$ifTable})",
             [],
             $backend,
+            'packet_id',
         );
 
         return [$inboundDeleted, $outboundDeleted];
     }
 
+    /**
+     * One bounded DELETE.
+     *
+     * With `$pkColumn` given, the rows are found first and then deleted BY
+     * PRIMARY KEY, ascending. That is the node's one lock order for the
+     * packet tables: primary key first. A range DELETE driven by a secondary
+     * index (acked_at, delivered_batch_id, queued_at) locks index entries
+     * first and rows second, while every single-row UPDATE on the same
+     * table - ack, batch assignment - locks the row first and its index
+     * entries second. Opposite orders: every deadlock retichat.com logged
+     * between 2026-07-19 and 2026-09-22 (298 of them, all
+     * `requeueOutboundPackets`, 2-6 a day) was that pair. Deleting by
+     * primary key puts the DELETE on the same order as the UPDATEs.
+     */
     private function deleteSingleBatch(
         string $table,
         string $whereClause,
         array $params,
-        string $backend
+        string $backend,
+        ?string $pkColumn = null
     ): int {
+        if ($pkColumn !== null) {
+            $order = '';
+            if (preg_match('/\s+ORDER\s+BY\s+(\S+(\s+(ASC|DESC))?)\s*$/i', $whereClause, $m)) {
+                $order = ' ORDER BY ' . $m[1];
+                $whereClause = preg_replace('/\s+ORDER\s+BY\s+\S+(\s+(ASC|DESC))?\s*$/i', '', $whereClause);
+            }
+            $select = $this->db->prepare("SELECT {$pkColumn} FROM {$table} WHERE {$whereClause}{$order} LIMIT 1000");
+            foreach ($params as $name => $value) {
+                $select->bindValue($name, $value, is_int($value) ? PDO::PARAM_INT : PDO::PARAM_STR);
+            }
+            $select->execute();
+            $ids = array_map('intval', $select->fetchAll(PDO::FETCH_COLUMN));
+            sort($ids);
+            return $this->deletePacketRowsByIds($table, $pkColumn, $ids);
+        }
+
         $limitClause = $backend === 'mysql' ? ' LIMIT 1000' : '';
         if ($backend === 'sqlite') {
             $whereClause = preg_replace('/\s+ORDER\s+BY\s+\S+(\s+(ASC|DESC))?\s*$/i', '', $whereClause);

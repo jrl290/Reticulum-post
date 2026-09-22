@@ -34,7 +34,7 @@ trait RequestInterfaceRuntimeTrait
         $insert->bindValue(':state_key', 'identity_hash_hex', PDO::PARAM_STR);
         $insert->bindValue(':state_value', $identityHashHex, PDO::PARAM_STR);
         $insert->bindValue(':updated_at', time(), PDO::PARAM_INT);
-        $insert->execute();
+        Database::executeWithRetry($insert, 'seedTransportState');
 
         return $identityHashHex;
     }
@@ -74,7 +74,7 @@ trait RequestInterfaceRuntimeTrait
             $replaceStmt->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
             $replaceStmt->bindValue(':dest_hash_hex', $destinationHashHex, PDO::PARAM_STR);
             $replaceStmt->bindValue(':queue_reason', 'relay_announce', PDO::PARAM_STR);
-            $replaceStmt->execute();
+            Database::executeWithRetry($replaceStmt, 'replaceQueuedAnnounce');
             $replaced = $replaceStmt->rowCount() > 0;
         }
 
@@ -116,7 +116,7 @@ trait RequestInterfaceRuntimeTrait
             $stmt->bindValue(':packet_base64', $wrappedPacketBase64, PDO::PARAM_STR);
             $stmt->bindValue(':queued_at', time(), PDO::PARAM_INT);
             $stmt->bindValue(':queue_reason', $reason, PDO::PARAM_STR);
-            $stmt->execute();
+            Database::executeWithRetry($stmt, 'queueOutboundPacket');
         }
 
         // Cap pending outbound per interface at 256. Drop oldest unissued entries.
@@ -135,16 +135,32 @@ trait RequestInterfaceRuntimeTrait
         $minKeepId = $minIdStmt->fetchColumn();
 
         if ($minKeepId !== false && $minKeepId !== null) {
-            $delStmt = $this->db->prepare(
-                'DELETE FROM outbound_packets
+            // Find the rows, then delete by primary key ascending: the one
+            // lock order for the packet tables (see deleteSingleBatch). This
+            // range DELETE, driven by the delivered_batch_id index, was one of
+            // the two partners in every `requeueOutboundPackets` deadlock -
+            // and it ran bare on the request path, so an unretried 1213
+            // would have failed the exchange.
+            $idStmt = $this->db->prepare(
+                'SELECT packet_id FROM outbound_packets
                  WHERE interface_id = :del_iface
                    AND acked_at IS NULL
                    AND delivered_batch_id IS NULL
-                   AND packet_id < :min_id'
+                   AND packet_id < :min_id
+                 ORDER BY packet_id'
             );
-            $delStmt->bindValue(':del_iface', $interfaceId, PDO::PARAM_STR);
-            $delStmt->bindValue(':min_id', (int) $minKeepId, PDO::PARAM_INT);
-            $delStmt->execute();
+            $idStmt->bindValue(':del_iface', $interfaceId, PDO::PARAM_STR);
+            $idStmt->bindValue(':min_id', (int) $minKeepId, PDO::PARAM_INT);
+            $idStmt->execute();
+            $dropIds = array_map('intval', $idStmt->fetchAll(PDO::FETCH_COLUMN));
+            if ($dropIds !== []) {
+                $placeholders = implode(',', array_fill(0, count($dropIds), '?'));
+                $delStmt = $this->db->prepare("DELETE FROM outbound_packets WHERE packet_id IN ({$placeholders})");
+                foreach ($dropIds as $i => $id) {
+                    $delStmt->bindValue($i + 1, $id, PDO::PARAM_INT);
+                }
+                Database::executeWithRetry($delStmt, 'capOutboundQueue');
+            }
         }
 
         if ($currentExchangeInterfaceId !== null && $currentExchangeInterfaceId === $interfaceId) {
@@ -233,7 +249,7 @@ trait RequestInterfaceRuntimeTrait
         $stmt->bindValue(':queue_reason', $reason, PDO::PARAM_STR);
         $stmt->bindValue(':queued_packet_count', $pendingPacketCount, PDO::PARAM_INT);
         $stmt->bindValue(':created_at', time(), PDO::PARAM_INT);
-        $stmt->execute();
+        Database::executeWithRetry($stmt, 'queueWakeEvent');
     }
 
     /**

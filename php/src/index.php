@@ -1682,7 +1682,6 @@ final class HttpApi
                 $this->runInterfaceRequestEpilogue();
                 $t5 = microtime(true);
 
-                try { $this->dispatchWakes(); } catch (\Throwable $e) {}
 
                 $this->respond(200, [
                     'status' => 'accepted',
@@ -1742,7 +1741,6 @@ final class HttpApi
                 $acked = $this->storage->acknowledgeOutboundBatches($interfaceId, $ackBatchIds);
                 $batch = $this->storage->fetchOutboundBatch($interfaceId, $maxPackets);
                 $this->runInterfaceRequestEpilogue();
-                try { $this->dispatchWakes(); } catch (\Throwable $e) {}
 
                 $this->respond(200, [
                     'status' => 'ok',
