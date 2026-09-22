@@ -223,21 +223,7 @@ trait RequestRelayRoutingTrait
         ?int $remainingHops = null
     ): ?array {
         $now = time();
-        // A negative remaining_hops is "no hop expectation" (a LINKREQUEST
-        // delivered to a LOCAL destination, request_inbound_batch_trait.php).
-        // Until 2026-09-22 the exact filter here could never match that row,
-        // so every LRPROOF from a browser fell through to the reverse-path
-        // fallback, which recorded a second entry whose taken_hops was the
-        // proof's hop count; the initiator's link data (observed hops = the
-        // LINKREQUEST's) then failed linkTransportTargetInterfaceId's
-        // taken-hops check and was dropped on the floor. Prefer an exact
-        // match, then the local entry.
-        $hopClause = $remainingHops === null
-            ? ''
-            : ' AND (lte.remaining_hops = :remaining_hops OR lte.remaining_hops < 0)';
-        $hopOrder = $remainingHops === null
-            ? ''
-            : ' ORDER BY CASE WHEN lte.remaining_hops < 0 THEN 1 ELSE 0 END';
+        $hopClause = $remainingHops === null ? '' : ' AND lte.remaining_hops = :remaining_hops';
         $stmt = $this->db->prepare(
                         "SELECT lte.*
                          FROM link_transport_entries AS lte
@@ -251,7 +237,7 @@ trait RequestRelayRoutingTrait
                              AND (
                                   (lte.proof_expires_at IS NOT NULL AND lte.proof_expires_at >= :now)
                                OR (lte.proof_expires_at IS NULL AND lte.updated_at >= :active_after)
-                             ){$hopOrder}"
+                             )"
         );
         $stmt->bindValue(':link_id_hex', $linkIdHex, PDO::PARAM_STR);
         $stmt->bindValue(':outbound_interface_id', $outboundInterfaceId, PDO::PARAM_STR);
@@ -704,7 +690,7 @@ trait RequestRelayRoutingTrait
         //   if packet.hops != remaining_hops { ... return; }
         // See HOPS.md §5 Bugs #1, #2.
         $expectedHops = (int) ($linkEntry['remaining_hops'] ?? -1);
-        if ($expectedHops >= 0 && $observedHops !== $expectedHops) {
+        if ($observedHops !== $expectedHops) {
             error_log("[LRPROOF-DROP] linkId=" . substr($linkIdHex,0,12)
                 . " hop_mismatch: observed=$observedHops expected=$expectedHops");
             return 0;
@@ -717,9 +703,9 @@ trait RequestRelayRoutingTrait
 
         $relayPacketBase64 = $this->proofRelayPacketBase64($rawBase64, $packet);
         $this->queueOutboundPacket((string) $linkEntry['received_interface_id'], $relayPacketBase64, 'lrproof_relay', $sourceInterfaceId);
-        // Validate the row that matched, by ITS remaining_hops: for a local
-        // destination that is -1, not the proof's observed hop count.
-        $this->touchLinkTransportEntry($linkIdHex, $sourceInterfaceId, true, (int) ($linkEntry['remaining_hops'] ?? $observedHops));
+        // Validate the row that matched, by ITS remaining_hops (the key the
+        // exact gate above just checked), so only that row is touched.
+        $this->touchLinkTransportEntry($linkIdHex, $sourceInterfaceId, true, $expectedHops);
 
         return 1;
     }
@@ -770,8 +756,8 @@ trait RequestRelayRoutingTrait
         // Exact hop matching — aligns with Python Transport.py:1593-1617
         // and Rust transport.rs:5125-5130 (directional hop match).
         // See HOPS.md §5 Bug #4.
-        $remOk = $remainingHops < 0 || $observedHops === $remainingHops;
-        $tknOk = $takenHops < 0 || $observedHops === $takenHops;
+        $remOk = $observedHops === $remainingHops;
+        $tknOk = $observedHops === $takenHops;
 
         if ($outboundInterfaceId === $receivedInterfaceId) {
             if ($remOk || $tknOk) {

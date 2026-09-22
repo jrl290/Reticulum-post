@@ -287,20 +287,17 @@ trait RequestInboundBatchTrait
             $destinationHashHex = (string) ($packet['destination_hash_hex'] ?? '');
             $linkIdHex = $this->linkIdHex($rawBase64, $packet);
             if ($linkIdHex !== null && $linkIdHex !== '') {
-                // The destination is LOCAL, so this entry exists only to route
-                // the link's later packets between the two interfaces. It
-                // carries NO hop expectation: the reference never creates a
-                // link_table entry for a local destination at all
-                // (Transport.py:2028-2054 hands the LINKREQUEST straight to
-                // destination.receive), so its LRPROOF is never subjected to
-                // the exact-hop gate (Transport.py:2106-2113, guarded on the
-                // entry existing). Reading remaining_hops from the path table
-                // here - HOPS.md Bug #6's rule, which is right for TRANSIT -
-                // stored a stale relay distance (3) for a destination one hop
-                // away, and the returning proof (observed 1) was dropped as a
-                // hop mismatch. A negative value is "do not check" at both
-                // read sites (request_relay_routing_trait.php:693, :757).
-                $remainingHops = -1;
+                // The destination is a LOCAL client, directly attached: its
+                // packets arrive with hops 0 and the inbound step counts them
+                // as 1, which is what the reference's path table holds for a
+                // directly attached next hop. So the browser's LRPROOF arrives
+                // observed 1, and 1 is the remaining_hops it must match - the
+                // same exact gate a transit entry gets (Transport.py link_table
+                // has no "don't check" mode). Do NOT read the path table here:
+                // a stale relay path once stored 3 for a destination one hop
+                // away and the proof was dropped (88ec642 fixed that with a -1
+                // "no expectation" sentinel, which the reference does not have).
+                $remainingHops = 1;
                 $takenHops = $this->transportObservedHops($packet);
                 $nextHopHex = $destinationHashHex;
                 $this->rememberLinkTransportEntry(

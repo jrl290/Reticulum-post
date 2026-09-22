@@ -2,16 +2,20 @@
 /**
  * A link initiated from OUTSIDE to a browser on this node, on the real SQL.
  *
+ * The LINKREQUEST is delivered locally and its link entry carries
+ * remaining_hops = 1: the browser is a directly attached client, so its
+ * LRPROOF arrives observed 1 and must match exactly, the same gate a transit
+ * entry gets (the reference link_table has no "don't check" mode).
+ *
  * 2026-09-22, retichat.com: an Android app opened a link to a browser here.
- * The LINKREQUEST (observed 7 hops) was delivered locally and recorded with
- * remaining_hops = -1 ("no expectation", commit 88ec642). The browser's LRPROOF
- * (observed 1) was looked up with `remaining_hops = 1`, which a -1 row can
- * never satisfy, so it fell to the reverse-path fallback: the proof went out,
- * but a SECOND row (taken_hops = 1) was written and the original never
- * validated. The phone's LRRTT and LXMF data (observed 7) then failed the
- * taken-hops check on the fallback row and were dropped without a trace.
- * hops_test.php's mock had hidden the filter; this test uses the trait's own
- * queries on an in-memory SQLite so the SQL itself is what is asserted.
+ * The entry was then recorded with a -1 "no expectation" sentinel (88ec642),
+ * which the exact `remaining_hops = 1` lookup could never match, so the
+ * browser's LRPROOF fell to the reverse-path fallback: the proof went out, but
+ * a SECOND row (taken_hops = 1) was written and the original never validated.
+ * The phone's LRRTT and LXMF data (observed 7) then failed the taken-hops check
+ * on the fallback row and were dropped without a trace. hops_test.php's mock
+ * had hidden the filter; this test uses the trait's own queries on an
+ * in-memory SQLite so the SQL itself is what is asserted.
  *
  * Run: php tests/local_link_relay_sql_test.php
  */
@@ -153,8 +157,8 @@ check('delivered locally', $r->t_deliverLocally($GATEWAY, $lrRaw, $lr) === true)
 check('LINKREQUEST queued to the browser as local_delivery', ($r->queued[0]['interface_id'] ?? '') === $BROWSER && ($r->queued[0]['reason'] ?? '') === 'local_delivery');
 $rows = $r->linkRows($linkId);
 check('one link entry', count($rows) === 1, json_encode($rows));
-check('entry: remaining_hops = -1, taken_hops = 7, gateway -> browser',
-    (int) $rows[0]['remaining_hops'] === -1 && (int) $rows[0]['taken_hops'] === 7
+check('entry: remaining_hops = 1, taken_hops = 7, gateway -> browser',
+    (int) $rows[0]['remaining_hops'] === 1 && (int) $rows[0]['taken_hops'] === 7
     && $rows[0]['received_interface_id'] === $GATEWAY && $rows[0]['outbound_interface_id'] === $BROWSER, json_encode($rows));
 
 echo "── 2. LRPROOF from the browser (1 hop) ──\n";
@@ -166,6 +170,18 @@ check('LRPROOF went to the gateway via the link entry (lrproof_relay)',
 $rows = $r->linkRows($linkId);
 check('still one link entry (no fallback duplicate)', count($rows) === 1, json_encode($rows));
 check('the entry is validated', (int) ($rows[0]['validated'] ?? 0) === 1, json_encode($rows));
+
+echo "── 2b. a browser LRPROOF with 2 hops on a local entry is dropped (separate router) ──\n";
+$rb = new SqlLinkRouter();
+$rb->addInterface($GATEWAY);
+$rb->addInterface($BROWSER);
+$rb->addLocalDestination($dest, $BROWSER);
+check('delivered locally (separate router)', $rb->t_deliverLocally($GATEWAY, $lrRaw, $lr) === true);
+$rb->queued = [];
+[$pf2, $pf2Raw] = pkt(['packet_type' => 3, 'context' => 0xFF, 'destination_type' => 2, 'hops' => 2, 'destination_hash_hex' => $linkId], 99);
+check('2-hop LRPROOF on a remaining=1 local entry is dropped', $rb->t_lrproof($BROWSER, $pf2Raw, $pf2) === 0 && $rb->queued === [], json_encode($rb->queued));
+$rowsB = $rb->linkRows($linkId);
+check('the local entry stays unvalidated and alone', count($rowsB) === 1 && (int) $rowsB[0]['validated'] === 0, json_encode($rowsB));
 
 echo "── 3. LRRTT and LXMF data from the gateway (7 hops) reach the browser ──\n";
 foreach ([0xFE => 'LRRTT', 0x00 => 'data'] as $ctx => $what) {
