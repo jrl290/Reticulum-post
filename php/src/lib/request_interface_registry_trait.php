@@ -222,6 +222,34 @@ trait RequestInterfaceRegistryTrait
         $stmt->execute();
     }
 
+    /**
+     * The client's goodbye (POST /v1/interfaces/goodbye, sent as a beacon on
+     * pagehide): the interface is marked offline now, and the local
+     * destinations and paths registered through it are dropped now — exactly
+     * what the stale sweep would do interface_stale_after_seconds later
+     * (300 s on retichat.com), during which a closed tab kept capturing direct
+     * delivery for its destinations. Idempotent; the sweep remains the backstop
+     * for pages that never get to say goodbye. Returns what was dropped.
+     */
+    public function goodbyeInterface(string $interfaceId): array
+    {
+        $now = time();
+        $stmt = $this->db->prepare(
+            "UPDATE interfaces SET status = 'offline', updated_at = :now WHERE interface_id = :interface_id"
+        );
+        $stmt->bindValue(':now', $now, PDO::PARAM_INT);
+        $stmt->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
+        $stmt->execute();
+        $dropped = ['local_destinations' => 0, 'path_entries' => 0];
+        foreach (array_keys($dropped) as $table) {
+            $del = $this->db->prepare("DELETE FROM {$table} WHERE interface_id = :interface_id");
+            $del->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
+            $del->execute();
+            $dropped[$table] = $del->rowCount();
+        }
+        return $dropped;
+    }
+
     private function interfaceBitrate(string $interfaceId): ?int
     {
         $stmt = $this->db->prepare('SELECT bitrate FROM interfaces WHERE interface_id = :interface_id');

@@ -1644,6 +1644,17 @@ final class HttpApi
                 $this->respond(200, $response);
             }
 
+            if ($method === 'POST' && $path === '/v1/interfaces/goodbye') {
+                // A page going away (pagehide beacon). Authenticate like an
+                // exchange, then release the registration immediately instead
+                // of holding it until the stale sweep.
+                $body = $this->readJsonBody();
+                [$interfaceId, $sessionToken] = $this->requireInterfaceCredentials($body);
+                $this->storage->authenticateInterface($interfaceId, $sessionToken);
+                $dropped = $this->storage->goodbyeInterface($interfaceId);
+                $this->respond(200, ['status' => 'offline', 'interface_id' => $interfaceId, 'dropped' => $dropped]);
+            }
+
             if ($method === 'POST' && ($path === '/v1/interfaces/exchange' || $path === '/v1/interfaces/tx')) {
                 $t0 = microtime(true);
                 $body = $this->readJsonBody();
