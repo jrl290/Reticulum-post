@@ -51,10 +51,27 @@ class MockRouter
         return $this->pathTable[$destinationHashHex] ?? null;
     }
 
-    public function linkTransportEntryForOutbound(string $linkIdHex, string $outboundInterfaceId): ?array
+    /**
+     * Mirrors the SQL in request_relay_routing_trait.php: an unvalidated row
+     * for this link and outbound interface whose remaining_hops is the
+     * observed count, OR is negative ("no expectation": a LOCAL destination).
+     * Until 2026-09-22 this mock ignored $remainingHops entirely and hid the
+     * fact that the real query could never match the -1 row.
+     */
+    public function linkTransportEntryForOutbound(string $linkIdHex, string $outboundInterfaceId, ?int $remainingHops = null): ?array
     {
         $key = "$linkIdHex::$outboundInterfaceId";
-        return $this->linkTransportTable[$key] ?? null;
+        $entry = $this->linkTransportTable[$key] ?? null;
+        if ($entry === null || (int) ($entry['validated'] ?? 0) !== 0) {
+            return null;
+        }
+        if ($remainingHops !== null) {
+            $stored = (int) ($entry['remaining_hops'] ?? 0);
+            if ($stored >= 0 && $stored !== $remainingHops) {
+                return null;
+            }
+        }
+        return $entry;
     }
 
     public function linkTransportEntries(string $linkIdHex, bool $validatedOnly = false): array
@@ -80,7 +97,21 @@ class MockRouter
         return false;
     }
 
-    public function touchLinkTransportEntry(string $linkIdHex, string $outboundInterfaceId, ?bool $validated = null): void {}
+    public function touchLinkTransportEntry(string $linkIdHex, string $outboundInterfaceId, ?bool $validated = null, ?int $remainingHops = null): void
+    {
+        // Same WHERE clause as the SQL: the row is only touched when its
+        // remaining_hops equals the one passed (if any).
+        $key = "$linkIdHex::$outboundInterfaceId";
+        if (!isset($this->linkTransportTable[$key])) {
+            return;
+        }
+        if ($remainingHops !== null && (int) ($this->linkTransportTable[$key]['remaining_hops'] ?? 0) !== $remainingHops) {
+            return;
+        }
+        if ($validated !== null) {
+            $this->linkTransportTable[$key]['validated'] = $validated ? 1 : 0;
+        }
+    }
     public function deleteLinkTransportEntries(string $linkIdHex): void {}
 
     public function peekReversePath(string $truncatedHashHex, string $outboundInterfaceId): ?array
@@ -526,129 +557,83 @@ assertTrue('link transport entry created for local delivery', $entry !== null);
 // answer; the reference has no number here at all.
 assertEq('remaining_hops carries no expectation for a local destination (-1)', -1, $entry['remaining_hops'] ?? 0);
 assertEq('taken_hops = observed hops (1)', 1, $entry['taken_hops'] ?? -1);
-
-// ══════════════════════════════════════════════════════════════════════════
-// Test 6: LRPROOF relay with exact hop match
-// ══════════════════════════════════════════════════════════════════════════
-
-echo "\n── Test 6: LRPROOF exact hop check ──\n";
-
-$router3 = new MockRouter();
-$linkIdHex = 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee';
-$router3->linkTransportTable["$linkIdHex::iface_nas"] = [
-    'link_id_hex' => $linkIdHex,
-    'received_interface_id' => 'iface_browser',
-    'outbound_interface_id' => 'iface_nas',
-    'next_hop_hex' => '22222222222222222222222222222222',
-    'remaining_hops' => 2,
-    'taken_hops' => 1,
-    'destination_hash_hex' => $linkIdHex,
-    'validated' => 0,
-];
-
-// LRPROOF with correct hops (2 = remaining_hops) → should relay
-$pkt = makePacket(['packet_type' => 3, 'context' => 0xFF, 'hops' => 2, 'destination_hash_hex' => $linkIdHex]);
-$rawB64 = makeRawBase64($pkt);
-$ref = new ReflectionMethod($router3, 'relayLinkRequestProofPacket');
-$ref->setAccessible(true);
-$result = $ref->invoke($router3, 'iface_nas', $rawB64, $pkt);
-assertEq('LRPROOF hops=2 match remaining=2 → relayed (count=1)', 1, $result);
-assertTrue('relayed to browser iface', count($router3->outboundQueue) > 0 && ($router3->outboundQueue[0]['interface_id'] ?? '') === 'iface_browser');
-
-// LRPROOF with wrong hops (3 != remaining_hops=2) → dropped
-$router3->outboundQueue = [];
-$pkt = makePacket(['packet_type' => 3, 'context' => 0xFF, 'hops' => 3, 'destination_hash_hex' => $linkIdHex]);
-$rawB64 = makeRawBase64($pkt);
-$result = $ref->invoke($router3, 'iface_nas', $rawB64, $pkt);
-assertEq('LRPROOF hops=3 ≠ remaining=2 → dropped (count=0)', 0, $result);
-assertTrue('outbound queue empty', count($router3->outboundQueue) === 0);
-
-// LRPROOF with hops=1 (was the special case '$observedHops !== 1' in old code) → dropped
-$router3->outboundQueue = [];
-$pkt = makePacket(['packet_type' => 3, 'context' => 0xFF, 'hops' => 1, 'destination_hash_hex' => $linkIdHex]);
-$rawB64 = makeRawBase64($pkt);
-$result = $ref->invoke($router3, 'iface_nas', $rawB64, $pkt);
-assertEq('LRPROOF hops=1 (was old $observedHops !== 1 special case) → dropped', 0, $result);
-assertTrue('outbound queue empty after hops=1 drop', count($router3->outboundQueue) === 0);
-
-// ══════════════════════════════════════════════════════════════════════════
-// Test 7: PLAIN/GROUP filter rejects hops > 1 AFTER inbound increment
-// ══════════════════════════════════════════════════════════════════════════
-
-echo "\n── Test 7: Filter rejects multi-hop PLAIN/GROUP ──\n";
-
-$router4 = new MockRouter();
-$ref = new ReflectionMethod($router4, 'applyPacketFilter');
-$ref->setAccessible(true);
-
-[$status, $reason] = $ref->invoke($router4, makePacket(['destination_type' => 2, 'packet_type' => 0, 'hops' => 2]));
-assertEq('PLAIN hops=2 → rejected', 'rejected', $status);
-assertEq('rejection reason', 'plain_hops_exceeded', $reason);
-
-[$status, $reason] = $ref->invoke($router4, makePacket(['destination_type' => 2, 'packet_type' => 0, 'hops' => 1]));
-assertEq('PLAIN hops=1 → accepted', 'accepted', $status);
-
-[$status, $reason] = $ref->invoke($router4, makePacket(['destination_type' => 1, 'packet_type' => 0, 'hops' => 2]));
-assertEq('GROUP hops=2 → rejected', 'rejected', $status);
-assertEq('rejection reason', 'group_hops_exceeded', $reason);
-
-[$status, $reason] = $ref->invoke($router4, makePacket(['destination_type' => 1, 'packet_type' => 0, 'hops' => 1]));
-assertEq('GROUP hops=1 → accepted', 'accepted', $status);
-
-// ══════════════════════════════════════════════════════════════════════════
-// Test 8: Local LINKREQUEST link entry carries no hop expectation (-1),
-//         as the reference gates no local-destination proof on hops
-// ══════════════════════════════════════════════════════════════════════════
-
-echo "\n── Test 8: Local LINKREQUEST remaining_hops ignores path table ──\n";
-
-$router5 = new MockRouter();
-$destHex = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab';
-$linkIdHex = '11111111111111111111111111111111';
-
-// Simulate a stale path table entry (announce propagated 3 hops)
-$router5->pathTable[$destHex] = [
-    'hops' => 3,
-    'next_hop_hex' => '22222222222222222222222222222222',
-    'interface_id' => 'iface_bridge',
-];
-
-// Register the destination as local (browser client)
-$router5->localDestinations[$destHex] = 'iface_browser';
-
-// Override linkIdHex to return a fixed value
-$router5->linkIdHexReturn = $linkIdHex;
-
-$pkt = makePacket([
-    'packet_type' => 2,       // LINKREQUEST
-    'hops' => 1,              // post-inbound (arrived from NAS with hops=0, +1)
-    'destination_hash_hex' => $destHex,
-    'truncated_hash_hex' => substr($linkIdHex, 0, 16),
-]);
-$rawB64 = makeRawBase64($pkt);
-
-$ref = new ReflectionMethod($router5, 'deliverLocallyIfKnown');
-$ref->setAccessible(true);
-$result = $ref->invoke($router5, 'iface_bridge', $rawB64, $pkt);
-assertTrue('deliverLocallyIfKnown returned true', $result === true);
-
-// Key is {linkIdHex}::{outbound_interface_id}
-$linkKey = "$linkIdHex::iface_browser";
-$entry = $router5->linkTransportTable[$linkKey] ?? null;
-assertTrue('link transport entry created for local delivery', $entry !== null);
-
-// Resolved 2026-09-22. The reference creates NO link_table entry for a local
-// destination (Transport.py:2028-2054 hands the LINKREQUEST straight to
-// destination.receive) and so never applies the exact-hop gate to its LRPROOF
-// (Transport.py:2106-2113 is guarded on the entry existing). The PHP keeps an
-// entry for routing between the two interfaces, with no hop expectation: -1 is
-// "do not check" at both read sites. Neither the path table's 3 (HOPS.md Bug
-// #6, which is right for TRANSIT) nor the observed 1 is the reference's
-// answer; the reference has no number here at all.
-assertEq('remaining_hops carries no expectation for a local destination (-1)', -1, $entry['remaining_hops'] ?? 0);
-assertEq('taken_hops = observed hops (1)', 1, $entry['taken_hops'] ?? -1);
 assertEq('received_interface is bridge', 'iface_bridge', $entry['received_interface_id'] ?? '');
 assertEq('outbound_interface is browser', 'iface_browser', $entry['outbound_interface_id'] ?? '');
+
+// ══════════════════════════════════════════════════════════════════════════
+// Test 9: a link INITIATED FROM OUTSIDE to a local browser, end to end
+// ══════════════════════════════════════════════════════════════════════════
+//
+// 2026-09-22, retichat.com: the Android app opened a link to a browser on the
+// node (LINKREQUEST observed 7 hops, entry remaining=-1 taken=7). The browser's
+// LRPROOF (observed 1) did not match the entry — the lookup filtered on
+// remaining_hops = 1 — and fell to the reverse-path fallback, which relayed the
+// proof but recorded a SECOND entry with taken_hops = 1. The phone's LRRTT and
+// its LXMF data (observed 7) then failed the taken-hops check on that entry and
+// were dropped without a trace; the sender saw a delivery-proof timeout and
+// fell back to propagation. Test 8 could not see this: the mock ignored the
+// hop filter. Now it mirrors the SQL, and this test walks the whole exchange.
+
+echo "\n── Test 9: outside-initiated link to a local browser round-trips ──\n";
+
+$router6 = new MockRouter();
+$destHex = 'b42714bda794d70a05dd70ce6140f59a';
+$linkIdHex = '35411bbc80c2c3dcaa1e794ed0665e99';
+$router6->localDestinations[$destHex] = 'iface_browser';
+$router6->linkIdHexReturn = $linkIdHex;
+
+// 1. LINKREQUEST arrives from the gateway, 7 hops away.
+$lr = makePacket([
+    'packet_type' => 2, 'hops' => 7,
+    'destination_hash_hex' => $destHex,
+    'truncated_hash_hex' => 'ffffffffffffffffffffffffffffffff',
+]);
+$ref = new ReflectionMethod($router6, 'deliverLocallyIfKnown');
+$ref->setAccessible(true);
+assertTrue('LINKREQUEST delivered locally', $ref->invoke($router6, 'iface_gateway', makeRawBase64($lr), $lr) === true);
+$entry = $router6->linkTransportTable["$linkIdHex::iface_browser"] ?? null;
+assertTrue('link entry exists', $entry !== null);
+assertEq('entry: no hop expectation', -1, $entry['remaining_hops'] ?? 0);
+assertEq('entry: taken_hops = 7', 7, $entry['taken_hops'] ?? 0);
+
+// 2. LRPROOF comes back from the browser, 1 hop.
+$router6->outboundQueue = [];
+$proof = makePacket(['packet_type' => 3, 'context' => 0xFF, 'hops' => 1, 'destination_hash_hex' => $linkIdHex]);
+$ref = new ReflectionMethod($router6, 'relayLinkRequestProofPacket');
+$ref->setAccessible(true);
+assertEq('LRPROOF relayed (count=1)', 1, $ref->invoke($router6, 'iface_browser', makeRawBase64($proof), $proof));
+assertEq('LRPROOF went to the gateway', 'iface_gateway', $router6->outboundQueue[0]['interface_id'] ?? '');
+assertEq('LRPROOF matched the link entry, not the reverse-path fallback', 'lrproof_relay', $router6->outboundQueue[0]['reason'] ?? '');
+assertEq('the entry is now validated', 1, $router6->linkTransportTable["$linkIdHex::iface_browser"]['validated'] ?? 0);
+assertEq('still exactly one entry for the link', 1, count($router6->linkTransportEntries($linkIdHex)));
+
+// 3. The initiator's LRRTT and data (observed 7 hops) reach the browser.
+$ref = new ReflectionMethod($router6, 'relayLinkTransportPacket');
+$ref->setAccessible(true);
+$should = new ReflectionMethod($router6, 'shouldRelayLinkTransportPacket');
+$should->setAccessible(true);
+foreach ([0xFE => 'LRRTT', 0x00 => 'LXMF data'] as $ctx => $what) {
+    $router6->outboundQueue = [];
+    $pkt = makePacket(['packet_type' => 0, 'destination_type' => 2, 'context' => $ctx, 'hops' => 7, 'destination_hash_hex' => $linkIdHex]);
+    assertTrue("$what from the gateway is a link transport packet", $should->invoke($router6, $pkt) === true);
+    assertEq("$what from the gateway relayed (count=1)", 1, $ref->invoke($router6, 'iface_gateway', makeRawBase64($pkt), $pkt));
+    assertEq("$what reached the browser", 'iface_browser', $router6->outboundQueue[0]['interface_id'] ?? '');
+}
+
+// 4. The browser's reply on the link (observed 1 hop) reaches the initiator.
+$router6->outboundQueue = [];
+$pkt = makePacket(['packet_type' => 0, 'destination_type' => 2, 'context' => 0x00, 'hops' => 1, 'destination_hash_hex' => $linkIdHex]);
+assertEq('browser data relayed (count=1)', 1, $ref->invoke($router6, 'iface_browser', makeRawBase64($pkt), $pkt));
+assertEq('browser data reached the gateway', 'iface_gateway', $router6->outboundQueue[0]['interface_id'] ?? '');
+
+// 5. A transit entry (remaining=2) still demands the exact count.
+$router7 = new MockRouter();
+$router7->linkTransportTable["$linkIdHex::iface_nas"] = [
+    'link_id_hex' => $linkIdHex, 'received_interface_id' => 'iface_browser', 'outbound_interface_id' => 'iface_nas',
+    'next_hop_hex' => $destHex, 'remaining_hops' => 2, 'taken_hops' => 1, 'destination_hash_hex' => $destHex, 'validated' => 0,
+];
+$proof = makePacket(['packet_type' => 3, 'context' => 0xFF, 'hops' => 3, 'destination_hash_hex' => $linkIdHex]);
+assertEq('transit LRPROOF with the wrong hop count is still dropped', 0, $ref = (new ReflectionMethod($router7, 'relayLinkRequestProofPacket'))->invoke($router7, 'iface_nas', makeRawBase64($proof), $proof));
 
 // ══════════════════════════════════════════════════════════════════════════
 // Report

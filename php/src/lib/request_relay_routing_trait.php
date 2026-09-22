@@ -223,7 +223,21 @@ trait RequestRelayRoutingTrait
         ?int $remainingHops = null
     ): ?array {
         $now = time();
-        $hopClause = $remainingHops === null ? '' : ' AND lte.remaining_hops = :remaining_hops';
+        // A negative remaining_hops is "no hop expectation" (a LINKREQUEST
+        // delivered to a LOCAL destination, request_inbound_batch_trait.php).
+        // Until 2026-09-22 the exact filter here could never match that row,
+        // so every LRPROOF from a browser fell through to the reverse-path
+        // fallback, which recorded a second entry whose taken_hops was the
+        // proof's hop count; the initiator's link data (observed hops = the
+        // LINKREQUEST's) then failed linkTransportTargetInterfaceId's
+        // taken-hops check and was dropped on the floor. Prefer an exact
+        // match, then the local entry.
+        $hopClause = $remainingHops === null
+            ? ''
+            : ' AND (lte.remaining_hops = :remaining_hops OR lte.remaining_hops < 0)';
+        $hopOrder = $remainingHops === null
+            ? ''
+            : ' ORDER BY CASE WHEN lte.remaining_hops < 0 THEN 1 ELSE 0 END';
         $stmt = $this->db->prepare(
                         "SELECT lte.*
                          FROM link_transport_entries AS lte
@@ -237,7 +251,7 @@ trait RequestRelayRoutingTrait
                              AND (
                                   (lte.proof_expires_at IS NOT NULL AND lte.proof_expires_at >= :now)
                                OR (lte.proof_expires_at IS NULL AND lte.updated_at >= :active_after)
-                             )"
+                             ){$hopOrder}"
         );
         $stmt->bindValue(':link_id_hex', $linkIdHex, PDO::PARAM_STR);
         $stmt->bindValue(':outbound_interface_id', $outboundInterfaceId, PDO::PARAM_STR);
@@ -703,7 +717,9 @@ trait RequestRelayRoutingTrait
 
         $relayPacketBase64 = $this->proofRelayPacketBase64($rawBase64, $packet);
         $this->queueOutboundPacket((string) $linkEntry['received_interface_id'], $relayPacketBase64, 'lrproof_relay', $sourceInterfaceId);
-        $this->touchLinkTransportEntry($linkIdHex, $sourceInterfaceId, true, $observedHops);
+        // Validate the row that matched, by ITS remaining_hops: for a local
+        // destination that is -1, not the proof's observed hop count.
+        $this->touchLinkTransportEntry($linkIdHex, $sourceInterfaceId, true, (int) ($linkEntry['remaining_hops'] ?? $observedHops));
 
         return 1;
     }
