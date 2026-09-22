@@ -287,10 +287,22 @@ trait RequestInboundBatchTrait
             $destinationHashHex = (string) ($packet['destination_hash_hex'] ?? '');
             $linkIdHex = $this->linkIdHex($rawBase64, $packet);
             if ($linkIdHex !== null && $linkIdHex !== '') {
-                $path = $this->usablePathEntry($destinationHashHex);
-                $remainingHops = $path !== null ? (int) ($path['hops'] ?? 0) : $this->transportObservedHops($packet);
+                // The destination is LOCAL, so this entry exists only to route
+                // the link's later packets between the two interfaces. It
+                // carries NO hop expectation: the reference never creates a
+                // link_table entry for a local destination at all
+                // (Transport.py:2028-2054 hands the LINKREQUEST straight to
+                // destination.receive), so its LRPROOF is never subjected to
+                // the exact-hop gate (Transport.py:2106-2113, guarded on the
+                // entry existing). Reading remaining_hops from the path table
+                // here - HOPS.md Bug #6's rule, which is right for TRANSIT -
+                // stored a stale relay distance (3) for a destination one hop
+                // away, and the returning proof (observed 1) was dropped as a
+                // hop mismatch. A negative value is "do not check" at both
+                // read sites (request_relay_routing_trait.php:693, :757).
+                $remainingHops = -1;
                 $takenHops = $this->transportObservedHops($packet);
-                $nextHopHex = $path !== null ? (string) ($path['next_hop_hex'] ?? $destinationHashHex) : $destinationHashHex;
+                $nextHopHex = $destinationHashHex;
                 $this->rememberLinkTransportEntry(
                     $linkIdHex,
                     $sourceInterfaceId,
