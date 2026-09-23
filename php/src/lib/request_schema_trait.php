@@ -202,7 +202,7 @@ trait RequestSchemaTrait
                     packet_hash_hex VARCHAR(64) DEFAULT NULL,
                     announce_emitted INT NOT NULL DEFAULT 0,
                     updated_at INT NOT NULL DEFAULT 0,
-                    PRIMARY KEY (destination_hash_hex, interface_id)
+                    PRIMARY KEY (destination_hash_hex)
                 ){$engine}",
 
             'known_destinations' => "
@@ -385,7 +385,15 @@ trait RequestSchemaTrait
     private function ensurePrimaryKeys(array &$summary): void
     {
         if ($this->backend !== 'mysql') {
-            return; // SQLite builds the table with the current key already.
+            // SQLite builds tables with the current keys, except for a file
+            // created before 2026-09-23, whose path_entries carried the key
+            // (destination_hash_hex, interface_id). The reference keeps ONE
+            // path per destination and every path upsert conflicts on the
+            // destination alone (production MySQL has that key), so on such
+            // a file every announce failed with "ON CONFLICT clause does not
+            // match any PRIMARY KEY or UNIQUE constraint". Rebuild it.
+            $this->rebuildSqlitePathEntriesKey($summary);
+            return;
         }
 
         try {
@@ -411,6 +419,54 @@ trait RequestSchemaTrait
             if ($code !== 1146) {
                 $summary['errors'][] = 'primary_key link_transport_entries: ' . $e->getMessage();
             }
+        }
+    }
+
+    private function rebuildSqlitePathEntriesKey(array &$summary): void
+    {
+        try {
+            $stmt = $this->db->query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'path_entries'");
+            $sql = $stmt === false ? '' : (string) $stmt->fetchColumn();
+            // The open cursor holds a shared lock; the DDL below needs it gone.
+            if ($stmt !== false) {
+                $stmt->closeCursor();
+            }
+            unset($stmt);
+            if ($sql === '' || !preg_match('/PRIMARY KEY\s*\(\s*destination_hash_hex\s*,\s*interface_id\s*\)/i', $sql)) {
+                return;
+            }
+            $this->db->exec('BEGIN');
+            $this->db->exec('ALTER TABLE path_entries RENAME TO path_entries_old_key');
+            $this->db->exec(
+                'CREATE TABLE path_entries (
+                    destination_hash_hex VARCHAR(64) NOT NULL,
+                    next_hop_hex VARCHAR(32) DEFAULT NULL,
+                    hops INT NOT NULL DEFAULT 0,
+                    expires_at INT NOT NULL DEFAULT 0,
+                    random_blobs_json TEXT,
+                    interface_id VARCHAR(64) NOT NULL,
+                    packet_hash_hex VARCHAR(64) DEFAULT NULL,
+                    announce_emitted INT NOT NULL DEFAULT 0,
+                    updated_at INT NOT NULL DEFAULT 0,
+                    PRIMARY KEY (destination_hash_hex)
+                )'
+            );
+            // Keep the newest row per destination.
+            $this->db->exec(
+                'INSERT INTO path_entries
+                 SELECT destination_hash_hex, next_hop_hex, hops, expires_at, random_blobs_json,
+                        interface_id, packet_hash_hex, announce_emitted, updated_at
+                   FROM path_entries_old_key o
+                  WHERE updated_at = (SELECT MAX(updated_at) FROM path_entries_old_key i
+                                       WHERE i.destination_hash_hex = o.destination_hash_hex)
+                  GROUP BY destination_hash_hex'
+            );
+            $this->db->exec('DROP TABLE path_entries_old_key');
+            $this->db->exec('COMMIT');
+            $summary['indexes_added']++;
+        } catch (PDOException $e) {
+            try { $this->db->exec('ROLLBACK'); } catch (PDOException $ignored) {}
+            $summary['errors'][] = 'primary_key path_entries: ' . $e->getMessage();
         }
     }
 
