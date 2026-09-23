@@ -228,6 +228,12 @@ Creates a HEADER_2 packet with context `0x0B` (PATH_RESPONSE), containing the or
 
 ### 🔴 ISSUE #4: Link ID Confusion — Destination Hash vs. True Link ID
 
+> **2026-09-23:** The reverse-path fallback mentioned below is gone. `relayLinkRequestProofPacket()` now follows RNS 1.5.2 Transport.py:2608-2672: pending entry on the proof's
+> next-hop interface; a signed hop mismatch rebalances remaining_hops and the path hops; then the exact `hops == remaining_hops`
+> gate; the Ed25519 proof signature is validated at the relay (unknown identity or bad signature → drop); relayed as
+> `lrproof_relay`. Local-client entries use remaining_hops = 1. No reverse-path fallback. See php/src/lib/request_relay_routing_trait.php,
+> php/tests/local_link_relay_sql_test.php and php/tests/hops_test.php.
+
 **File:** `php/src/lib/request_relay_routing_trait.php:514-540`
 
 In `rememberLinkTransportRelay`:
@@ -253,6 +259,12 @@ The destination_hash on a LINKREQUEST is the hash of the *target destination*. T
 **Fix:** Use `linkIdHex()` in `rememberLinkTransportRelay` instead of `$destinationHashHex`.
 
 ### 🔴 ISSUE #5: Link Request Proof Validation Uses Wrong Key
+
+> **2026-09-23:** This finding was wrong: upstream transport nodes DO validate the LRPROOF with the destination's long-term Ed25519 key (signed data = link_id . responder X25519 pub . destination Ed25519 pub . signalling). `relayLinkRequestProofPacket()` now follows RNS 1.5.2 Transport.py:2608-2672: pending entry on the proof's
+> next-hop interface; a signed hop mismatch rebalances remaining_hops and the path hops; then the exact `hops == remaining_hops`
+> gate; the Ed25519 proof signature is validated at the relay (unknown identity or bad signature → drop); relayed as
+> `lrproof_relay`. Local-client entries use remaining_hops = 1. No reverse-path fallback. See php/src/lib/request_relay_routing_trait.php,
+> php/tests/local_link_relay_sql_test.php and php/tests/hops_test.php.
 
 **File:** `php/src/lib/request_relay_routing_trait.php:813-835`
 
@@ -403,6 +415,12 @@ The entire PHP transport is "request-operated" — packets only move during auth
 ---
 
 ## Issue Severity Summary
+
+> **2026-09-23:** Issue #5's recommendation is reversed: the relay validates the proof. `relayLinkRequestProofPacket()` now follows RNS 1.5.2 Transport.py:2608-2672: pending entry on the proof's
+> next-hop interface; a signed hop mismatch rebalances remaining_hops and the path hops; then the exact `hops == remaining_hops`
+> gate; the Ed25519 proof signature is validated at the relay (unknown identity or bad signature → drop); relayed as
+> `lrproof_relay`. Local-client entries use remaining_hops = 1. No reverse-path fallback. See php/src/lib/request_relay_routing_trait.php,
+> php/tests/local_link_relay_sql_test.php and php/tests/hops_test.php.
 
 | # | Section | Issue | Severity | Fix Complexity |
 |---|---------|-------|----------|----------------|

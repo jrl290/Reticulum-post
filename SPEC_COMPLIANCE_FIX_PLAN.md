@@ -167,6 +167,12 @@ This fix depends on Fix #1 being applied to `linkIdHex()` first. Without Fix #1,
 
 ## Fix #5 🔴 LRPROOF validation uses wrong key + transport should not validate
 
+> **2026-09-23:** Reversed: upstream relays validate the proof with the destination's long-term Ed25519 key. `relayLinkRequestProofPacket()` now follows RNS 1.5.2 Transport.py:2608-2672: pending entry on the proof's
+> next-hop interface; a signed hop mismatch rebalances remaining_hops and the path hops; then the exact `hops == remaining_hops`
+> gate; the Ed25519 proof signature is validated at the relay (unknown identity or bad signature → drop); relayed as
+> `lrproof_relay`. Local-client entries use remaining_hops = 1. No reverse-path fallback. See php/src/lib/request_relay_routing_trait.php,
+> php/tests/local_link_relay_sql_test.php and php/tests/hops_test.php.
+
 **Severity:** High | **File:** `request_relay_routing_trait.php`
 
 ### Root cause

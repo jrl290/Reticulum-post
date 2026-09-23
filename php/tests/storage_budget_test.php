@@ -75,6 +75,13 @@ final class StorageBudgetHarness
             )'
         );
         $this->db->exec(
+            'CREATE TABLE local_destinations (
+                destination_hash_hex TEXT PRIMARY KEY,
+                interface_id TEXT NOT NULL,
+                registered_at INTEGER NOT NULL DEFAULT 0
+            )'
+        );
+        $this->db->exec(
             'CREATE TABLE transport_state (
                 state_key TEXT PRIMARY KEY,
                 state_value TEXT,
@@ -97,6 +104,24 @@ final class StorageBudgetHarness
             'INSERT INTO outbound_packets (packet_id, queued_at, acked_at) VALUES (?, ?, ?)'
         );
         $stmt->execute([$id, $queuedAt, $ackedAt]);
+    }
+
+    public function addKnownDestination(string $destHashHex, int $updatedAt): void
+    {
+        $this->db->prepare('INSERT INTO known_destinations (destination_hash_hex, updated_at) VALUES (:d, :u)')
+            ->execute([':d' => $destHashHex, ':u' => $updatedAt]);
+    }
+
+    public function addLocalDestination(string $destHashHex): void
+    {
+        $this->db->prepare('INSERT INTO local_destinations (destination_hash_hex, interface_id, registered_at) VALUES (:d, :i, :r)')
+            ->execute([':d' => $destHashHex, ':i' => 'iface_browser', ':r' => time()]);
+    }
+
+    /** @return string[] sorted destination hashes still in known_destinations */
+    public function knownDestinationHashes(): array
+    {
+        return $this->db->query('SELECT destination_hash_hex FROM known_destinations ORDER BY destination_hash_hex')->fetchAll(PDO::FETCH_COLUMN);
     }
 
     public function addPathEntry(string $destHashHex, string $packetHashHex, int $expiresAt): void
@@ -286,6 +311,22 @@ for ($id = 2; $id <= 60; $id++) {
 $harness->addPathEntry('deadbeefdeadbeefdeadbeefdeadbeef', 'cached_announce', $now + 604_800);
 $harness->enforce(1, footprint(1_000_000_000));
 check([1], $harness->ids('inbound_packets', 'packet_record_id'), 'the referenced announce survives a total purge');
+
+// ── 8b. An identity with a live path or a local registration is kept ───
+// The LRPROOF relay validates proofs against the destination's identity
+// (2026-09-23); losing the identity while its path lives would drop every
+// link to it until it announces again. Only orphaned identities are pruned.
+$harness = new StorageBudgetHarness();
+$harness->addKnownDestination('cccc', $old);                 // live path below
+$harness->addPathEntry('cccc', 'h3', $now + 604_800);
+$harness->addKnownDestination('dddd', $old);                 // local browser
+$harness->addLocalDestination('dddd');
+$harness->addKnownDestination('eeee', $old);                 // expired path
+$harness->addPathEntry('eeee', 'h4', $now - 10);
+$harness->addKnownDestination('ffff', $old);                 // no path at all
+$harness->enforce(1, footprint(1_000_000_000));
+$kept = $harness->knownDestinationHashes();
+check(['cccc', 'dddd'], $kept, 'identities with a live path or a local registration survive; orphans are pruned');
 
 // ── 9. path_entries is last resort and only touches expired routes ─────
 $harness = new StorageBudgetHarness();

@@ -281,9 +281,11 @@ trait RequestInboundBatchTrait
 
             // Create a link transport entry so that returning LRPROOF,
             // LRRTT and subsequent link-addressed packets are routed
-            // back to the link initiator (NAS). Python reference creates
-            // this unconditionally in Transport.outbound() for all
-            // forwarded LINKREQUESTs, including to local clients.
+            // back to the link initiator. Upstream (RNS 1.5.2) creates the
+            // link_table entry in Transport.inbound() when it forwards a
+            // LINKREQUEST, local clients included (Transport.py:2057-2100),
+            // and relays the returning LRPROOF only after checking its hop
+            // count and signature (:2608-2672; relayLinkRequestProofPacket).
             $destinationHashHex = (string) ($packet['destination_hash_hex'] ?? '');
             $linkIdHex = $this->linkIdHex($rawBase64, $packet);
             if ($linkIdHex !== null && $linkIdHex !== '') {

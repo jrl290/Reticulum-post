@@ -125,6 +125,8 @@ trait RequestStorageBudgetTrait
     {
         $pathEntries = Database::quoteTable($backend, 'path_entries');
         $inboundPackets = Database::quoteTable($backend, 'inbound_packets');
+        $knownDestinations = Database::quoteTable($backend, 'known_destinations');
+        $localDestinations = Database::quoteTable($backend, 'local_destinations');
 
         return [
             // 1. Inbound packet rows are parse diagnostics. Nothing reads them
@@ -190,14 +192,23 @@ trait RequestStorageBudgetTrait
                 'min_age_key' => 'outbound_pending_max_age_seconds',
             ],
 
-            // 6. Learned destination identities. Losing one costs a re-announce,
-            //    not a dropped packet, so this ranks below queued traffic.
+            // 6. Learned destination identities. Since 2026-09-23 the LRPROOF
+            //    relay validates the proof against the destination's identity
+            //    (RNS 1.5.2 Transport.py:2644-2667), so an identity whose path
+            //    is still live is NOT free to lose: without it every link to
+            //    that destination fails until it announces again. Only
+            //    identities with no live path and no local registration are
+            //    eligible; the rest wait for tier 7 to expire their path.
             [
                 'name' => 'known_destinations',
                 'table_name' => 'known_destinations',
-                'table' => Database::quoteTable($backend, 'known_destinations'),
+                'table' => $knownDestinations,
                 'time_column' => 'updated_at',
-                'where' => '1 = 1',
+                'where' => "NOT EXISTS (SELECT 1 FROM {$pathEntries} lp"
+                    . " WHERE lp.destination_hash_hex = {$knownDestinations}.destination_hash_hex"
+                    . " AND lp.expires_at >= :prune_now)"
+                    . " AND NOT EXISTS (SELECT 1 FROM {$localDestinations} ld"
+                    . " WHERE ld.destination_hash_hex = {$knownDestinations}.destination_hash_hex)",
                 'min_age_key' => null,
             ],
 

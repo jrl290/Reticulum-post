@@ -14,6 +14,12 @@ Use this list to confirm the exact fixes that were just made before running full
 
 ### B) PHP local-link/proof routing safeguards
 
+> **2026-09-23:** LRPROOF is routed by the link entry, not reverse-path state. `relayLinkRequestProofPacket()` now follows RNS 1.5.2 Transport.py:2608-2672: pending entry on the proof's
+> next-hop interface; a signed hop mismatch rebalances remaining_hops and the path hops; then the exact `hops == remaining_hops`
+> gate; the Ed25519 proof signature is validated at the relay (unknown identity or bad signature → drop); relayed as
+> `lrproof_relay`. Local-client entries use remaining_hops = 1. No reverse-path fallback. See php/src/lib/request_relay_routing_trait.php,
+> php/tests/local_link_relay_sql_test.php and php/tests/hops_test.php.
+
 - [ ] Local-delivered LINKREQUEST packets still create reverse-path state so LRPROOF has a valid return route.
 - [ ] LRPROOF relay path does not artificially increment hops during relay.
 - [ ] Proof relay packets appear in outbound queue with `queue_reason=proof_relay` and transition to `acked_at` after delivery.

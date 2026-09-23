@@ -66,11 +66,11 @@ trait RequestRelayRoutingTrait
             throw new RuntimeException('Relayed proof raw payload is invalid');
         }
 
-        // Write the current (post-inbound) hop count into the proof.
-        // The NAS Transport needs the correct hop count for its LRPROOF
-        // validation (packet.hops == remaining_hops, exact match).
-        // Python: Transport.py:2103  Rust: transport.rs:5229
-        // See HOPS.md §5 Bug #5.
+        // Write the current (post-inbound) hop count into the proof, as
+        // upstream does before transmitting a transported LRPROOF or link
+        // packet (RNS 1.5.2 Transport.py:2658-2660 and :2154-2156). The next
+        // transport node checks packet.hops == remaining_hops exactly
+        // (Transport.py:2640). See HOPS.md §5 Bug #5.
         $hops = $this->transportObservedHops($packet);
         $forwardedRaw = $raw[0] . chr($hops) . substr($raw, 2);
         return base64_encode($forwardedRaw);
@@ -169,7 +169,11 @@ trait RequestRelayRoutingTrait
         int $takenHops,
         string $destinationHashHex
     ): void {
-        $proofExpiresAt = $this->linkRequestProofExpiresAt($receivedInterfaceId, $remainingHops);
+        // Upstream sizes the extra proof timeout by the NEXT-HOP interface
+        // the LINKREQUEST leaves on (RNS 1.5.2 Transport.py:2061,
+        // extra_link_proof_timeout(outbound_interface)), not the one it
+        // arrived on.
+        $proofExpiresAt = $this->linkRequestProofExpiresAt($outboundInterfaceId, $remainingHops);
         $stmt = $this->db->prepare(Database::upsertSql(
             'INSERT INTO link_transport_entries (
                 link_id_hex,
@@ -217,33 +221,44 @@ trait RequestRelayRoutingTrait
         Database::executeWithRetry($stmt, 'storeLinkTransportEntry');
     }
 
+    /**
+     * The pending (unvalidated, unexpired) link table row for this link id
+     * whose next-hop interface is the one the LRPROOF arrived on.
+     *
+     * There is deliberately NO hop filter: upstream looks the link up by id
+     * alone (RNS 1.5.2 Transport.py:2612-2613) and only then compares hops,
+     * rebalancing on a signed mismatch (:2614-2635) before the exact gate
+     * (:2640). A row is keyed (link_id, outbound_interface, remaining_hops),
+     * so one link can hold several hop-count forks; when it does, the fork
+     * whose remaining_hops equals $observedHops is preferred.
+     */
     private function linkTransportEntryForOutbound(
         string $linkIdHex,
         string $outboundInterfaceId,
-        ?int $remainingHops = null
+        ?int $observedHops = null
     ): ?array {
         $now = time();
-        $hopClause = $remainingHops === null ? '' : ' AND lte.remaining_hops = :remaining_hops';
         $stmt = $this->db->prepare(
                         "SELECT lte.*
                          FROM link_transport_entries AS lte
                          JOIN interfaces AS received_if ON received_if.interface_id = lte.received_interface_id
                          JOIN interfaces AS outbound_if ON outbound_if.interface_id = lte.outbound_interface_id
                          WHERE lte.link_id_hex = :link_id_hex
-                             AND lte.outbound_interface_id = :outbound_interface_id{$hopClause}
+                             AND lte.outbound_interface_id = :outbound_interface_id
                              AND lte.validated = 0
                              AND received_if.status = 'online'
                              AND outbound_if.status = 'online'
                              AND (
                                   (lte.proof_expires_at IS NOT NULL AND lte.proof_expires_at >= :now)
                                OR (lte.proof_expires_at IS NULL AND lte.updated_at >= :active_after)
-                             )"
+                             )
+                         ORDER BY CASE WHEN lte.remaining_hops = :observed_hops THEN 0 ELSE 1 END,
+                                  lte.updated_at DESC
+                         LIMIT 1"
         );
         $stmt->bindValue(':link_id_hex', $linkIdHex, PDO::PARAM_STR);
         $stmt->bindValue(':outbound_interface_id', $outboundInterfaceId, PDO::PARAM_STR);
-        if ($remainingHops !== null) {
-            $stmt->bindValue(':remaining_hops', $remainingHops, PDO::PARAM_INT);
-        }
+        $stmt->bindValue(':observed_hops', $observedHops ?? -1, PDO::PARAM_INT);
         $stmt->bindValue(':now', $now, PDO::PARAM_INT);
         $stmt->bindValue(':active_after', $this->validatedLinkTransportActiveAfter($now), PDO::PARAM_INT);
         $stmt->execute(); $row = $stmt->fetch(PDO::FETCH_ASSOC);
@@ -339,6 +354,61 @@ trait RequestRelayRoutingTrait
             $stmt->bindValue(':remaining_hops', $remainingHops, PDO::PARAM_INT);
         }
         $stmt->execute();
+    }
+
+    /**
+     * ALLOW_LINK_PATH_REBALANCE, RNS 1.5.2 Transport.py:2614-2635: a correctly
+     * signed LRPROOF that arrives on a not-yet-validated entry's next-hop
+     * interface with a different hop count moves the entry's remaining_hops,
+     * and the path-table hops for the entry's destination, to the proof's
+     * count. remaining_hops is part of this table's PRIMARY KEY, so a row
+     * already holding the new value for the same (link, outbound interface)
+     * is removed first. The caller has already checked the signature.
+     */
+    private function rebalanceLinkTransportEntry(array $linkEntry, int $newRemainingHops): void
+    {
+        $linkIdHex = (string) ($linkEntry['link_id_hex'] ?? '');
+        $outboundInterfaceId = (string) ($linkEntry['outbound_interface_id'] ?? '');
+        $oldRemainingHops = (int) ($linkEntry['remaining_hops'] ?? -1);
+        if ($linkIdHex === '' || $outboundInterfaceId === '' || $oldRemainingHops === $newRemainingHops) {
+            return;
+        }
+
+        $delete = $this->db->prepare(
+            'DELETE FROM link_transport_entries
+             WHERE link_id_hex = :link_id_hex
+               AND outbound_interface_id = :outbound_interface_id
+               AND remaining_hops = :new_remaining_hops'
+        );
+        $delete->bindValue(':link_id_hex', $linkIdHex, PDO::PARAM_STR);
+        $delete->bindValue(':outbound_interface_id', $outboundInterfaceId, PDO::PARAM_STR);
+        $delete->bindValue(':new_remaining_hops', $newRemainingHops, PDO::PARAM_INT);
+        Database::executeWithRetry($delete, 'rebalanceLinkTransportEntryCollision');
+
+        $update = $this->db->prepare(
+            'UPDATE link_transport_entries
+             SET remaining_hops = :new_remaining_hops
+             WHERE link_id_hex = :link_id_hex
+               AND outbound_interface_id = :outbound_interface_id
+               AND remaining_hops = :old_remaining_hops'
+        );
+        $update->bindValue(':new_remaining_hops', $newRemainingHops, PDO::PARAM_INT);
+        $update->bindValue(':link_id_hex', $linkIdHex, PDO::PARAM_STR);
+        $update->bindValue(':outbound_interface_id', $outboundInterfaceId, PDO::PARAM_STR);
+        $update->bindValue(':old_remaining_hops', $oldRemainingHops, PDO::PARAM_INT);
+        Database::executeWithRetry($update, 'rebalanceLinkTransportEntry');
+
+        // Upstream: path_entry = path_table.get(link_destination);
+        // if path_entry: path_entry[IDX_PT_HOPS] = packet.hops
+        $destinationHashHex = strtolower((string) ($linkEntry['destination_hash_hex'] ?? ''));
+        if ($destinationHashHex !== '') {
+            $path = $this->db->prepare(
+                'UPDATE path_entries SET hops = :hops WHERE destination_hash_hex = :destination_hash_hex'
+            );
+            $path->bindValue(':hops', $newRemainingHops, PDO::PARAM_INT);
+            $path->bindValue(':destination_hash_hex', $destinationHashHex, PDO::PARAM_STR);
+            Database::executeWithRetry($path, 'rebalancePathEntryHops');
+        }
     }
 
     private function deleteLinkTransportEntries(string $linkIdHex): void
@@ -639,72 +709,89 @@ trait RequestRelayRoutingTrait
         return 1;
     }
 
+    /**
+     * Transport an LRPROOF exactly as RNS 1.5.2 does (Transport.py:2608-2672):
+     *
+     *   1. The link id (the proof's destination hash) must be in the link
+     *      table with a pending row whose next-hop interface is the one the
+     *      proof arrived on. Otherwise it is not transported; upstream then
+     *      tries a local pending link, which this node never holds, so drop.
+     *   2. ALLOW_LINK_PATH_REBALANCE (:2614-2635): if the hop count differs
+     *      from remaining_hops and the signature validates, adopt the proof's
+     *      count for the row and the destination's path entry.
+     *   3. Exact gate (:2640-2641): packet.hops == remaining_hops, on the
+     *      next-hop interface. Otherwise log and drop.
+     *   4. Signature (:2643-2656): the destination identity must be known and
+     *      its Ed25519 key must verify the proof, else drop.
+     *   5. Relay to the interface the LINKREQUEST arrived on, with the
+     *      post-increment hop count written in, and mark the row validated
+     *      (:2657-2662).
+     *
+     * There is no reverse-path fallback upstream, and none here: a fallback
+     * that relayed the proof and wrote a second, already-validated row made
+     * the initiator's later link traffic fail the taken-hops check.
+     */
     private function relayLinkRequestProofPacket(string $sourceInterfaceId, string $rawBase64, array $packet): int
     {
-        // The LRPROOF destination_hash_hex is the truncated hash of the
-        // original LINKREQUEST — use it directly as the link ID.
+        // The LRPROOF destination_hash_hex is the link id (the truncated hash
+        // of the LINKREQUEST's hashable part, signalling bytes stripped).
         $linkIdHex = (string) ($packet['destination_hash_hex'] ?? '');
         if ($linkIdHex === '') {
             return 0;
         }
 
         $observedHops = $this->transportObservedHops($packet);
-        // Select the fork the proof actually came back on. Each hop-count
-        // variant is stored separately, so this still matches exactly.
         $linkEntry = $this->linkTransportEntryForOutbound($linkIdHex, $sourceInterfaceId, $observedHops);
         if ($linkEntry === null) {
-            // Fallback: try reverse-path routing. Some RNS implementations
-            // use a different link ID in the proof than what was stored.
-            $result = $this->relayProofPacket($sourceInterfaceId, $rawBase64, $packet);
-            if ($result > 0) {
-                // The proof was relayed via reverse path. Create a validated
-                // link transport entry keyed by the actual link ID so that
-                // subsequent link-addressed packets (RTT, data, proofs) are
-                // routed through relayLinkTransportPacket, which handles
-                // both directions via linkTransportTargetInterfaceId.
-                $reversePath = $this->peekReversePath($linkIdHex, $sourceInterfaceId);
-                if ($reversePath !== null) {
-                    $receivedIface = (string)($reversePath['received_interface_id'] ?? '');
-                    $outboundIface = (string)($reversePath['outbound_interface_id'] ?? '');
-                    if ($receivedIface !== '' && $outboundIface !== '') {
-                        $this->rememberLinkTransportEntry(
-                            $linkIdHex,
-                            $receivedIface,
-                            $outboundIface,
-                            $linkIdHex,
-                            $observedHops,
-                            $observedHops,
-                            $linkIdHex
-                        );
-                        $this->touchLinkTransportEntry($linkIdHex, $outboundIface, true, $observedHops);
-                    }
-                }
-            }
-            return $result;
-        }
-
-        // Exact hop match: the LRPROOF must have travelled exactly
-        // the expected number of hops. Python reference: Transport.py:2103
-        //   hops_ok = (packet.hops == link_entry[IDX_LT_REM_HOPS])
-        // Rust: transport.rs:5229
-        //   if packet.hops != remaining_hops { ... return; }
-        // See HOPS.md §5 Bugs #1, #2.
-        $expectedHops = (int) ($linkEntry['remaining_hops'] ?? -1);
-        if ($observedHops !== $expectedHops) {
-            error_log("[LRPROOF-DROP] linkId=" . substr($linkIdHex,0,12)
-                . " hop_mismatch: observed=$observedHops expected=$expectedHops");
+            $elsewhere = $this->linkTransportEntries($linkIdHex) !== [];
+            error_log("[LRPROOF-DROP] linkId=" . substr($linkIdHex, 0, 12)
+                . ($elsewhere
+                    ? " received on wrong interface $sourceInterfaceId (no pending link entry with that next hop)"
+                    : " no pending link entry (unknown, expired or already validated link)")
+                . " observed_hops=$observedHops");
             return 0;
         }
 
-        // Transport relays route LRPROOF by link transport table, not by
-        // cryptographic validation. Link proof validation is the link
-        // initiator's responsibility per spec §7. The exact hop check
-        // above provides sufficient routing integrity for the relay.
+        $storedHops = (int) ($linkEntry['remaining_hops'] ?? -1);
+        $signatureValid = null;
+        if ($observedHops !== $storedHops) {
+            // The lookup already restricts to unvalidated rows on the
+            // next-hop interface, which are upstream's other two conditions.
+            $signatureValid = $this->validateLinkRequestProof($packet, $linkEntry);
+            if ($signatureValid) {
+                error_log("[LRPROOF-REBALANCE] linkId=" . substr($linkIdHex, 0, 12)
+                    . " dest=" . substr((string) ($linkEntry['destination_hash_hex'] ?? ''), 0, 12)
+                    . " remaining_hops $storedHops->$observedHops");
+                $this->rebalanceLinkTransportEntry($linkEntry, $observedHops);
+                $linkEntry['remaining_hops'] = $observedHops;
+            } else {
+                error_log("[LRPROOF-REBALANCE] linkId=" . substr($linkIdHex, 0, 12)
+                    . " aborted: invalid signature or unknown identity"
+                    . " (observed=$observedHops stored=$storedHops)");
+            }
+        }
+
+        $expectedHops = (int) ($linkEntry['remaining_hops'] ?? -1);
+        if ($observedHops !== $expectedHops) {
+            error_log("[LRPROOF-DROP] linkId=" . substr($linkIdHex, 0, 12)
+                . " hop mismatch: observed=$observedHops stored_remaining=$expectedHops"
+                . " (" . (string) ($linkEntry['outbound_interface_id'] ?? '')
+                . " -> " . (string) ($linkEntry['received_interface_id'] ?? '') . ")");
+            return 0;
+        }
+
+        $signatureValid ??= $this->validateLinkRequestProof($packet, $linkEntry);
+        if (!$signatureValid) {
+            error_log("[LRPROOF-DROP] warning: invalid link request proof in transport for linkId=" . $linkIdHex
+                . " dest=" . (string) ($linkEntry['destination_hash_hex'] ?? '')
+                . " (bad signature, malformed payload or unknown identity), dropping proof");
+            return 0;
+        }
 
         $relayPacketBase64 = $this->proofRelayPacketBase64($rawBase64, $packet);
         $this->queueOutboundPacket((string) $linkEntry['received_interface_id'], $relayPacketBase64, 'lrproof_relay', $sourceInterfaceId);
-        // Validate the row that matched, by ITS remaining_hops (the key the
-        // exact gate above just checked), so only that row is touched.
+        // Validate the row that matched, by its (possibly rebalanced)
+        // remaining_hops, so only that row is touched.
         $this->touchLinkTransportEntry($linkIdHex, $sourceInterfaceId, true, $expectedHops);
 
         return 1;
@@ -955,10 +1042,15 @@ trait RequestRelayRoutingTrait
         return count($invalidated);
     }
 
-    private function linkRequestProofExpiresAt(string $receivedInterfaceId, int $remainingHops): int
+    /**
+     * Proof deadline for a new link table row, as RNS 1.5.2
+     * Transport.py:2059-2061: extra_link_proof_timeout() of the NEXT-HOP
+     * (outbound) interface plus ESTABLISHMENT_TIMEOUT_PER_HOP per remaining hop.
+     */
+    private function linkRequestProofExpiresAt(string $outboundInterfaceId, int $remainingHops): int
     {
         $now = time();
-        $bitrate = $this->interfaceBitrate($receivedInterfaceId);
+        $bitrate = $this->interfaceBitrate($outboundInterfaceId);
         $mtu = max(1, (int) ($this->config['transport']['rns_mtu'] ?? 500));
         $extraProofTimeout = 0.0;
         if ($bitrate !== null && $bitrate > 0) {

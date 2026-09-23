@@ -131,6 +131,12 @@ if packet.destination_hash in Transport.reverse_table:
 
 ## Fix 5: PostInterface.py Proof Hop Count
 
+> **2026-09-23:** The Python line cited below (2112 fallback) is the modified mirror, not upstream. `relayLinkRequestProofPacket()` now follows RNS 1.5.2 Transport.py:2608-2672: pending entry on the proof's
+> next-hop interface; a signed hop mismatch rebalances remaining_hops and the path hops; then the exact `hops == remaining_hops`
+> gate; the Ed25519 proof signature is validated at the relay (unknown identity or bad signature → drop); relayed as
+> `lrproof_relay`. Local-client entries use remaining_hops = 1. No reverse-path fallback. See php/src/lib/request_relay_routing_trait.php,
+> php/tests/local_link_relay_sql_test.php and php/tests/hops_test.php.
+
 **File**: `Reticulum-post/python/RNS/Interfaces/PostInterface.py` (3 copies: `python/`, `bridge-conf/interfaces/`, `docker/bridge/interfaces/`)
 
 **Problem**: Browser sends proofs with `hops=0`. The NAS Transport checks LRPROOF hop count against `remaining_hops`. For multi-hop paths through the PHP relay, this check fails.
@@ -255,6 +261,12 @@ All `lib/` changes are mirrored to `selectiv-snapshot/lib/`. The selectiv-snapsh
 ---
 
 ## Python Reference Cross-Reference
+
+> **2026-09-23:** The LRPROOF rows below are stale (no link_table proof fallback upstream). `relayLinkRequestProofPacket()` now follows RNS 1.5.2 Transport.py:2608-2672: pending entry on the proof's
+> next-hop interface; a signed hop mismatch rebalances remaining_hops and the path hops; then the exact `hops == remaining_hops`
+> gate; the Ed25519 proof signature is validated at the relay (unknown identity or bad signature → drop); relayed as
+> `lrproof_relay`. Local-client entries use remaining_hops = 1. No reverse-path fallback. See php/src/lib/request_relay_routing_trait.php,
+> php/tests/local_link_relay_sql_test.php and php/tests/hops_test.php.
 
 | Python Location | Line(s) | PHP Equivalent |
 |----------------|---------|----------------|

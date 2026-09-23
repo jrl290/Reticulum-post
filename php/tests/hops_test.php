@@ -9,7 +9,10 @@ declare(strict_types=1);
  *   1. transportObservedHops is a passthrough (post-inbound value)
  *   2. relayPacketBase64 uses transportObservedHops (no double +1)
  *   3. proofRelayPacketBase64 writes actual hop count into relayed bytes
- *   4. relayLinkRequestProofPacket uses exact hop match (no ±1 tolerance)
+ *   4. relayLinkRequestProofPacket: exact hop + next-hop-interface gate, and
+ *      a signed hop mismatch on a pending entry rebalances (RNS 1.5.2
+ *      Transport.py:2608-2672); signatures are mocked here and covered for
+ *      real by local_link_relay_sql_test.php
  *   5. linkTransportTargetInterfaceId uses exact hop match (no ±1)
  *   6. rememberLinkTransportRelay stores remaining_hops from path table
  *   7. Inbound handler increments hops by 1
@@ -52,26 +55,50 @@ class MockRouter
     }
 
     /**
-     * Mirrors the SQL in request_relay_routing_trait.php: an unvalidated row
-     * for this link and outbound interface whose remaining_hops is exactly
-     * the one given. Until 2026-09-22 this mock ignored $remainingHops
-     * entirely and hid the fact that the real query could never match a row
-     * whose remaining_hops differed from the proof's observed count.
+     * Mirrors the SQL in request_relay_routing_trait.php: the unvalidated row
+     * for this link and outbound (next-hop) interface, with NO hop filter -
+     * upstream looks the link up by id and only then compares hops, so the
+     * rebalance and hop-mismatch branches are reachable. (Until 2026-09-23
+     * the query filtered on remaining_hops = observed, which made both dead.)
+     * This mock holds one row per (link, outbound interface), so the SQL's
+     * preference for the fork whose remaining_hops equals $observedHops has
+     * nothing to choose between.
      */
-    public function linkTransportEntryForOutbound(string $linkIdHex, string $outboundInterfaceId, ?int $remainingHops = null): ?array
+    public function linkTransportEntryForOutbound(string $linkIdHex, string $outboundInterfaceId, ?int $observedHops = null): ?array
     {
         $key = "$linkIdHex::$outboundInterfaceId";
         $entry = $this->linkTransportTable[$key] ?? null;
         if ($entry === null || (int) ($entry['validated'] ?? 0) !== 0) {
             return null;
         }
-        if ($remainingHops !== null) {
-            $stored = (int) ($entry['remaining_hops'] ?? 0);
-            if ($stored !== $remainingHops) {
-                return null;
-            }
-        }
         return $entry;
+    }
+
+    /** Result of the mocked signature check (see validateLinkRequestProof). */
+    public bool $proofSignatureValid = true;
+
+    /**
+     * Signature validation is mocked here: this harness has no keys or
+     * known_destinations table. The real check (real Ed25519 keys through the
+     * real knownDestinationPublicKey() query) is covered by
+     * local_link_relay_sql_test.php.
+     */
+    public function validateLinkRequestProof(array $packet, array $linkEntry): bool
+    {
+        return $this->proofSignatureValid;
+    }
+
+    /** Same effect as the SQL: move the row's remaining_hops and the path hops. */
+    public function rebalanceLinkTransportEntry(array $linkEntry, int $newRemainingHops): void
+    {
+        $key = $linkEntry['link_id_hex'] . '::' . $linkEntry['outbound_interface_id'];
+        if (isset($this->linkTransportTable[$key])) {
+            $this->linkTransportTable[$key]['remaining_hops'] = $newRemainingHops;
+        }
+        $dest = (string) ($linkEntry['destination_hash_hex'] ?? '');
+        if (isset($this->pathTable[$dest])) {
+            $this->pathTable[$dest]['hops'] = $newRemainingHops;
+        }
     }
 
     public function linkTransportEntries(string $linkIdHex, bool $validatedOnly = false): array
@@ -465,21 +492,52 @@ $result = $ref->invoke($router3, 'iface_nas', $rawB64, $pkt);
 assertEq('LRPROOF hops=2 match remaining=2 → relayed (count=1)', 1, $result);
 assertTrue('relayed to browser iface', count($router3->outboundQueue) > 0 && ($router3->outboundQueue[0]['interface_id'] ?? '') === 'iface_browser');
 
-// LRPROOF with wrong hops (3 != remaining_hops=2) → dropped
-$router3->outboundQueue = [];
-$pkt = makePacket(['packet_type' => 3, 'context' => 0xFF, 'hops' => 3, 'destination_hash_hex' => $linkIdHex]);
-$rawB64 = makeRawBase64($pkt);
-$result = $ref->invoke($router3, 'iface_nas', $rawB64, $pkt);
-assertEq('LRPROOF hops=3 ≠ remaining=2 → dropped (count=0)', 0, $result);
-assertTrue('outbound queue empty', count($router3->outboundQueue) === 0);
+assertEq('entry validated after the relay', 1, $router3->linkTransportTable["$linkIdHex::iface_nas"]['validated'] ?? 0);
 
-// LRPROOF with hops=1 (was the special case '$observedHops !== 1' in old code) → dropped
-$router3->outboundQueue = [];
-$pkt = makePacket(['packet_type' => 3, 'context' => 0xFF, 'hops' => 1, 'destination_hash_hex' => $linkIdHex]);
-$rawB64 = makeRawBase64($pkt);
-$result = $ref->invoke($router3, 'iface_nas', $rawB64, $pkt);
-assertEq('LRPROOF hops=1 (was old $observedHops !== 1 special case) → dropped', 0, $result);
-assertTrue('outbound queue empty after hops=1 drop', count($router3->outboundQueue) === 0);
+// A pending entry for the Test 6 variants below (remaining 2, next hop iface_nas).
+$freshEntry = function () use ($linkIdHex): array {
+    return [
+        'link_id_hex' => $linkIdHex,
+        'received_interface_id' => 'iface_browser',
+        'outbound_interface_id' => 'iface_nas',
+        'next_hop_hex' => '22222222222222222222222222222222',
+        'remaining_hops' => 2,
+        'taken_hops' => 1,
+        'destination_hash_hex' => '33333333333333333333333333333333',
+        'validated' => 0,
+    ];
+};
+
+// LRPROOF on the wrong interface (the one the LINKREQUEST came in on) → dropped
+$routerW = new MockRouter();
+$routerW->linkTransportTable["$linkIdHex::iface_nas"] = $freshEntry();
+$pkt = makePacket(['packet_type' => 3, 'context' => 0xFF, 'hops' => 2, 'destination_hash_hex' => $linkIdHex]);
+$ref = new ReflectionMethod($routerW, 'relayLinkRequestProofPacket');
+assertEq('LRPROOF hops=2 on the received interface (not the next hop) → dropped', 0, $ref->invoke($routerW, 'iface_browser', makeRawBase64($pkt), $pkt));
+assertTrue('outbound queue empty after wrong-interface drop', count($routerW->outboundQueue) === 0);
+assertEq('entry stays unvalidated', 0, $routerW->linkTransportTable["$linkIdHex::iface_nas"]['validated']);
+
+// Signed hop mismatch (3 != remaining 2) on a pending entry → rebalanced and
+// relayed (ALLOW_LINK_PATH_REBALANCE, RNS 1.5.2 Transport.py:2614-2635)
+$routerR = new MockRouter();
+$routerR->linkTransportTable["$linkIdHex::iface_nas"] = $freshEntry();
+$routerR->pathTable['33333333333333333333333333333333'] = ['hops' => 2, 'next_hop_hex' => '22222222222222222222222222222222', 'interface_id' => 'iface_nas'];
+$pkt = makePacket(['packet_type' => 3, 'context' => 0xFF, 'hops' => 3, 'destination_hash_hex' => $linkIdHex]);
+$ref = new ReflectionMethod($routerR, 'relayLinkRequestProofPacket');
+assertEq('signed LRPROOF hops=3 on remaining=2 pending entry → rebalanced and relayed', 1, $ref->invoke($routerR, 'iface_nas', makeRawBase64($pkt), $pkt));
+assertEq('rebalanced proof relayed to the browser', 'iface_browser', $routerR->outboundQueue[0]['interface_id'] ?? '');
+assertEq('entry remaining_hops rebalanced to 3', 3, $routerR->linkTransportTable["$linkIdHex::iface_nas"]['remaining_hops']);
+assertEq('entry validated', 1, $routerR->linkTransportTable["$linkIdHex::iface_nas"]['validated']);
+assertEq('path hops rebalanced to 3', 3, $routerR->pathTable['33333333333333333333333333333333']['hops']);
+
+// Unsigned hop mismatch → no rebalance, dropped by the exact gate
+$routerU = new MockRouter();
+$routerU->proofSignatureValid = false;
+$routerU->linkTransportTable["$linkIdHex::iface_nas"] = $freshEntry();
+$ref = new ReflectionMethod($routerU, 'relayLinkRequestProofPacket');
+assertEq('invalid-signature LRPROOF hops=3 on remaining=2 → dropped', 0, $ref->invoke($routerU, 'iface_nas', makeRawBase64($pkt), $pkt));
+assertEq('entry remaining_hops unchanged (2)', 2, $routerU->linkTransportTable["$linkIdHex::iface_nas"]['remaining_hops']);
+assertTrue('outbound queue empty after invalid-signature drop', count($routerU->outboundQueue) === 0);
 
 // ══════════════════════════════════════════════════════════════════════════
 // Test 7: PLAIN/GROUP filter rejects hops > 1 AFTER inbound increment
@@ -627,18 +685,22 @@ $pkt = makePacket(['packet_type' => 0, 'destination_type' => 2, 'context' => 0x0
 assertEq('browser data relayed (count=1)', 1, $ref->invoke($router6, 'iface_browser', makeRawBase64($pkt), $pkt));
 assertEq('browser data reached the gateway', 'iface_gateway', $router6->outboundQueue[0]['interface_id'] ?? '');
 
-// 5. A transit entry (remaining=2) still demands the exact count.
+// 5. A transit entry only takes the proof from its next-hop interface: the
+//    right hop count on the interface the LINKREQUEST came in on is dropped.
 $router7 = new MockRouter();
 $router7->linkTransportTable["$linkIdHex::iface_nas"] = [
     'link_id_hex' => $linkIdHex, 'received_interface_id' => 'iface_browser', 'outbound_interface_id' => 'iface_nas',
     'next_hop_hex' => $destHex, 'remaining_hops' => 2, 'taken_hops' => 1, 'destination_hash_hex' => $destHex, 'validated' => 0,
 ];
-$proof = makePacket(['packet_type' => 3, 'context' => 0xFF, 'hops' => 3, 'destination_hash_hex' => $linkIdHex]);
-assertEq('transit LRPROOF with the wrong hop count is still dropped', 0, $ref = (new ReflectionMethod($router7, 'relayLinkRequestProofPacket'))->invoke($router7, 'iface_nas', makeRawBase64($proof), $proof));
+$proof = makePacket(['packet_type' => 3, 'context' => 0xFF, 'hops' => 2, 'destination_hash_hex' => $linkIdHex]);
+assertEq('transit LRPROOF on the wrong interface is dropped', 0, $ref = (new ReflectionMethod($router7, 'relayLinkRequestProofPacket'))->invoke($router7, 'iface_browser', makeRawBase64($proof), $proof));
 
 // 6. The local entry gets the same exact gate: a browser LRPROOF observed with
-//    2 hops (it must be 1) is dropped. Fresh router, same LINKREQUEST setup.
+//    2 hops (it must be 1) whose signature does not validate cannot rebalance
+//    the entry and is dropped. (With a valid signature it would rebalance, as
+//    upstream does - see Test 6.) Fresh router, same LINKREQUEST setup.
 $router8 = new MockRouter();
+$router8->proofSignatureValid = false;
 $router8->localDestinations[$destHex] = 'iface_browser';
 $router8->linkIdHexReturn = $linkIdHex;
 $ref = new ReflectionMethod($router8, 'deliverLocallyIfKnown');
