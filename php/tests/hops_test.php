@@ -114,16 +114,6 @@ class MockRouter
         return $entries;
     }
 
-    public function hasValidatedLinkTransportEntry(string $linkIdHex): bool
-    {
-        foreach ($this->linkTransportTable as $entry) {
-            if (($entry['link_id_hex'] ?? '') === $linkIdHex && ($entry['validated'] ?? 0) === 1) {
-                return true;
-            }
-        }
-        return false;
-    }
-
     public function touchLinkTransportEntry(string $linkIdHex, string $outboundInterfaceId, ?bool $validated = null, ?int $remainingHops = null): void
     {
         // Same WHERE clause as the SQL: the row is only touched when its
@@ -139,7 +129,6 @@ class MockRouter
             $this->linkTransportTable[$key]['validated'] = $validated ? 1 : 0;
         }
     }
-    public function deleteLinkTransportEntries(string $linkIdHex): void {}
 
     public function peekReversePath(string $truncatedHashHex, string $outboundInterfaceId): ?array
     {
@@ -167,7 +156,6 @@ class MockRouter
         return $this->knownDestIdentityHashes[$destinationHashHex] ?? null;
     }
 
-    public function registerLinkLocalDestination(string $linkHashHex, string $localIface): void {}
     public function knownDestinationPublicKey(string $destHashHex): ?string { return null; }
     public function rememberPacketHash(string $hex): void {}
     public function packetHashExists(string $hex): bool { return false; }

@@ -434,17 +434,12 @@ trait RequestControlPlaneTrait
             }
         }
 
-        // Link-addressed packets (e.g. RTT on established links) have
-        // a link ID as destination, which won't be in the path table.
-        // The link ID is registered in local_destinations when the
-        // LRPROOF is relayed. Check there as a fallback.
-        if ($path === null && $destHashHex !== '') {
-            $localIface = $this->localDestinationInterface($destHashHex);
-            if ($localIface !== null && $localIface !== $sourceInterfaceId) {
-                return [$localIface];
-            }
-        }
-
+        // No path, no target. Link-addressed packets never get here: they
+        // are routed by the validated link table entry alone
+        // (relayAcceptedInboundPacket -> relayLinkTransportPacket), never by
+        // a local_destinations row, which is what upstream does
+        // (RNS 1.5.2 Transport.py:2121-2166). Packets for a local
+        // destination were already delivered by deliverLocallyIfKnown().
         return [];
     }
 

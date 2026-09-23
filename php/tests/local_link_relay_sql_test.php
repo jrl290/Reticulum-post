@@ -23,6 +23,15 @@
  * on a pending entry rebalances remaining_hops and the path hops, and the
  * exact hop + next-hop-interface gate follows.
  *
+ * Also 2026-09-23: link packets reach a local browser only through the
+ * validated link table entry, as in Transport.py:2121-2166. No
+ * local_destinations row is written for a link (it used to be, under the
+ * LINKREQUEST's truncated hash, and relayTargetsForAcceptedPacket() fell back
+ * to it with no hop check); a link packet with no validated entry is dropped
+ * without a path request; a LINKCLOSE no longer deletes the entry, which ages
+ * out instead. Sections 13-16 run the real dispatch
+ * (relayAcceptedInboundPacket) and the real path-request code.
+ *
  * Run: php tests/local_link_relay_sql_test.php
  */
 declare(strict_types=1);
@@ -74,6 +83,7 @@ final class SqlLinkRouter
             next_hop_hex TEXT NOT NULL, remaining_hops INTEGER NOT NULL DEFAULT 0, taken_hops INTEGER NOT NULL DEFAULT 0,
             destination_hash_hex TEXT NOT NULL, validated INTEGER NOT NULL DEFAULT 0, proof_expires_at INTEGER DEFAULT NULL,
             updated_at INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (link_id_hex, outbound_interface_id, remaining_hops))');
+        $this->db->exec('CREATE TABLE path_request_throttle (throttle_key TEXT PRIMARY KEY, last_requested_at INTEGER NOT NULL DEFAULT 0)');
         $this->db->exec('CREATE TABLE reverse_path_entries (truncated_hash_hex TEXT NOT NULL, received_interface_id TEXT NOT NULL, outbound_interface_id TEXT NOT NULL, created_at INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (truncated_hash_hex, outbound_interface_id))');
     }
 
@@ -109,6 +119,13 @@ final class SqlLinkRouter
         return $v === false ? null : (int) $v;
     }
 
+    public function countWhere(string $table, string $column, string $value): int
+    {
+        $st = $this->db->prepare("SELECT COUNT(*) FROM $table WHERE $column = :v");
+        $st->execute([':v' => $value]);
+        return (int) $st->fetchColumn();
+    }
+
     public function linkRows(string $linkIdHex): array
     {
         $st = $this->db->prepare('SELECT * FROM link_transport_entries WHERE link_id_hex = :l ORDER BY remaining_hops');
@@ -130,6 +147,7 @@ final class SqlLinkRouter
     public function registerLocalDestinationIfOwnInterface(string $destHashHex, string $interfaceId): void {}
     private function rememberPacketHash(string $hex): void {}
     private function packetHashExists(string $hex): bool { return false; }
+    private function transportIdentityHashHex(): string { return str_repeat('ab', 16); }
 
     // ── Entry points ──────────────────────────────────────────────────
     public function t_deliverLocally(string $src, string $raw, array $pkt): bool { return $this->deliverLocallyIfKnown($src, $raw, $pkt); }
@@ -137,10 +155,17 @@ final class SqlLinkRouter
     public function t_shouldRelayLink(array $pkt): bool { return $this->shouldRelayLinkTransportPacket($pkt); }
     public function t_relayLink(string $src, string $raw, array $pkt): int { return $this->relayLinkTransportPacket($src, $raw, $pkt); }
     public function t_linkIdHex(string $raw, array $pkt): ?string { return $this->linkIdHex($raw, $pkt); }
-    /** What relayAcceptedPacket() records for a LINKREQUEST it forwards. */
+    /** The inbound dispatch for an accepted packet that was not delivered locally. */
+    public function t_relayAccepted(string $src, string $raw, array $pkt): int { return $this->relayAcceptedInboundPacket($src, $raw, $pkt, false); }
+    public function t_relayTargets(string $src, array $pkt): array { return $this->relayTargetsForAcceptedPacket($src, $pkt); }
+    /** What relayAcceptedPacket() records for a LINKREQUEST it forwards: a link entry, no reverse path. */
     public function t_forwardLinkRequest(string $src, string $target, string $raw, array $pkt): void
     {
         $this->rememberLinkTransportRelay($src, $target, $raw, $pkt);
+    }
+    /** A reverse path under the LINKREQUEST's hash, as the code before 2026-09-23 wrote one. */
+    public function t_legacyReversePath(string $src, string $target, array $pkt): void
+    {
         $this->rememberReversePath((string) $pkt['truncated_hash_hex'], $src, $target);
     }
 }
@@ -264,9 +289,9 @@ $r->queued = [];
 check('3-hop packet on a 7-hop link is not relayed', $r->t_relayLink($GATEWAY, $dRaw, $d) === 0 && $r->queued === []);
 
 echo "── 6. (case 2) browser-initiated 64-byte LINKREQUEST (Retichat-js), valid proof ──\n";
-// Link id == the packet's truncated hash, and relayAcceptedPacket records a
-// reverse path under that same hash: exactly the case the removed fallback
-// used to catch and duplicate.
+// Link id == the packet's truncated hash: relayAcceptedPacket used to record a
+// reverse path under that same hash, exactly the case the removed fallback
+// used to catch and duplicate. (It records none now: section 13.)
 $remote = 'c0ffee00c0ffee00c0ffee00c0ffee00';
 $rj = localRouter($dest, $edPub);
 $rj->addKnownDestination($remote, $edPub);
@@ -343,6 +368,7 @@ $re = localRouter($dest, $edPub);
 $re->addKnownDestination($remote, $edPub);
 $re->addPath($remote, $GATEWAY, 2);
 $re->t_forwardLinkRequest($BROWSER, $GATEWAY, $jlrRaw, $jlr);
+$re->t_legacyReversePath($BROWSER, $GATEWAY, $jlr);
 $re->db->prepare('UPDATE link_transport_entries SET proof_expires_at = :t WHERE link_id_hex = :l')->execute([':t' => time() - 1, ':l' => $jLinkId]);
 [$pf, $pfRaw] = lrproof($jLinkId, 2, proofPayload($jLinkId, '', $edSec, $edPub));
 check('expired-entry LRPROOF is dropped even though a reverse path exists', $re->t_lrproof($GATEWAY, $pfRaw, $pf) === 0 && $re->queued === [], json_encode($re->queued));
@@ -357,6 +383,79 @@ $rw->queued = [];
 check('valid LRPROOF arriving from the gateway (the received side) is dropped', $rw->t_lrproof($GATEWAY, $pfRaw, $pf) === 0 && $rw->queued === []);
 $rows = $rw->linkRows($linkId);
 check('one row, unvalidated', count($rows) === 1 && (int) $rows[0]['validated'] === 0, json_encode($rows));
+
+echo "── 13. a locally delivered LINKREQUEST registers no local destination and no reverse path ──\n";
+$ra = localRouter($dest, $edPub);
+check('67-byte LINKREQUEST delivered locally', $ra->t_deliverLocally($GATEWAY, $lrRaw, $lr) === true);
+check('no local_destinations row for the link id', $ra->countWhere('local_destinations', 'destination_hash_hex', $linkId) === 0);
+check('no local_destinations row for the packet truncated hash', $ra->countWhere('local_destinations', 'destination_hash_hex', $lr['truncated_hash_hex']) === 0);
+check('no reverse path for the LINKREQUEST', $ra->countWhere('reverse_path_entries', 'truncated_hash_hex', $lr['truncated_hash_hex']) === 0);
+check('only the browser destination is local', (int) $ra->db->query('SELECT COUNT(*) FROM local_destinations')->fetchColumn() === 1);
+// 64 bytes (Retichat-js): link id == truncated hash, the one case the old row matched.
+[$lr64, $lr64Raw] = pkt(['packet_type' => 2, 'hops' => 3, 'destination_hash_hex' => $dest], 64);
+$link64 = $ra->t_linkIdHex($lr64Raw, $lr64);
+check('64-byte LINKREQUEST delivered locally', $ra->t_deliverLocally($GATEWAY, $lr64Raw, $lr64) === true);
+check('no local_destinations row for the 64-byte link id', $ra->countWhere('local_destinations', 'destination_hash_hex', $link64) === 0);
+check('no reverse path for the 64-byte LINKREQUEST', $ra->countWhere('reverse_path_entries', 'truncated_hash_hex', $link64) === 0);
+check('the link entry was still created', count($ra->linkRows($link64)) === 1);
+// A DATA packet delivered locally still records its reverse path (regular proofs need it).
+[$dp, $dpRaw] = pkt(['packet_type' => 0, 'hops' => 2, 'destination_hash_hex' => $dest], 40);
+check('DATA delivered locally', $ra->t_deliverLocally($GATEWAY, $dpRaw, $dp) === true);
+check('DATA still records a reverse path', $ra->countWhere('reverse_path_entries', 'truncated_hash_hex', $dp['truncated_hash_hex']) === 1);
+
+echo "── 14. a link packet arriving before the LRPROOF is dropped ──\n";
+$rp = localRouter($dest, $edPub);
+check('LINKREQUEST delivered locally', $rp->t_deliverLocally($GATEWAY, $lrRaw, $lr) === true);
+$rp->queued = [];
+foreach ([[$GATEWAY, 7, 'from the initiator'], [$BROWSER, 1, 'from the browser']] as [$from, $hops, $side]) {
+    [$d, $dRaw] = pkt(['packet_type' => 0, 'destination_type' => 3, 'context' => 0x00, 'hops' => $hops, 'destination_hash_hex' => $linkId], 100);
+    check("pre-validation packet $side is link traffic", $rp->t_shouldRelayLink($d));
+    check("pre-validation packet $side is dropped", $rp->t_relayAccepted($from, $dRaw, $d) === 0);
+}
+check('nothing queued before validation (no relay, no path request)', $rp->queued === [], json_encode($rp->queued));
+check('the entry stays pending', count($rp->linkRows($linkId)) === 1 && (int) $rp->linkRows($linkId)[0]['validated'] === 0);
+
+echo "── 15. a LINKCLOSE leaves the entry to age out; later packets still pass ──\n";
+$rc = localRouter($dest, $edPub);
+check('LINKREQUEST delivered locally', $rc->t_deliverLocally($GATEWAY, $lrRaw, $lr) === true);
+[$pf, $pfRaw] = lrproof($linkId, 1, proofPayload($linkId, $SIG3, $edSec, $edPub));
+check('LRPROOF relayed and validates', $rc->t_lrproof($BROWSER, $pfRaw, $pf) === 1 && (int) $rc->linkRows($linkId)[0]['validated'] === 1);
+$rc->queued = [];
+[$close, $closeRaw] = pkt(['packet_type' => 0, 'destination_type' => 3, 'context' => 0xFC, 'hops' => 7, 'destination_hash_hex' => $linkId], 48);
+check('LINKCLOSE from the initiator is relayed to the browser', $rc->t_relayAccepted($GATEWAY, $closeRaw, $close) === 1
+    && ($rc->queued[0]['interface_id'] ?? '') === $BROWSER && ($rc->queued[0]['reason'] ?? '') === 'link_relay', json_encode($rc->queued));
+$rows = $rc->linkRows($linkId);
+check('the link entry still exists, validated', count($rows) === 1 && (int) $rows[0]['validated'] === 1, json_encode($rows));
+$rc->queued = [];
+[$d, $dRaw] = pkt(['packet_type' => 0, 'destination_type' => 3, 'context' => 0x00, 'hops' => 1, 'destination_hash_hex' => $linkId], 100);
+check('a later packet from the browser is still relayed to the initiator', $rc->t_relayAccepted($BROWSER, $dRaw, $d) === 1
+    && ($rc->queued[0]['interface_id'] ?? '') === $GATEWAY, json_encode($rc->queued));
+// Past the TTL the maintenance delete is what removes it; a stale row is also
+// no longer "active", so the packet is dropped as unknown.
+$rc->db->exec('UPDATE link_transport_entries SET updated_at = 0');
+$rc->queued = [];
+check('after the TTL the link is unknown and the packet is dropped', $rc->t_relayAccepted($BROWSER, $dRaw, $d) === 0 && $rc->queued === []);
+
+echo "── 16. a link packet for an unknown link id is dropped, with no path request ──\n";
+$rn = localRouter($dest, $edPub);
+// Control: the harness does emit a path request for an unknown DATA destination.
+$unknownDest = bin2hex(random_bytes(16));
+[$d, $dRaw] = pkt(['packet_type' => 0, 'destination_type' => 0, 'hops' => 1, 'destination_hash_hex' => $unknownDest], 40);
+$rn->t_relayAccepted($BROWSER, $dRaw, $d);
+check('control: DATA to an unknown destination queues a path request',
+    count(array_filter($rn->queued, fn ($q) => $q['reason'] === 'relay_path_request')) === 1, json_encode(array_column($rn->queued, 'reason')));
+$rn->queued = [];
+$unknownLink = bin2hex(random_bytes(16));
+// A stale row left in local_destinations by the old code must not matter.
+$rn->addLocalDestination($unknownLink, $BROWSER);
+foreach ([[0x00, 0, 'data'], [0xFE, 0, 'LRRTT'], [0x00, 3, 'link proof']] as [$ctx, $type, $what]) {
+    [$d, $dRaw] = pkt(['packet_type' => $type, 'destination_type' => 3, 'context' => $ctx, 'hops' => 7, 'destination_hash_hex' => $unknownLink], 80);
+    check("unknown-link $what is link traffic", $rn->t_shouldRelayLink($d));
+    check("unknown-link $what is dropped", $rn->t_relayAccepted($GATEWAY, $dRaw, $d) === 0);
+    check("path table routing gives it no target either", $rn->t_relayTargets($GATEWAY, $d) === []);
+}
+check('nothing queued: no relay to the browser and no path request', $rn->queued === [], json_encode($rn->queued));
+check('no path request throttle slot was claimed for the link id', $rn->countWhere('path_request_throttle', 'throttle_key', 'auto:' . $unknownLink) === 0);
 
 echo "\nResults: $pass passed, $fail failed\n";
 exit($fail > 0 ? 1 : 0);

@@ -258,27 +258,27 @@ trait RequestInboundBatchTrait
         $queueReason = 'local_delivery';
         $this->queueOutboundPacket($localIface, $rawBase64, $queueReason, $sourceInterfaceId);
 
-        // Remember the reverse path so proofs can be routed back to the
-        // requester (the bridge/NAS). This is needed for both DATA (type 0)
-        // and LINKREQUEST (type 2) packets — without it, regular proofs
-        // for opportunistically-delivered data cannot find their way back.
-        if ((int) ($packet['packet_type'] ?? -1) === 0 || (int) ($packet['packet_type'] ?? -1) === 2) {
+        // Remember the reverse path so the regular proof for this DATA packet
+        // (addressed to its truncated hash) can be routed back to the
+        // requester (the bridge/NAS). Upstream records a reverse_table entry
+        // for every forwarded packet EXCEPT a LINKREQUEST, which gets a
+        // link_table entry instead (RNS 1.5.2 Transport.py:2089-2109): the
+        // LRPROOF and every later packet on the link are routed by the link
+        // table alone, so a LINKREQUEST's reverse path had no reader.
+        if ((int) ($packet['packet_type'] ?? -1) === 0) {
             $truncatedHashHex = (string) ($packet['truncated_hash_hex'] ?? '');
             if ($truncatedHashHex !== '') {
                 $this->rememberReversePath($truncatedHashHex, $sourceInterfaceId, $localIface);
             }
         }
 
-        // For LINKREQUEST packets, also register the link hash as a local
-        // destination so that subsequent link packets (RTT, data, close)
-        // addressed to the link's truncated hash can be delivered to the
-        // browser rather than being relayed to peers.
         if ((int) ($packet['packet_type'] ?? -1) === 2) {
-            $truncatedHashHex = (string) ($packet['truncated_hash_hex'] ?? '');
-            if ($truncatedHashHex !== '') {
-                $this->registerLinkLocalDestination($truncatedHashHex, $localIface);
-            }
-
+            // Nothing else is registered for the link: no local_destinations
+            // row for the link id. Link packets reach the browser only
+            // through the validated link_transport_entries row created here,
+            // with the directional hop check (relayLinkTransportPacket), as
+            // upstream's link_table does (Transport.py:2121-2166).
+            //
             // Create a link transport entry so that returning LRPROOF,
             // LRRTT and subsequent link-addressed packets are routed
             // back to the link initiator. Upstream (RNS 1.5.2) creates the
@@ -334,23 +334,32 @@ trait RequestInboundBatchTrait
     }
 
     /**
-     * Register a link's truncated hash as a local destination so that
-     * link packets (RTT, data, close) addressed to the link hash are
-     * delivered to the browser rather than relayed to peers.
+     * Route an accepted inbound packet that was not delivered locally.
+     *
+     * A link packet (anything but an announce, LINKREQUEST or LRPROOF that is
+     * addressed to a link: destination type LINK, or a link id in the link
+     * table) is routed by the link table and nothing else. When no validated
+     * entry lets it through, relayLinkTransportPacket() drops it; it never
+     * falls through to the reverse-path or path-table relay below, so it can
+     * neither reach a local destination unchecked nor trigger a path request
+     * for a link id (RNS 1.5.2 Transport.py:2121-2166).
      */
-    private function registerLinkLocalDestination(string $linkHashHex, string $localIface): void
+    private function relayAcceptedInboundPacket(string $interfaceId, string $rawBase64, array $packet, bool $cacheRequestReplayed): int
     {
-        $stmt = $this->db->prepare(Database::insertOrSql($this->backend,
-            'INSERT OR REPLACE INTO local_destinations (
-                destination_hash_hex, interface_id, registered_at
-             ) VALUES (
-                :dest, :iface, :ts
-             )'
-        ));
-        $stmt->bindValue(':dest', $linkHashHex, PDO::PARAM_STR);
-        $stmt->bindValue(':iface', $localIface, PDO::PARAM_STR);
-        $stmt->bindValue(':ts', time(), PDO::PARAM_INT);
-        $stmt->execute();
+        if ($this->shouldTransportLinkRequestProofPacket($packet)) {
+            return $this->relayLinkRequestProofPacket($interfaceId, $rawBase64, $packet);
+        }
+        if ($this->shouldRelayLinkTransportPacket($packet)) {
+            return $this->relayLinkTransportPacket($interfaceId, $rawBase64, $packet);
+        }
+        if ($this->shouldReverseRouteProofPacket($packet)) {
+            return $this->relayProofPacket($interfaceId, $rawBase64, $packet);
+        }
+        if (!$cacheRequestReplayed && $this->shouldRelayAcceptedPacket($packet)) {
+            return $this->relayAcceptedPacket($interfaceId, $rawBase64, $packet);
+        }
+
+        return 0;
     }
 
     private function processInboundBatchRow(array $row, array &$summary): void
@@ -457,16 +466,8 @@ trait RequestInboundBatchTrait
                     }
                 }
 
-                if (!$deliveredLocally) {
-                    if ($filterStatus === 'accepted' && $this->shouldTransportLinkRequestProofPacket($packet)) {
-                        $summary['relay_packets_queued'] += $this->relayLinkRequestProofPacket($interfaceId, $normalizedRawBase64, $packet);
-                    } elseif ($filterStatus === 'accepted' && $this->shouldRelayLinkTransportPacket($packet)) {
-                        $summary['relay_packets_queued'] += $this->relayLinkTransportPacket($interfaceId, $normalizedRawBase64, $packet);
-                    } elseif ($filterStatus === 'accepted' && $this->shouldReverseRouteProofPacket($packet)) {
-                        $summary['relay_packets_queued'] += $this->relayProofPacket($interfaceId, $normalizedRawBase64, $packet);
-                    } elseif ($filterStatus === 'accepted' && !$cacheRequestReplayed && $this->shouldRelayAcceptedPacket($packet)) {
-                        $summary['relay_packets_queued'] += $this->relayAcceptedPacket($interfaceId, $normalizedRawBase64, $packet);
-                    }
+                if (!$deliveredLocally && $filterStatus === 'accepted') {
+                    $summary['relay_packets_queued'] += $this->relayAcceptedInboundPacket($interfaceId, $normalizedRawBase64, $packet, $cacheRequestReplayed);
                 }
 
                 $this->storeInboundPacket($interfaceId, $batchId, $packetIndex, 'parsed', $normalizedRawBase64, $packet, null);

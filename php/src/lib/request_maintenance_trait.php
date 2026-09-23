@@ -174,9 +174,9 @@ trait RequestMaintenanceTrait
             // Phase 2b: Orphaned local destinations for stale interfaces.
             // A local destination is only reachable while the interface it was
             // registered on is connected. If the row survives the interface,
-            // relayTargetsForAcceptedPacket() keeps choosing local delivery
-            // over the path entry and the traffic is black-holed — even after
-            // the destination reappears on another node.
+            // deliverLocallyIfKnown() keeps choosing local delivery over the
+            // path entry and the traffic is black-holed — even after the
+            // destination reappears on another node.
             $summary['orphaned_local_destinations'] = $this->deleteOrphanedLocalDestinationsForStaleInterfaces(
                 $staleCutoff,
                 $backend
@@ -365,9 +365,9 @@ trait RequestMaintenanceTrait
      * Mirrors deleteOrphanedPathsForStaleInterfaces(): a destination announced
      * by a browser is local only for as long as that browser's interface is
      * online. Once the interface disappears the row must go too, otherwise
-     * relayTargetsForAcceptedPacket() keeps choosing local delivery over the
-     * path entry and black-holes traffic for a destination that has since
-     * moved to another node.
+     * deliverLocallyIfKnown() keeps choosing local delivery over the path
+     * entry and black-holes traffic for a destination that has since moved to
+     * another node.
      */
     private function deleteOrphanedLocalDestinationsForStaleInterfaces(
         int $staleCutoff,

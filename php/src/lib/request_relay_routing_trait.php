@@ -24,12 +24,33 @@ trait RequestRelayRoutingTrait
             && (int) ($packet['context'] ?? -1) === 0xFF;
     }
 
+    /**
+     * Whether a packet is link traffic, to be routed by the link table alone.
+     *
+     * Upstream hands every packet other than an announce, LINKREQUEST or
+     * LRPROOF whose destination hash is in link_table to the link table, and
+     * drops it there if it is unvalidated or fails the hop check (RNS 1.5.2
+     * Transport.py:2121-2166). A packet addressed to a LINK destination with
+     * no entry at all has nowhere else to go either: this node holds no links
+     * of its own. So both count as link traffic, and relayLinkTransportPacket()
+     * is the only place they can be relayed or dropped.
+     */
     private function shouldRelayLinkTransportPacket(array $packet): bool
     {
-        return (int) ($packet['packet_type'] ?? -1) !== 1
-            && (int) ($packet['packet_type'] ?? -1) !== 2
-            && (int) ($packet['context'] ?? -1) !== 0xFF
-            && $this->hasValidatedLinkTransportEntry((string) ($packet['destination_hash_hex'] ?? ''));
+        if ((int) ($packet['packet_type'] ?? -1) === 1
+            || (int) ($packet['packet_type'] ?? -1) === 2
+            || (int) ($packet['context'] ?? -1) === 0xFF
+        ) {
+            return false;
+        }
+
+        if ((int) ($packet['destination_type'] ?? -1) === 3) {
+            return true;
+        }
+
+        $destinationHashHex = (string) ($packet['destination_hash_hex'] ?? '');
+
+        return $destinationHashHex !== '' && $this->linkTransportEntries($destinationHashHex) !== [];
     }
 
     private function relayPacketBase64(string $rawBase64, array $packet): string
@@ -304,27 +325,6 @@ trait RequestRelayRoutingTrait
         return $entries;
     }
 
-    private function hasValidatedLinkTransportEntry(string $linkIdHex): bool
-    {
-        if ($linkIdHex === '') {
-            return false;
-        }
-
-        $stmt = $this->db->prepare(
-            'SELECT 1
-             FROM link_transport_entries
-             WHERE link_id_hex = :link_id_hex
-               AND validated = 1
-               AND updated_at >= :active_after
-             LIMIT 1'
-        );
-        $stmt->bindValue(':link_id_hex', $linkIdHex, PDO::PARAM_STR);
-        $stmt->bindValue(':active_after', $this->validatedLinkTransportActiveAfter(), PDO::PARAM_INT);
-        $stmt->execute(); $row = $stmt->fetch(PDO::FETCH_NUM);
-
-        return $row !== false;
-    }
-
     private function touchLinkTransportEntry(
         string $linkIdHex,
         string $outboundInterfaceId,
@@ -409,15 +409,6 @@ trait RequestRelayRoutingTrait
             $path->bindValue(':destination_hash_hex', $destinationHashHex, PDO::PARAM_STR);
             Database::executeWithRetry($path, 'rebalancePathEntryHops');
         }
-    }
-
-    private function deleteLinkTransportEntries(string $linkIdHex): void
-    {
-        $stmt = $this->db->prepare(
-            'DELETE FROM link_transport_entries WHERE link_id_hex = :link_id_hex'
-        );
-        $stmt->bindValue(':link_id_hex', $linkIdHex, PDO::PARAM_STR);
-        Database::executeWithRetry($stmt, 'deleteLinkTransportEntry');
     }
 
     private function rememberReversePath(string $truncatedHashHex, string $receivedInterfaceId, string $outboundInterfaceId): void
@@ -527,8 +518,10 @@ trait RequestRelayRoutingTrait
         foreach ($targets as $targetInterfaceId) {
             $this->queueOutboundPacket($targetInterfaceId, $relayPacketBase64, $queueReason, $sourceInterfaceId);
             if ((int) ($packet['packet_type'] ?? -1) === 2) {
+                // A forwarded LINKREQUEST gets a link table entry and no
+                // reverse path (Transport.py:2089-2109): its LRPROOF and all
+                // later link traffic are routed by the link table only.
                 $this->rememberLinkTransportRelay($sourceInterfaceId, $targetInterfaceId, $rawBase64, $packet);
-                $this->rememberReversePath((string) $packet['truncated_hash_hex'], $sourceInterfaceId, $targetInterfaceId);
             } elseif ((int) ($packet['packet_type'] ?? -1) !== 1) {
                 $this->rememberReversePath((string) $packet['truncated_hash_hex'], $sourceInterfaceId, $targetInterfaceId);
             }
@@ -574,6 +567,13 @@ trait RequestRelayRoutingTrait
     private function queueRelayPathRequestIfNeeded(string $sourceInterfaceId, array $packet): void
     {
         if ((int) ($packet['packet_type'] ?? -1) === 1) {
+            return;
+        }
+
+        // A link id is never announced and never has a path: link packets are
+        // routed by the link table only (relayAcceptedInboundPacket keeps them
+        // out of here), and upstream never requests a path for one.
+        if ((int) ($packet['destination_type'] ?? -1) === 3) {
             return;
         }
 
@@ -797,13 +797,45 @@ trait RequestRelayRoutingTrait
         return 1;
     }
 
+    /**
+     * Relay a link packet by the link table, as RNS 1.5.2 does
+     * (Transport.py:2121-2166): only through a VALIDATED entry, and only when
+     * the directional hop check passes. Everything else is dropped - an
+     * unknown link id, a packet that arrives before the LRPROOF validated the
+     * entry, and a hop or interface mismatch.
+     *
+     * A LINKCLOSE (context 0xFC) is relayed like any other link packet and
+     * leaves the entry in place. Upstream does not act on it at a transport
+     * node - the packet is encrypted for the link's endpoints and cannot be
+     * trusted here - and the entry simply ages out after LINK_TIMEOUT
+     * (Transport.py:879), as link_transport_entries rows do after
+     * link_transport_ttl_seconds in maintenance.
+     */
     private function relayLinkTransportPacket(string $sourceInterfaceId, string $rawBase64, array $packet): int
     {
         $linkIdHex = (string) ($packet['destination_hash_hex'] ?? '');
         $observedHops = $this->transportObservedHops($packet);
-        $targets = [];
+        $entries = $linkIdHex === '' ? [] : $this->linkTransportEntries($linkIdHex);
+        if ($entries === []) {
+            error_log("[LINK-DROP] linkId=" . substr($linkIdHex, 0, 12)
+                . " no link table entry (unknown, expired or never relayed here)"
+                . " from $sourceInterfaceId observed_hops=$observedHops; dropped, no path request");
+            return 0;
+        }
 
-        foreach ($this->linkTransportEntries($linkIdHex, true) as $linkEntry) {
+        $validatedEntries = array_values(array_filter(
+            $entries,
+            static fn (array $entry): bool => (int) ($entry['validated'] ?? 0) === 1
+        ));
+        if ($validatedEntries === []) {
+            error_log("[LINK-DROP] linkId=" . substr($linkIdHex, 0, 12)
+                . " link packet received before link validation (entry pending its LRPROOF)"
+                . " from $sourceInterfaceId observed_hops=$observedHops; dropped");
+            return 0;
+        }
+
+        $targets = [];
+        foreach ($validatedEntries as $linkEntry) {
             $targetInterfaceId = $this->linkTransportTargetInterfaceId($sourceInterfaceId, $observedHops, $linkEntry);
             if ($targetInterfaceId === null) {
                 continue;
@@ -813,6 +845,16 @@ trait RequestRelayRoutingTrait
         }
 
         if ($targets === []) {
+            error_log("[LINK-DROP] linkId=" . substr($linkIdHex, 0, 12)
+                . " hop or interface mismatch: from $sourceInterfaceId observed_hops=$observedHops, entries "
+                . implode(', ', array_map(
+                    static fn (array $e): string => (string) ($e['received_interface_id'] ?? '')
+                        . '<->' . (string) ($e['outbound_interface_id'] ?? '')
+                        . ' taken=' . (string) ($e['taken_hops'] ?? '?')
+                        . ' remaining=' . (string) ($e['remaining_hops'] ?? '?'),
+                    $validatedEntries
+                ))
+                . "; dropped");
             return 0;
         }
 
@@ -820,10 +862,6 @@ trait RequestRelayRoutingTrait
         foreach ($targets as $targetInterfaceId => $linkEntry) {
             $this->queueOutboundPacket($targetInterfaceId, $relayPacketBase64, 'link_relay', $sourceInterfaceId);
             $this->touchLinkTransportEntry((string) $linkEntry['link_id_hex'], (string) $linkEntry['outbound_interface_id']);
-        }
-
-        if ((int) ($packet['context'] ?? -1) === 0xFC) {
-            $this->deleteLinkTransportEntries($linkIdHex);
         }
 
         return count($targets);
