@@ -45,6 +45,15 @@ trait RequestSchemaTrait
         $engine = $this->backend === 'mysql'
             ? ' ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci'
             : '';
+        // SQLite only auto-numbers an INTEGER PRIMARY KEY (the rowid alias).
+        // "BIGINT AUTO_INCREMENT PRIMARY KEY" is accepted there but every
+        // inserted id is NULL, so outbound packets could never be assigned
+        // to a batch or acknowledged and were re-sent on every poll: the
+        // 2026-09-23 replay storm on the private staging node (a browser
+        // re-processing the same batch 43 times a second).
+        $idColumn = $this->backend === 'mysql'
+            ? 'BIGINT AUTO_INCREMENT PRIMARY KEY'
+            : 'INTEGER PRIMARY KEY AUTOINCREMENT';
 
         $tables = [
             'interfaces' => "
@@ -88,7 +97,7 @@ trait RequestSchemaTrait
 
             'inbound_packets' => "
                 CREATE TABLE IF NOT EXISTS inbound_packets (
-                    packet_record_id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                    packet_record_id {$idColumn},
                     interface_id VARCHAR(64) NOT NULL,
                     batch_id VARCHAR(128) NOT NULL,
                     packet_index INT NOT NULL DEFAULT 0,
@@ -128,7 +137,7 @@ trait RequestSchemaTrait
 
             'outbound_packets' => "
                 CREATE TABLE IF NOT EXISTS outbound_packets (
-                    packet_id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                    packet_id {$idColumn},
                     interface_id VARCHAR(64) NOT NULL,
                     packet_hash_hex VARCHAR(64),
                     proof_destination_hash_hex VARCHAR(32),
@@ -227,7 +236,7 @@ trait RequestSchemaTrait
 
             'wake_events' => "
                 CREATE TABLE IF NOT EXISTS wake_events (
-                    wake_event_id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                    wake_event_id {$idColumn},
                     interface_id VARCHAR(64) NOT NULL DEFAULT '',
                     wake_profile VARCHAR(64) DEFAULT NULL,
                     wake_target VARCHAR(512) DEFAULT NULL,
@@ -255,7 +264,7 @@ trait RequestSchemaTrait
 
             'post_interface_peers' => "
                 CREATE TABLE IF NOT EXISTS post_interface_peers (
-                    peer_id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                    peer_id {$idColumn},
                     name VARCHAR(255) NOT NULL DEFAULT '',
                     local_interface_id VARCHAR(64) NOT NULL,
                     remote_node_url VARCHAR(512) DEFAULT NULL,
@@ -393,6 +402,7 @@ trait RequestSchemaTrait
             // a file every announce failed with "ON CONFLICT clause does not
             // match any PRIMARY KEY or UNIQUE constraint". Rebuild it.
             $this->rebuildSqlitePathEntriesKey($summary);
+            $this->rebuildSqliteAutoIncrementIds($summary);
             return;
         }
 
@@ -467,6 +477,50 @@ trait RequestSchemaTrait
         } catch (PDOException $e) {
             try { $this->db->exec('ROLLBACK'); } catch (PDOException $ignored) {}
             $summary['errors'][] = 'primary_key path_entries: ' . $e->getMessage();
+        }
+    }
+
+    /**
+     * A SQLite file built before 2026-09-23 declared its id columns
+     * "BIGINT AUTO_INCREMENT PRIMARY KEY", which SQLite does not number.
+     * Rebuild each such table with INTEGER PRIMARY KEY AUTOINCREMENT, numbering
+     * the existing rows by rowid.
+     */
+    private function rebuildSqliteAutoIncrementIds(array &$summary): void
+    {
+        $tables = [
+            'inbound_packets' => 'packet_record_id',
+            'outbound_packets' => 'packet_id',
+            'wake_events' => 'wake_event_id',
+            'post_interface_peers' => 'peer_id',
+        ];
+        foreach ($tables as $table => $idColumn) {
+            try {
+                $stmt = $this->db->query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = '{$table}'");
+                $sql = $stmt === false ? '' : (string) $stmt->fetchColumn();
+                if ($stmt !== false) {
+                    $stmt->closeCursor();
+                }
+                unset($stmt);
+                if ($sql === '' || !preg_match('/' . $idColumn . '\s+BIGINT\s+AUTO_INCREMENT\s+PRIMARY\s+KEY/i', $sql)) {
+                    continue;
+                }
+                $newSql = preg_replace('/' . $idColumn . '\s+BIGINT\s+AUTO_INCREMENT\s+PRIMARY\s+KEY/i', $idColumn . ' INTEGER PRIMARY KEY AUTOINCREMENT', $sql);
+                $newSql = preg_replace('/CREATE TABLE (IF NOT EXISTS )?' . $table . '\b/i', 'CREATE TABLE ' . $table . '_rebuilt', $newSql, 1);
+                $cols = $this->db->query("SELECT name FROM pragma_table_info('{$table}')")->fetchAll(PDO::FETCH_COLUMN);
+                $colList = implode(', ', $cols);
+                $selectList = implode(', ', array_map(fn ($c) => $c === $idColumn ? 'rowid' : $c, $cols));
+                $this->db->exec('BEGIN');
+                $this->db->exec($newSql);
+                $this->db->exec("INSERT INTO {$table}_rebuilt ({$colList}) SELECT {$selectList} FROM {$table}");
+                $this->db->exec("DROP TABLE {$table}");
+                $this->db->exec("ALTER TABLE {$table}_rebuilt RENAME TO {$table}");
+                $this->db->exec('COMMIT');
+                $summary['indexes_added']++;
+            } catch (PDOException $e) {
+                try { $this->db->exec('ROLLBACK'); } catch (PDOException $ignored) {}
+                $summary['errors'][] = "autoincrement {$table}: " . $e->getMessage();
+            }
         }
     }
 

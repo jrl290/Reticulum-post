@@ -56,7 +56,7 @@ final class SchemaRouter
         $summary = $this->migrate();
         // ensureColumns() retries MySQL-only ALTERs on SQLite and records the
         // noise; only a path_entries error is a failure here.
-        $relevant = array_values(array_filter($summary['errors'] ?? [], fn ($e) => str_contains((string) $e, 'path_entries')));
+        $relevant = array_values(array_filter($summary['errors'] ?? [], fn ($e) => str_contains((string) $e, 'path_entries') || str_contains((string) $e, 'autoincrement')));
         if ($relevant !== []) {
             throw new RuntimeException('schema errors: ' . json_encode($relevant));
         }
@@ -103,6 +103,31 @@ check('first announce accepted', in_array($s1, ['validated', 'path_updated'], tr
 check('second announce (fewer hops, other interface) accepted', in_array($s2, ['validated', 'path_updated'], true), $s2);
 $rows = $r->db->query("SELECT interface_id, hops FROM path_entries WHERE destination_hash_hex = '$dest'")->fetchAll(PDO::FETCH_ASSOC);
 check('one path per destination, the newer one', count($rows) === 1 && $rows[0]['interface_id'] === 'iface_two' && (int) $rows[0]['hops'] === 1, json_encode($rows));
+
+echo "── id columns are numbered on SQLite ──\n";
+$r->db->exec("INSERT INTO outbound_packets (interface_id, packet_base64, queued_at, queue_reason) VALUES ('i', 'AAAA', 1, 'relay')");
+$r->db->exec("INSERT INTO outbound_packets (interface_id, packet_base64, queued_at, queue_reason) VALUES ('i', 'AAAA', 1, 'relay')");
+$ids = $r->db->query('SELECT packet_id FROM outbound_packets ORDER BY packet_id')->fetchAll(PDO::FETCH_COLUMN);
+check('outbound packet ids are 1, 2 (not NULL)', array_map('intval', $ids) === [1, 2], json_encode($ids));
+$r->db->exec("INSERT INTO inbound_packets (interface_id, batch_id, packet_index, status, created_at) VALUES ('i', 'b', 0, 'parsed', 1)");
+$rid = $r->db->query('SELECT packet_record_id FROM inbound_packets')->fetchColumn();
+check('inbound packet record ids are numbered', (int) $rid === 1, (string) $rid);
+
+echo "── a file with BIGINT AUTO_INCREMENT ids is rebuilt, rows renumbered ──\n";
+$oldIds = "CREATE TABLE outbound_packets (
+    packet_id BIGINT AUTO_INCREMENT PRIMARY KEY, interface_id VARCHAR(64) NOT NULL, packet_hash_hex VARCHAR(64),
+    proof_destination_hash_hex VARCHAR(64), destination_hash_hex VARCHAR(64), destination_public_key_hex TEXT,
+    packet_base64 TEXT NOT NULL, queued_at INT NOT NULL DEFAULT 0, delivered_at INT DEFAULT NULL,
+    delivered_batch_id VARCHAR(64) DEFAULT NULL, acked_at INT DEFAULT NULL, proofed_at INT DEFAULT NULL,
+    queue_reason VARCHAR(32) NOT NULL DEFAULT 'relay');
+INSERT INTO outbound_packets (interface_id, packet_base64, queued_at) VALUES ('i', 'AAAA', 1);
+INSERT INTO outbound_packets (interface_id, packet_base64, queued_at) VALUES ('i', 'BBBB', 2);";
+$r3 = new SchemaRouter($oldIds);
+$rows = $r3->db->query('SELECT packet_id, packet_base64 FROM outbound_packets ORDER BY packet_id')->fetchAll(PDO::FETCH_ASSOC);
+check('existing rows got ids from their rowid', count($rows) === 2 && (int) $rows[0]['packet_id'] === 1 && (int) $rows[1]['packet_id'] === 2, json_encode($rows));
+$r3->db->exec("INSERT INTO outbound_packets (interface_id, packet_base64, queued_at) VALUES ('i', 'CCCC', 3)");
+$next = $r3->db->query('SELECT MAX(packet_id) FROM outbound_packets')->fetchColumn();
+check('new rows keep numbering', (int) $next === 3, (string) $next);
 
 echo "── a file built with the old two-column key is rebuilt ──\n";
 $old = 'CREATE TABLE path_entries (
