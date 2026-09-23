@@ -297,18 +297,27 @@ trait RequestRelayRoutingTrait
                   WHERE lte.link_id_hex = :link_id_hex
                     AND received_if.status = 'online'
                     AND outbound_if.status = 'online'";
+        // Each placeholder appears exactly once. MySQL runs native prepared
+        // statements (database.php: ATTR_EMULATE_PREPARES = false) and
+        // rejects a named placeholder used twice with SQLSTATE[HY093]
+        // "Invalid parameter number"; SQLite accepts it, so the SQLite suite
+        // passed while production dropped every link packet (2026-09-23).
+        $activeAfter = $this->validatedLinkTransportActiveAfter($now);
         if ($validatedOnly) {
             $query .= ' AND lte.validated = 1 AND lte.updated_at >= :active_after';
         } else {
-            $query .= ' AND ((lte.validated = 1 AND lte.updated_at >= :active_after)'
+            $query .= ' AND ((lte.validated = 1 AND lte.updated_at >= :active_after_validated)'
                 . ' OR (lte.validated = 0 AND ((lte.proof_expires_at IS NOT NULL AND lte.proof_expires_at >= :now)'
-                . ' OR (lte.proof_expires_at IS NULL AND lte.updated_at >= :active_after))))';
+                . ' OR (lte.proof_expires_at IS NULL AND lte.updated_at >= :active_after_pending))))';
         }
 
         $stmt = $this->db->prepare($query);
         $stmt->bindValue(':link_id_hex', $linkIdHex, PDO::PARAM_STR);
-        $stmt->bindValue(':active_after', $this->validatedLinkTransportActiveAfter($now), PDO::PARAM_INT);
-        if (!$validatedOnly) {
+        if ($validatedOnly) {
+            $stmt->bindValue(':active_after', $activeAfter, PDO::PARAM_INT);
+        } else {
+            $stmt->bindValue(':active_after_validated', $activeAfter, PDO::PARAM_INT);
+            $stmt->bindValue(':active_after_pending', $activeAfter, PDO::PARAM_INT);
             $stmt->bindValue(':now', $now, PDO::PARAM_INT);
         }
         $stmt->execute();
