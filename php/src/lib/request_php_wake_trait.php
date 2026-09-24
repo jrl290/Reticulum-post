@@ -184,6 +184,7 @@ trait RequestPhpWakeTrait
         );
 
         if ($fp === false) {
+            error_log("[WAKE-DROP] {$host}:{$port} connect failed: {$errstr} ({$errno})");
             return;
         }
 
@@ -191,6 +192,23 @@ trait RequestPhpWakeTrait
         if ($isTls) {
             @stream_set_blocking($fp, true);
             @stream_socket_enable_crypto($fp, true, STREAM_CRYPTO_METHOD_TLSv1_2_CLIENT);
+        } else {
+            // STREAM_CLIENT_ASYNC_CONNECT returns while the TCP handshake is
+            // still in flight, and a write before it completes fails — the
+            // wake was lost with nothing said. Wait for the socket to become
+            // writable (the handshake finished), bounded by the same 2 s as
+            // the connect. The TLS branch already blocks through its
+            // handshake, which is why https wake URLs (production) always
+            // worked while the staging gateway's http://127.0.0.1:4371 lost
+            // nearly every wake.
+            $read = null;
+            $write = [$fp];
+            $except = null;
+            if (@stream_select($read, $write, $except, 2) !== 1) {
+                error_log("[WAKE-DROP] {$host}:{$port} did not finish connecting within 2 s");
+                @fclose($fp);
+                return;
+            }
         }
 
         // HTTP/1.0 + Connection: close — the server will close after
@@ -203,9 +221,14 @@ trait RequestPhpWakeTrait
         $request .= "\r\n";
         $request .= $body;
 
-        @fwrite($fp, $request);
+        $written = @fwrite($fp, $request);
         @fclose($fp);
-        // Never read the response. Truly fire and forget.
+        // Never read the response. Truly fire and forget — but a wake that
+        // never left says so.
+        if ($written !== strlen($request)) {
+            error_log("[WAKE-DROP] {$host}:{$port} write failed ("
+                . var_export($written, true) . " of " . strlen($request) . " bytes)");
+        }
     }
 
     /**
