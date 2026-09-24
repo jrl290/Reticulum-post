@@ -141,7 +141,7 @@ final class Config
                 // its log files. See RequestStorageBudgetTrait.
                 'storage_max_bytes' => 300000000,
                 'storage_log_max_bytes' => 16000000,
-                'storage_check_interval_seconds' => 60,
+                'storage_check_interval_seconds' => 600,
                 'storage_prune_max_rows_per_pass' => 200000,
                 'storage_prune_min_age_seconds' => 300,
                 'outbound_pending_max_age_seconds' => 86400,
@@ -2597,7 +2597,7 @@ function initializeRuntime(string $projectRoot): array
     Environment::verify();
 
     $reticulumPhpStorage = new Storage($reticulumPhpConfig);
-    $reticulumPhpStorage->migrate();
+    $reticulumPhpStorage->migrateIfNeeded();
 
     return [$reticulumPhpConfig, $reticulumPhpStorage];
 }

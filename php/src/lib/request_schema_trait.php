@@ -22,6 +22,68 @@ use PDOException;
 
 trait RequestSchemaTrait
 {
+    /**
+     * Run migrate() only when the schema code has changed since the last
+     * successful run against this database.
+     *
+     * Until 2026-09-24 migrate() ran inside every request: ~20 CREATE TABLE
+     * IF NOT EXISTS, 24 CREATE INDEX attempts that each fail with "duplicate
+     * key" on MySQL, plus column and primary-key probes — about 60 statements
+     * per request before any packet was touched, ~800 plain SELECTs a second
+     * on retichat.com. The fingerprint of the migration source is kept in a
+     * one-row table inside the database itself, so a recreated or restored
+     * database (staging wipes its SQLite file) migrates again and the check
+     * costs one SELECT. A changed schema trait re-runs the migration; the
+     * /v1/initialize path still calls migrate() unconditionally.
+     */
+    public function migrateIfNeeded(): array
+    {
+        $fingerprint = $this->schemaFingerprint();
+        if ($this->recordedSchemaFingerprint() === $fingerprint) {
+            return ['skipped' => true];
+        }
+        $summary = $this->migrate();
+        if ($summary['errors'] === []) {
+            $this->recordSchemaFingerprint($fingerprint);
+        }
+        return $summary;
+    }
+
+    private function schemaFingerprint(): string
+    {
+        return sha1((string) @file_get_contents(__FILE__));
+    }
+
+    private function recordedSchemaFingerprint(): ?string
+    {
+        try {
+            $stmt = $this->db->prepare('SELECT fingerprint FROM schema_meta WHERE meta_key = :k');
+            $stmt->bindValue(':k', 'migration', PDO::PARAM_STR);
+            $stmt->execute();
+            $row = $stmt->fetch(PDO::FETCH_ASSOC);
+            return is_array($row) && isset($row['fingerprint']) ? (string) $row['fingerprint'] : null;
+        } catch (PDOException $e) {
+            return null; // table missing: never migrated here
+        }
+    }
+
+    private function recordSchemaFingerprint(string $fingerprint): void
+    {
+        try {
+            $this->db->exec('CREATE TABLE IF NOT EXISTS schema_meta (meta_key VARCHAR(32) NOT NULL, fingerprint VARCHAR(64) NOT NULL, applied_at INT NOT NULL, PRIMARY KEY (meta_key))');
+            $sql = $this->backend === 'mysql'
+                ? 'INSERT INTO schema_meta (meta_key, fingerprint, applied_at) VALUES (:k, :f, :t) ON DUPLICATE KEY UPDATE fingerprint = VALUES(fingerprint), applied_at = VALUES(applied_at)'
+                : 'INSERT INTO schema_meta (meta_key, fingerprint, applied_at) VALUES (:k, :f, :t) ON CONFLICT(meta_key) DO UPDATE SET fingerprint = excluded.fingerprint, applied_at = excluded.applied_at';
+            $stmt = $this->db->prepare($sql);
+            $stmt->bindValue(':k', 'migration', PDO::PARAM_STR);
+            $stmt->bindValue(':f', $fingerprint, PDO::PARAM_STR);
+            $stmt->bindValue(':t', time(), PDO::PARAM_INT);
+            $stmt->execute();
+        } catch (PDOException $e) {
+            error_log('ReticulumPhp: could not record schema fingerprint: ' . $e->getMessage());
+        }
+    }
+
     public function migrate(): array
     {
         $summary = [
@@ -328,17 +390,30 @@ trait RequestSchemaTrait
             ['inbound_packets', 'announce_reason', 'VARCHAR(128)', 'announce_status'],
         ];
 
+        // Ask each table for its columns once instead of issuing an ALTER per
+        // column and catching "duplicate column"; on SQLite the MySQL-only
+        // AFTER clause was also a syntax error that counted as a failure.
+        $existing = [];
         foreach ($additions as [$table, $column, $definition, $after]) {
+            if (!isset($existing[$table])) {
+                $existing[$table] = $this->existingColumns($table);
+            }
+            if (isset($existing[$table][$column])) {
+                continue;
+            }
             try {
                 $sql = "ALTER TABLE `{$table}` ADD COLUMN `{$column}` {$definition}";
-                if ($after !== null && $after !== '') {
+                if ($this->backend === 'mysql' && $after !== null && $after !== '') {
                     $sql .= " AFTER `{$after}`";
                 }
                 $this->db->exec($sql);
+                $existing[$table][$column] = true;
                 $summary['columns_added']++;
             } catch (PDOException $e) {
                 $code = (int) ($e->errorInfo[1] ?? 0);
-                if ($code !== 1060 && $code !== 1146) {
+                // 1060 = MySQL duplicate column; SQLite reports the same
+                // condition as "duplicate column name" with code 1.
+                if ($code !== 1060 && $code !== 1146 && !str_contains($e->getMessage(), 'duplicate column name')) {
                     $summary['errors'][] = "add_column {$table}.{$column}: " . $e->getMessage();
                 }
             }
@@ -355,6 +430,41 @@ trait RequestSchemaTrait
      * 2147483647 — MySQL clamps on overflow — so the counter had been lying
      * for weeks. MySQL only: SQLite INTEGER is already 64-bit.
      */
+    /** @return array<string,true> column name => true, empty if the table is missing */
+    private function existingColumns(string $table): array
+    {
+        $columns = [];
+        try {
+            if ($this->backend === 'mysql') {
+                $stmt = $this->db->prepare(
+                    'SELECT COLUMN_NAME FROM information_schema.COLUMNS
+                     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :table'
+                );
+                $stmt->bindValue(':table', $table, PDO::PARAM_STR);
+                $stmt->execute();
+                while (($row = $stmt->fetch(PDO::FETCH_ASSOC)) !== false) {
+                    $name = (string) ($row['COLUMN_NAME'] ?? $row['column_name'] ?? '');
+                    if ($name !== '') {
+                        $columns[$name] = true;
+                    }
+                }
+            } else {
+                $stmt = $this->db->query("PRAGMA table_info(`{$table}`)");
+                if ($stmt !== false) {
+                    while (($row = $stmt->fetch(PDO::FETCH_ASSOC)) !== false) {
+                        $name = (string) ($row['name'] ?? '');
+                        if ($name !== '') {
+                            $columns[$name] = true;
+                        }
+                    }
+                }
+            }
+        } catch (PDOException $e) {
+            // Unknown table or no metadata access: fall back to the ALTER path.
+        }
+        return $columns;
+    }
+
     private function ensureColumnTypes(array &$summary): void
     {
         if ($this->backend !== 'mysql') {
@@ -552,7 +662,10 @@ trait RequestSchemaTrait
             'CREATE INDEX idx_interfaces_peer_url ON interfaces (peer_url)',
             'CREATE INDEX idx_known_dest_identity ON known_destinations (identity_hash_hex)',
             'CREATE INDEX idx_local_dest_iface ON local_destinations (interface_id)',
-            'CREATE INDEX idx_wake_events_pending ON wake_events (status, created_at)',
+            // wake_events has no status column; pending rows are dispatched_at IS NULL.
+            // The old (status, created_at) form failed on every run — silently on MySQL
+            // (1072 is in the benign list), loudly on SQLite.
+            'CREATE INDEX idx_wake_events_pending ON wake_events (dispatched_at, created_at)',
             'CREATE INDEX idx_outbound_packets_queued ON outbound_packets (queued_at)',
         ];
 

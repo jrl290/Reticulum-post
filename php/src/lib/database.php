@@ -45,6 +45,64 @@ use RuntimeException;
  * retry log ever goes quiet, that is the signal the real fix landed.
  */
 
+/**
+ * PDO that counts every statement it hands out, for attributing a request's
+ * database work. Enabled only when `storage.query_log_path` is configured
+ * (or RETICULUM_PHP_QUERY_LOG names a file); production runs plain PDO.
+ * Each request then appends one JSON line: route, statement count, wall
+ * time, and the most frequent statement prefixes.
+ */
+final class CountingPdo extends \PDO
+{
+    /** @var array<string,int> */
+    public static array $counts = [];
+    public static int $total = 0;
+
+    private static function note(string $sql): void
+    {
+        self::$total++;
+        $key = substr(preg_replace('/\s+/', ' ', trim($sql)), 0, 90);
+        self::$counts[$key] = (self::$counts[$key] ?? 0) + 1;
+    }
+
+    public function prepare(string $query, array $options = []): \PDOStatement|false
+    {
+        self::note($query);
+        return parent::prepare($query, $options);
+    }
+
+    public function exec(string $statement): int|false
+    {
+        self::note($statement);
+        return parent::exec($statement);
+    }
+
+    public function query(string $query, ?int $fetchMode = null, mixed ...$fetchModeArgs): \PDOStatement|false
+    {
+        self::note($query);
+        return $fetchMode === null
+            ? parent::query($query)
+            : parent::query($query, $fetchMode, ...$fetchModeArgs);
+    }
+
+    /** Append this request's tally to $path (called from a shutdown function). */
+    public static function flush(string $path, float $startedAt): void
+    {
+        if (self::$total === 0) {
+            return;
+        }
+        arsort(self::$counts);
+        $line = json_encode([
+            'at'      => date('c'),
+            'route'   => ($_SERVER['REQUEST_METHOD'] ?? 'CLI') . ' ' . (parse_url($_SERVER['REQUEST_URI'] ?? ($_SERVER['argv'][1] ?? ''), PHP_URL_PATH) ?: ''),
+            'stmts'   => self::$total,
+            'ms'      => (int) round((microtime(true) - $startedAt) * 1000),
+            'top'     => array_slice(self::$counts, 0, 8, true),
+        ], JSON_UNESCAPED_SLASHES);
+        @file_put_contents($path, $line . "\n", FILE_APPEND | LOCK_EX);
+    }
+}
+
 final class Database
 {
     private const DEADLOCK_ERRORS = [1213, 1205];
@@ -113,6 +171,15 @@ final class Database
         $storage = $config['storage'] ?? [];
         $backend = self::backend($config);
         self::$logPath = (string) ($storage['log_path'] ?? '') ?: null;
+        $queryLog = (string) ($storage['query_log_path'] ?? (getenv('RETICULUM_PHP_QUERY_LOG') ?: ''));
+        $pdoClass = \PDO::class;
+        if ($queryLog !== '') {
+            $pdoClass = CountingPdo::class;
+            $startedAt = microtime(true);
+            register_shutdown_function(static function () use ($queryLog, $startedAt): void {
+                CountingPdo::flush($queryLog, $startedAt);
+            });
+        }
 
         if ($backend === 'mysql') {
             $host = $storage['mysql_host'] ?? '127.0.0.1';
@@ -123,7 +190,7 @@ final class Database
 
             $dsn = sprintf('mysql:host=%s;port=%d;dbname=%s;charset=utf8mb4', $host, $port, $dbname);
 
-            $pdo = new PDO($dsn, $user, $pass, [
+            $pdo = new $pdoClass($dsn, $user, $pass, [
                 PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
                 PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
                 PDO::ATTR_EMULATE_PREPARES   => false,
@@ -155,7 +222,7 @@ final class Database
             throw new RuntimeException('Unable to create SQLite directory: ' . $dir);
         }
 
-        $pdo = new PDO('sqlite:' . $sqlitePath, null, null, [
+        $pdo = new $pdoClass('sqlite:' . $sqlitePath, null, null, [
             PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
             PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
             PDO::ATTR_EMULATE_PREPARES   => false,

@@ -249,7 +249,7 @@ trait RequestStorageBudgetTrait
         $logMaxBytes = max(0, $this->maintenanceConfigInt('storage_log_max_bytes', 16_000_000));
         $summary['storage_log_bytes_trimmed'] = $this->trimManagedLogs($logMaxBytes);
 
-        $checkInterval = max(0, $this->maintenanceConfigInt('storage_check_interval_seconds', 60));
+        $checkInterval = max(0, $this->maintenanceConfigInt('storage_check_interval_seconds', 600));
         $now = time();
         $lastCheck = (int) ($this->storageStateGet('storage_budget_last_check_at') ?? 0);
         if (!$allowReclaim && $now - $lastCheck < $checkInterval) {
