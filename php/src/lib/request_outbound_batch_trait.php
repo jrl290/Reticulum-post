@@ -445,20 +445,27 @@ trait RequestOutboundBatchTrait
 
     private function assignOutboundBatch(string $interfaceId, string $batchId, array $packetIds): void
     {
-        foreach ($packetIds as $packetId) {
-            $update = $this->db->prepare(
-                'UPDATE outbound_packets
-                 SET delivered_batch_id = :delivered_batch_id
-                 WHERE packet_id = :packet_id
-                   AND interface_id = :interface_id
-                   AND acked_at IS NULL
-                   AND delivered_batch_id IS NULL'
-            );
-            $update->bindValue(':delivered_batch_id', $batchId, PDO::PARAM_STR);
-            $update->bindValue(':packet_id', $packetId, PDO::PARAM_INT);
-            $update->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
-            Database::executeWithRetry($update, 'requeueOutboundPackets');
+        // One statement for the batch (at most max_batch_packets ids), not
+        // one UPDATE per packet.
+        $ids = array_values(array_map('intval', $packetIds));
+        if ($ids === []) {
+            return;
         }
+        $placeholders = implode(',', array_fill(0, count($ids), '?'));
+        $update = $this->db->prepare(
+            "UPDATE outbound_packets
+             SET delivered_batch_id = ?
+             WHERE interface_id = ?
+               AND acked_at IS NULL
+               AND delivered_batch_id IS NULL
+               AND packet_id IN ({$placeholders})"
+        );
+        $update->bindValue(1, $batchId, PDO::PARAM_STR);
+        $update->bindValue(2, $interfaceId, PDO::PARAM_STR);
+        foreach ($ids as $i => $id) {
+            $update->bindValue($i + 3, $id, PDO::PARAM_INT);
+        }
+        Database::executeWithRetry($update, 'requeueOutboundPackets');
     }
 
     private function recordOutboundBatchAttempt(string $interfaceId, array $packets, ?int $now = null, ?int $txBytes = null): void

@@ -312,7 +312,18 @@ trait RequestInterfaceRegistryTrait
         return $rows;
     }
 
+    /** @var array<string,bool> per-request memo; peer status does not change mid-request */
+    private array $phpPeerInterfaceCache = [];
+
     public function isPhpPeerInterface(string $interfaceId): bool
+    {
+        if (array_key_exists($interfaceId, $this->phpPeerInterfaceCache)) {
+            return $this->phpPeerInterfaceCache[$interfaceId];
+        }
+        return $this->phpPeerInterfaceCache[$interfaceId] = $this->queryIsPhpPeerInterface($interfaceId);
+    }
+
+    private function queryIsPhpPeerInterface(string $interfaceId): bool
     {
         $stmt = $this->db->prepare(
             'SELECT 1 FROM interfaces WHERE interface_id = :id AND peer_url IS NOT NULL AND peer_interface_id IS NOT NULL LIMIT 1'

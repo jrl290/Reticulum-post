@@ -16,6 +16,8 @@ trait RequestInterfaceRuntimeTrait
      *  repeated SELECTs for the same interface within a single request. Called
      *  per-packet in eligibleOutboundPackets (N queries for N packets). */
     private array $metadataCache = [];
+    /** @var array<string,true> interfaces whose queue cap and wake were handled in this request */
+    private array $queueCapCheckedThisRequest = [];
 
     private function transportIdentityHashHex(): string
     {
@@ -121,6 +123,13 @@ trait RequestInterfaceRuntimeTrait
 
         // Cap pending outbound per interface at 256. Drop oldest unissued entries.
         // Python RNS caps announce_queue at MAX_QUEUED_ANNOUNCES (16384).
+        // The queue cap and the wake decision are per interface, not per
+        // packet: check them once per interface per request. A request that
+        // queues 64 announces for one browser used to run this block 64 times.
+        if (isset($this->queueCapCheckedThisRequest[$interfaceId])) {
+            return;
+        }
+        $this->queueCapCheckedThisRequest[$interfaceId] = true;
         $minIdStmt = $this->db->prepare(
             'SELECT packet_id FROM outbound_packets
              WHERE interface_id = :cap_iface

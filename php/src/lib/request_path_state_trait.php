@@ -12,19 +12,25 @@ use PDO;
 
 trait RequestPathStateTrait
 {
+    /** @var array<string,?string> per-request memo, cleared for a destination when its key is written */
+    private array $knownDestinationKeyCache = [];
+
     private function knownDestinationPublicKey(string $destinationHashHex): ?string
     {
+        if (array_key_exists($destinationHashHex, $this->knownDestinationKeyCache)) {
+            return $this->knownDestinationKeyCache[$destinationHashHex];
+        }
         $stmt = $this->db->prepare(
             'SELECT public_key_hex FROM known_destinations WHERE destination_hash_hex = :destination_hash_hex'
         );
         $stmt->bindValue(':destination_hash_hex', $destinationHashHex, PDO::PARAM_STR);
         $row = $stmt->execute(); $row = $stmt->fetch(PDO::FETCH_ASSOC);
-
-        return is_array($row) ? (string) $row['public_key_hex'] : null;
+        return $this->knownDestinationKeyCache[$destinationHashHex] = is_array($row) ? (string) $row['public_key_hex'] : null;
     }
 
     private function rememberKnownDestination(string $destinationHashHex, string $packetHashHex, array $announce): void
     {
+        unset($this->knownDestinationKeyCache[$destinationHashHex]);
         $sql = 'INSERT INTO known_destinations (
                 destination_hash_hex,
                 packet_hash_hex,
