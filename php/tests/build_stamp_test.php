@@ -241,7 +241,10 @@ $health = static function (?array $build) use ($tmp): string {
 [$code, $out] = run("$checker HEAD", ['HEALTH_URL' => $health(['commit' => $head, 'stamped_at' => '2026-09-30T12:00:00Z'])]);
 check('a node stamped with HEAD passes (exit 0)', $code === 0, $out);
 [$code, $out] = run("$checker HEAD", ['HEALTH_URL' => $health(['commit' => $parent, 'stamped_at' => '2026-09-30T12:00:00Z'])]);
-check('a node one commit behind fails (exit 1) and says so', $code === 1 && str_contains($out, '1 commit(s) behind HEAD'), $out);
+// HEAD~1..HEAD is one commit, or more when HEAD is a merge (a merged branch
+// brings its own commits), and the checker counts them all.
+[, $behind] = run('git -C ' . escapeshellarg($repo) . ' rev-list --count HEAD~1..HEAD');
+check('a node on HEAD~1 fails (exit 1) and says how far behind', $code === 1 && str_contains($out, trim($behind) . ' commit(s) behind HEAD'), $out);
 [$code, $out] = run("$checker HEAD~1", ['HEALTH_URL' => $health(['commit' => $parent, 'stamped_at' => '2026-09-30T12:00:00Z'])]);
 check('the same node passes against the ref it runs', $code === 0, $out);
 [$code, $out] = run("$checker HEAD", ['HEALTH_URL' => $health(['commit' => str_repeat('0', 40), 'stamped_at' => '2026-09-30T12:00:00Z'])]);
