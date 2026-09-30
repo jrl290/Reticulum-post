@@ -1566,6 +1566,23 @@ final class HttpApi
         ];
     }
 
+    /**
+     * Routes that only an operator should reach: the monitor page, its JSON,
+     * its clear-all button and the forced maintenance flush. None of them
+     * authenticates. Until 2026-09-30 they answered on every node: anyone
+     * could POST /v1/monitor/clear {"confirm":"YES"} and delete every table
+     * (the transport identity and every peer session included), or POST
+     * /v1/maintenance/flush {"force":true} and drop every browser session.
+     * They now answer only where config debug.enabled is true, the gate
+     * /debug always had. Pinned by tests/operator_routes_gated_test.php.
+     */
+    private const OPERATOR_PATHS = ['/v1/monitor', '/v1/monitor/data', '/v1/monitor/json', '/v1/monitor/clear', '/v1/maintenance/flush'];
+
+    private function debugRoutesEnabled(): bool
+    {
+        return ($this->config['debug']['enabled'] ?? false) === true;
+    }
+
     public function handle(string $method, string $uri, array $server): never
     {
         try {
@@ -1589,6 +1606,12 @@ final class HttpApi
                 $this->log('debug', "[perf] initialize total={$elapsed}ms");
 
                 $this->respond(200, $summary);
+            }
+
+            // The operator console and its buttons have no authentication, so
+            // they answer only where debug.enabled is set, like /debug.
+            if (in_array($path, self::OPERATOR_PATHS, true) && !$this->debugRoutesEnabled()) {
+                throw new ApiError(404, 'Not found', ['error' => 'not found']);
             }
 
             if ($method === 'GET' && $path === '/v1/monitor') {
@@ -1631,7 +1654,7 @@ final class HttpApi
             }
 
             if ($method === 'GET' && $path === '/debug') {
-                if (($this->config['debug']['enabled'] ?? false) !== true) {
+                if (!$this->debugRoutesEnabled()) {
                     throw new ApiError(404, 'Not found', ['error' => 'not found']);
                 }
 
