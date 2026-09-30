@@ -14,7 +14,36 @@ trait RequestPacketIngestTrait
 {
     private function applyPacketFilter(array $packet): array
     {
-        $alwaysAcceptedContexts = [0x05, 0x01, 0x08, 0x0E];
+        // RNS 1.5.2 Transport.packet_filter (Transport.py:1635-1640) accepts
+        // exactly these six contexts before the packet hash list is consulted,
+        // and only after the transport_id check (Transport.py:1630-1633, the
+        // first block below). Keep this list equal to the reference's: not
+        // Reticulum-rust's 0x01-0x07 superset, not a subset.
+        //
+        // KEEPALIVE and RESOURCE_REQ were missing until 2026-09-30. A
+        // keepalive goes out unencrypted (Packet.py:209-212) and its hash
+        // leaves out the hops byte (Packet.py:361-365), so it covers only
+        // link_id + context + the one data byte: every ping on a link hashes
+        // the same, and so does every pong. The first of each passed and
+        // every later one was dropped here as 'duplicate' for
+        // packet_hash_ttl_seconds, so idle links through this node went STALE
+        // and closed. That is the 2026-09-29 staging failure of stage_sim
+        // section c (channel posts to an idle web client were lost). A
+        // re-sent RESOURCE_REQ can be byte-identical in the same way.
+        // Pinned by tests/packet_filter_contexts_test.php.
+        //
+        // Known, separate divergence (not changed here): this filter
+        // remembers the hash of every packet it accepts, including link-table
+        // traffic; the reference adds hashes only after the filter and never
+        // for link-table packets or LRPROOFs (Transport.py:1944-1961).
+        $alwaysAcceptedContexts = [
+            0xFA, // KEEPALIVE
+            0x03, // RESOURCE_REQ
+            0x05, // RESOURCE_PRF
+            0x01, // RESOURCE
+            0x08, // CACHE_REQUEST
+            0x0E, // CHANNEL
+        ];
         $destinationType = (int) $packet['destination_type'];
         $packetType = (int) $packet['packet_type'];
         $context = (int) $packet['context'];
