@@ -151,10 +151,13 @@ source deploy.env        # see deploy.env.example
 ```
 
 `deploy.sh` stamps each deploy: `build.json` (from `write-build-stamp.sh`)
-names the commit, and `GET /health` publishes it as `build.commit`.
-`verify-live-stamp.sh [ref] [retichat|selectiv]` compares that with a ref from
-anywhere, with no SSH. It proves which deploy last completed, not the bytes;
-`verify-deploy.sh` is still the byte-for-byte check.
+names the commit, and `GET /health` publishes it as `build.commit`. Before any
+code goes up the node's stamp is set to unknown (`{"commit":null}`), and the new
+one is written only after `verify-deploy.sh` has proved the bytes, so a deploy
+that stops part way leaves `build.commit: null`, never a commit the node was
+not proven to run. `verify-live-stamp.sh [ref] [retichat|selectiv]` compares the
+stamp with a ref from anywhere, with no SSH. It proves the last verified deploy,
+not the bytes now; `verify-deploy.sh` is still the byte-for-byte check.
 
 `deploy.sh` refuses a dirty working tree, refuses a red test suite, deploys from
 `git archive <ref>` rather than from your filesystem, syntax-checks what landed,

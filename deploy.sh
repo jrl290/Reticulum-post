@@ -22,13 +22,18 @@
 #   2. run the test suite               — and refuse on any failure
 #   3. deploy from `git archive <ref>`  — never from the working directory
 #   4. hash-verify every node afterward — proof, not hope
+#   5. only then stamp each node with the commit it runs
 #
 # It also leaves a build stamp: build.json (write-build-stamp.sh) names the
 # commit, and GET /health publishes it, so verify-live-stamp.sh can say which
-# commit each node runs without credentials. The stamp is uploaded last, only
-# once the code has landed and parses, and the rollback copy carries the
-# previous stamp (or an explicit "unknown"), so a rollback does not leave the
-# new commit's name on old code.
+# commit each node runs without credentials. /health must never name a commit
+# the node was not proven to run, so before any code goes up the node's stamp
+# is replaced with an unknown one ({"commit":null}), and the new stamp is
+# uploaded only after verify-deploy.sh has proved every node's bytes. A
+# deploy that stops anywhere in between leaves "unknown", never the old
+# commit's name on new code or the new commit's name on unverified code. The
+# rollback copy carries the previous stamp (or an explicit unknown one), so
+# restoring it does not leave the new commit's name on old code either.
 #
 # Credentials come from the environment. Keep them in a gitignored deploy.env:
 #
@@ -155,16 +160,14 @@ echo "  ${GREEN}✓${NC} ${FILE_COUNT} php files staged from git (working tree u
 echo "  ${GREEN}✓${NC} build stamp: $(cat "$STAGE_SRC/build.json")"
 
 # ── 4. Push ──────────────────────────────────────────────────────────────
-deploy_node() {
-  local label="$1" host_var="$2" pass_var="$3"
-  local host="${!host_var:-}" pass="${!pass_var:-}"
+# Sets host, scp_cmd and ssh_cmd for one node; returns 1 when its host is not
+# configured. deploy_node and stamp_node declare them local before calling.
+node_commands() {
+  local host_var="$1" pass_var="$2"
+  local pass="${!pass_var:-}"
+  host="${!host_var:-}"
+  [[ -n "$host" ]] || return 1
 
-  if [[ -z "$host" ]]; then
-    echo "  ${DIM}skipped — ${host_var} not set${NC}"
-    return 0
-  fi
-
-  local -a scp_cmd ssh_cmd
   if [[ -n "$pass" ]]; then
     command -v sshpass >/dev/null 2>&1 || die "sshpass required when ${pass_var} is set"
     scp_cmd=(env "SSHPASS=$pass" sshpass -e scp "${SSH_OPTS[@]}")
@@ -172,6 +175,21 @@ deploy_node() {
   else
     scp_cmd=(scp "${SSH_OPTS[@]}" -o BatchMode=yes)
     ssh_cmd=(ssh "${SSH_OPTS[@]}" -o BatchMode=yes)
+  fi
+}
+
+# Nodes whose code went up in this run, one "label|host_var|pass_var" per
+# line; step 6 stamps exactly these.
+DEPLOYED=""
+
+deploy_node() {
+  local label="$1" host_var="$2" pass_var="$3"
+  local host
+  local -a scp_cmd ssh_cmd
+
+  if ! node_commands "$host_var" "$pass_var"; then
+    echo "  ${DIM}skipped — ${host_var} not set${NC}"
+    return 0
   fi
 
   echo "  ${DIM}backing up current state${NC}"
@@ -182,7 +200,10 @@ deploy_node() {
     "cd ~/${REMOTE_DIR} && rm -rf ../reticulum-rollback && mkdir -p ../reticulum-rollback/lib && cp *.php ../reticulum-rollback/ 2>/dev/null; cp lib/*.php ../reticulum-rollback/lib/ 2>/dev/null; if [ -f build.json ]; then cp build.json ../reticulum-rollback/; else echo '{\"commit\":null}' > ../reticulum-rollback/build.json; fi; true" \
     || die "${label}: backup failed"
 
-  "${ssh_cmd[@]}" "$host" "mkdir -p ~/${REMOTE_DIR}/lib" || die "${label}: mkdir failed"
+  # From here until the stamp step the node's code is in flux or unproven: it
+  # says "unknown", not the commit it ran before.
+  "${ssh_cmd[@]}" "$host" "mkdir -p ~/${REMOTE_DIR}/lib && echo '{\"commit\":null}' > ~/${REMOTE_DIR}/build.json" \
+    || die "${label}: mkdir or clearing the build stamp failed"
 
   "${scp_cmd[@]}" "$STAGE_SRC"/*.php "$host:~/${REMOTE_DIR}/" >/dev/null \
     || die "${label}: upload of top-level files failed"
@@ -201,11 +222,19 @@ deploy_node() {
     die "${label}: deployed code does not parse"
   fi
 
-  # Last: the code is in place and parses, so the node may now say it runs it.
-  "${scp_cmd[@]}" "$STAGE_SRC/build.json" "$host:~/${REMOTE_DIR}/build.json" >/dev/null \
-    || die "${label}: upload of the build stamp failed (code is deployed; /health still names the previous commit)"
-
+  DEPLOYED="${DEPLOYED}${label}|${host_var}|${pass_var}"$'\n'
   echo "  ${GREEN}✓${NC} ${label} — uploaded and parsing (rollback in ~/reticulum-rollback)"
+}
+
+# Step 6: the node's bytes are proven, so it may now say which commit it runs.
+stamp_node() {
+  local label="$1" host_var="$2" pass_var="$3"
+  local host
+  local -a scp_cmd ssh_cmd
+  node_commands "$host_var" "$pass_var" || die "${label}: ${host_var} vanished between deploy and stamp"
+  "${scp_cmd[@]}" "$STAGE_SRC/build.json" "$host:~/${REMOTE_DIR}/build.json" >/dev/null \
+    || die "${label}: upload of the build stamp failed (code is deployed and verified; /health reports no commit until a deploy completes)"
+  echo "  ${GREEN}✓${NC} ${label} — /health now names ${REF_SHA}"
 }
 
 if [[ -z "$ONLY_NODE" || "$ONLY_NODE" == "retichat" ]]; then
@@ -229,7 +258,14 @@ printf '%s  ref=%s  nodes=%s  dirty_override=%s  tests_skipped=%s  verified=%s\n
   "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$REF_SHA" "${ONLY_NODE:-all}" \
   "${DEPLOY_ALLOW_DIRTY:-0}" "${DEPLOY_SKIP_TESTS:-0}" "$VERIFY_OK" >> "$LOG_FILE"
 
-[[ $VERIFY_OK -eq 1 ]] || die "post-deploy verification failed — nodes do not match ${REF_SHA}"
+[[ $VERIFY_OK -eq 1 ]] || die "post-deploy verification failed — nodes do not match ${REF_SHA}; their /health reports no commit"
+
+# ── 6. Stamp ─────────────────────────────────────────────────────────────
+step "Stamping verified nodes"
+while IFS='|' read -r label host_var pass_var; do
+  [[ -n "$label" ]] || continue
+  stamp_node "$label" "$host_var" "$pass_var"
+done <<< "$DEPLOYED"
 
 echo
 echo "${GREEN}✓ ${REF_SHA} deployed and verified${NC}"

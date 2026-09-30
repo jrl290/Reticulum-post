@@ -12,15 +12,17 @@
 # through write-build-stamp.sh, from the ref it deployed) and compares it with
 # the commit <ref> resolves to here.
 #
-# What it proves: which deploy.sh run last completed on the node. What it does
-# not: the bytes. A file edited by hand after a deploy, or a deploy.sh that
-# died between the code and the stamp upload, is invisible here. The byte-level
-# proof is still verify-deploy.sh, which needs SSH. Run this one for drift
-# checks from anywhere; run that one when the answer matters.
+# What it proves: the last deploy.sh run whose bytes verify-deploy.sh proved on
+# the node. deploy.sh clears the stamp to "unknown" before any code goes up and
+# writes the new one only after that proof, so a deploy that stopped part way
+# reads as "unknown" (exit 2), never as a commit. What it does not prove: the
+# bytes now. A file edited by hand after the deploy is invisible here; the
+# byte-level proof is still verify-deploy.sh, which needs SSH. Run this one for
+# drift checks from anywhere; run that one when the answer matters.
 #
 # Exit status: 0 every node matches; 1 a node runs a different commit;
 # 2 a node could not be read or carries no stamp (deployed before 2026-09-30,
-# or not by deploy.sh).
+# not by deploy.sh, or by a deploy.sh run that did not reach verification).
 
 set -uo pipefail
 
@@ -57,7 +59,7 @@ check_node() {
   fi
   IFS='|' read -r live stamped <<< "$(extract_build <<< "$body")"
   if [[ -z "$live" ]]; then
-    echo "  ${YELLOW}?${NC} ${label} ${DIM}— no build stamp in /health (deployed before stamps, or not by deploy.sh)${NC}"
+    echo "  ${YELLOW}?${NC} ${label} ${DIM}— no build stamp in /health (deployed before stamps, not by deploy.sh, or a deploy that did not verify)${NC}"
     unknown=$((unknown + 1)); return
   fi
   if [[ "$live" == "$WANT" ]]; then

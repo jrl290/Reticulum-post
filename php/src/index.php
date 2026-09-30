@@ -1552,7 +1552,7 @@ final class HttpApi
      * GET /health is public. Every key is named here; the interface rows are
      * nodes and gateways only (browsers are counted, not listed) and go
      * through Storage::publicInterfaceView(), an allowlist. 'build' is the
-     * commit deploy.sh installed (verify-live-stamp.sh compares
+     * commit deploy.sh installed and verified (verify-live-stamp.sh compares
      * it with a ref, no credentials needed). Pinned by
      * tests/health_allowlist_test.php.
      */
