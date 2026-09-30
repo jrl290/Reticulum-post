@@ -179,6 +179,74 @@ line to HTTP clients, while the hardened version had been sitting committed in
 git. Drift runs in both directions — a fix that is committed but never deployed
 is just as invisible as a regression that is deployed but never committed.
 
+## Rotating a PHP peering's credentials
+
+A PHP-to-PHP peering is two rows. The node with an `[interfaces]` block for the
+other (the initiator) holds a row whose `interface_id` + `session_token` the
+peer presents to *its* `/v1/interfaces/exchange`, and it registered those at
+the peer, which keeps them as `peer_interface_id` + `peer_session_token`. The
+peer's own row id and token travel back the same way. Until 2026-09-30 `/health`
+published the peer's copy of the initiator's credential in the row metadata, and
+`/v1/monitor` published the `peer_session_token` column, so both halves were
+public. Rotate only once every node runs code that publishes neither (check with
+`curl -s https://<node>/reticulum/health | grep -c peer_session_token`, and the
+same for `/v1/monitor/data`: both must print 0), or the new tokens leak too.
+
+1. **Read, on both nodes.** Which one has the block, and the "before" state
+   (fingerprints, never tokens):
+
+   ```bash
+   N=retichat   # then N=selectiv
+   test-harnesses/distro-pipeline/node.sh $N "awk '/^\[interfaces\]/,0' ~/public_html/reticulum/config.toml | grep -viE 'pass|token|secret'"
+   test-harnesses/distro-pipeline/node.sh sql-$N "SELECT interface_id, name, status, FROM_UNIXTIME(last_seen_at) seen, peer_url, peer_interface_id, LEFT(SHA2(session_token,256),12) sess_fp, LEFT(SHA2(COALESCE(peer_session_token,''),256),12) peer_fp FROM interfaces WHERE peer_url IS NOT NULL"
+   ```
+
+   Each node should hold one row for the other. If either holds two, stop: that
+   needs a look before anything is deleted.
+
+2. **Rotate, on one initiator.** Prefer retichat.com if it has the block: the
+   initiator's row gets a new id, and selectiv's paths to the whole network hang
+   off selectiv's row, which keeps its id. `<peer URL>` is that node's row
+   `peer_url` exactly as step 1 printed it.
+
+   ```bash
+   test-harnesses/distro-pipeline/node.sh sql-retichat "DELETE FROM interfaces WHERE peer_url = '<peer URL>' AND peer_interface_id IS NOT NULL"
+   curl -s https://retichat.com/reticulum/v1/initialize
+   ```
+
+   Delete, do not mark the row dead: the peer's next exchange authenticates with
+   the old token and marks a merely-offline row online again, and then
+   `/v1/initialize` answers `already_connected` and rotates nothing. With the row
+   gone the old token is refused at once and nothing can revive it.
+   `/v1/initialize` finds no row, makes a new id and token, and registers at the
+   peer, which re-binds its row in place with a new session token of its own.
+   The response's `peers[]` must say `connected` (or `already_connected` with an
+   id that differs from step 1, if the node's own maintenance got there first).
+   `register_failed` means the peer did not answer: the initiator's old token is
+   already dead, but the peer's is live until a registration lands, so run the
+   `curl` again once the peer answers.
+
+3. **Verify.** Step 1's query again. The initiator's row has a new
+   `interface_id`, and the old one is gone. The peer's row keeps its
+   `interface_id`; its `peer_interface_id` is the initiator's new id, and both
+   `sess_fp` and `peer_fp` differ from step 1. Both rows are online at once;
+   within a minute their rx/tx move in `/health`, and a browser on selectiv
+   receives announces and can send a DM.
+
+What breaks meanwhile: between the `DELETE` and the `curl`, nothing is queued
+across the peering and the peer's exchanges get 401. Afterwards, on the
+initiator only, packets that were queued for the old row are lost, paths through
+it are unusable until those destinations announce again, and links relayed
+across the peering (a selectiv browser's rfed links, for example) are gone, so
+those users should reload. The peer's row, its queue and its paths survive.
+
+The gateway bridge needs none of this: the `peer_session_token` it registers is
+never checked (Reticulum-rust `post_interface.rs` wake server), and the bridge's
+real `session_token` was never published.
+
+`php/tests/peer_session_rotation_test.php` runs this procedure on two real
+nodes, with a peer exchange between the two commands.
+
 ## Storage Budget
 
 The router caps the total disk it occupies — every table it owns plus its log
