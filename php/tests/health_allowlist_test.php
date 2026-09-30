@@ -13,9 +13,15 @@
  * peer_session_token column.
  *
  * The rows below are written by the real registerInterface() and
- * upsertConfiguredInterface(), as the three kinds of client write them, plus
+ * upsertConfiguredInterface(), as each kind of client writes them, plus
  * a metadata key nobody has invented yet: an allowlist must drop it too,
  * where a denylist would publish it.
+ *
+ * Browsers are counted, never listed. A browser's row keeps its interface_id,
+ * created_at and rx/tx counters for as long as its identity re-registers, so
+ * a listed row told anyone who polled /health when each Retichat identity was
+ * online, under a stable pseudonym. Only nodes and gateways are listed, and
+ * newer browser rows must not push them out of the list.
  *
  * It also pins what the consumers read, so a later trim cannot break them:
  *   test-harnesses/staging/staging.sh status, e2e-local/start.sh,
@@ -111,6 +117,32 @@ $secrets['configured session_token'] = $configuredToken;
 $secrets['configured peer_interface_id'] = $remoteId;
 $secrets['configured peer_session_token'] = $remoteToken;
 
+// A gateway in poll mode (post_interface.rs / PostInterface.py, no wake_url).
+$pollGateway = $storage->registerInterface('RNS PostInterface (Staging Poll Gateway)', 1000000, 500, [
+    'client' => 'rns-post-interface', 'implementation' => 'PostInterface', 'mode' => 6, 'transport' => 'tcp-backbone-gateway',
+]);
+$secrets['poll gateway session_token'] = $pollGateway['session_token'];
+
+// Eight more browsers, all seen after every node row: they must not push the
+// nodes out of a five-row list, and none of them may be listed.
+$browserIds = [$web['interface_id']];
+for ($i = 0; $i < 7; $i++) {
+    $b = $storage->registerInterface('Retichat Web', 1000000, 500, [
+        'client' => 'rns-js', 'implementation' => 'PostInterface', 'mode' => 1, 'identity_hash' => $hex(16),
+    ]);
+    $browserIds[] = $b['interface_id'];
+}
+// One that carries the poll gateway's client string deeper in its metadata:
+// the SQL narrows by text, the client itself must be what decides.
+$nested = $storage->registerInterface('Retichat Web', 1000000, 500, [
+    'client' => 'rns-js', 'identity_hash' => $hex(16), 'extra' => ['client' => 'rns-post-interface'],
+]);
+$browserIds[] = $nested['interface_id'];
+$newer = $db->prepare('UPDATE interfaces SET last_seen_at = :t WHERE interface_id = :i');
+foreach ($browserIds as $id) {
+    $newer->execute([':t' => time() + 100, ':i' => $id]);
+}
+
 $api = new HttpApi($config, $storage);
 $body = call($api, 'healthBody');
 $json = json_encode($body, JSON_THROW_ON_ERROR);
@@ -122,6 +154,9 @@ foreach ($secrets as $what => $value) {
     check("/health omits the $what", !str_contains($json, $value));
 }
 check('/health omits peer URLs', !str_contains($json, 'peer.example') && !str_contains($json, 'gateway.example') && !str_contains($json, 'other.example'));
+$listedBrowsers = array_values(array_filter($browserIds, static fn (string $id): bool => str_contains($json, $id)));
+check('/health lists no browser: none of the 9 browser interface_ids appears', $listedBrowsers === [], implode(',', $listedBrowsers));
+check('/health has no row with client rns-js', !str_contains($json, '"rns-js"'));
 
 // ── (b) the rows are exactly the allowlist ─────────────────────────────
 echo "(b) interface rows are the allowlist, not a filtered copy\n";
@@ -130,7 +165,7 @@ $rowKeys = ['interface_id', 'name', 'bitrate', 'mtu', 'status', 'created_at', 'l
 $metadataKeys = ['client', 'implementation', 'mode', 'transport'];
 $registry = $decoded['php_interface_registry'] ?? [];
 $rows = array_merge($registry['recent_online'] ?? [], $registry['recent_offline'] ?? []);
-check('four interface rows listed', count($rows) === 4, (string) count($rows));
+check('four node and gateway rows listed', count($rows) === 4, (string) count($rows));
 foreach ($rows as $row) {
     $keys = array_keys($row);
     sort($keys);
@@ -154,17 +189,26 @@ foreach (['storage_bytes', 'storage_database_bytes', 'storage_database_free_byte
           'storage_budget_bytes', 'interfaces', 'interfaces_online', 'validated_announces', 'known_destinations'] as $k) {
     check("queues.$k", array_key_exists($k, $q));
 }
-check('php_interface_registry.summary total/online/offline',
+check('php_interface_registry.summary total/online/offline count browsers too',
     isset($registry['summary']['total'], $registry['summary']['online'], $registry['summary']['offline'])
-    && $registry['summary']['total'] === 4 && $registry['summary']['offline'] === 1);
+    && $registry['summary']['total'] === 13 && $registry['summary']['online'] === 12 && $registry['summary']['offline'] === 1,
+    json_encode($registry['summary'] ?? null));
+check('queues.interfaces_online counts browsers too', ($q['interfaces_online'] ?? null) === 12, (string) ($q['interfaces_online'] ?? ''));
 $byName = [];
 foreach ($rows as $row) {
     $byName[$row['name']] = $row;
 }
-$webRow = $byName['Retichat Web'] ?? [];
-check('web row: interface_id, rx/tx, last_seen_at',
-    ($webRow['interface_id'] ?? null) === $web['interface_id'] && isset($webRow['rx_packets'], $webRow['tx_packets'], $webRow['last_seen_at']));
-check('web row: metadata.client and metadata.mode', ($webRow['metadata']['client'] ?? null) === 'rns-js' && ($webRow['metadata']['mode'] ?? null) === 1);
+$onlineNames = array_column($registry['recent_online'] ?? [], 'name');
+sort($onlineNames);
+check('recent_online is the three online nodes and gateways, though 9 browsers were seen later',
+    $onlineNames === ['RNS PostInterface (Staging Poll Gateway)', 'retichat.com', 'selectivesubconscious.com'], implode(',', $onlineNames));
+$peerRow = $byName['selectivesubconscious.com'] ?? [];
+check('PHP peer row: interface_id, rx/tx, last_seen_at (staging.sh, e2e-local)',
+    ($peerRow['interface_id'] ?? null) === $peer['interface_id'] && isset($peerRow['rx_packets'], $peerRow['tx_packets'], $peerRow['last_seen_at']));
+$pollRow = $byName['RNS PostInterface (Staging Poll Gateway)'] ?? [];
+check('poll-mode gateway row: interface_id, metadata client, mode and transport',
+    ($pollRow['interface_id'] ?? null) === $pollGateway['interface_id'] && ($pollRow['metadata']['client'] ?? null) === 'rns-post-interface'
+    && ($pollRow['metadata']['mode'] ?? null) === 6 && ($pollRow['metadata']['transport'] ?? null) === 'tcp-backbone-gateway');
 $gwRow = $byName['RNS PostInterface (PostInterface Bridge)'] ?? [];
 check('bridge row: metadata.mode 6 and client (memory: gateway-transport-was-never-enabled)',
     ($gwRow['metadata']['mode'] ?? null) === 6 && ($gwRow['metadata']['client'] ?? null) === 'reticulum-php');

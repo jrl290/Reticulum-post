@@ -70,22 +70,25 @@ trait RequestDebugReportTrait
                 'online' => $this->countByQuery("SELECT COUNT(*) FROM interfaces WHERE status = 'online'"),
                 'offline' => $this->countByQuery("SELECT COUNT(*) FROM interfaces WHERE status = 'offline'"),
             ],
+            // Nodes and gateways only; browsers are in the counts above.
             'recent_online' => array_map(
                 static fn (array $row): array => self::publicInterfaceView($row, false),
-                $this->recentInterfacesByStatus('online', $limit)
+                $this->recentNodeInterfacesByStatus('online', $limit)
             ),
             'recent_offline' => array_map(
                 static fn (array $row): array => self::publicInterfaceView($row, false),
-                $this->recentInterfacesByStatus('offline', $limit)
+                $this->recentNodeInterfacesByStatus('offline', $limit)
             ),
         ];
     }
 
     /**
-     * The only interface fields a public report (/health, /v1/monitor) may
-     * carry. An allowlist, never a denylist: a field or metadata key that is
-     * not named here does not leave the node, whatever a client puts in its
-     * registration.
+     * The only interface fields a public report (/health, /v1/monitor and
+     * /v1/monitor/data, and /debug where debug.enabled is set) may carry. An
+     * allowlist, never a denylist: a field or metadata key that is not named
+     * here does not leave the node, whatever a client puts in its
+     * registration. Which rows a report lists is the caller's choice: /health
+     * lists only nodes and gateways (recentNodeInterfacesByStatus()).
      *
      * Until 2026-09-30 the whole metadata_json went out. For a PHP peer that
      * is its registration body, whose peer_interface_id + peer_session_token
@@ -98,8 +101,9 @@ trait RequestDebugReportTrait
      * Kept because something reads them: interface_id, name, rx/tx and
      * last_seen_at (staging.sh status, e2e-local/start.sh,
      * OPNS-RNS-Post-Bridge/rnsd-redeploy.sh), metadata client and mode
-     * (staging.sh, the bridge check in the gateway notes). peer_url only on the
-     * monitor page, which labels PHP peers by it.
+     * (staging.sh, the bridge check in the gateway notes). peer_url only with
+     * $withPeerUrl: the monitor page labels PHP peers by it, and /debug
+     * shares the view; /health never carries it.
      * Pinned by tests/health_allowlist_test.php.
      */
     public static function publicInterfaceView(array $row, bool $withPeerUrl): array
@@ -231,8 +235,35 @@ trait RequestDebugReportTrait
         return $interfaces;
     }
 
-    public function recentInterfacesByStatus(string $status, int $limit): array
+    /**
+     * The clients /health lists one row at a time: other nodes and gateways.
+     * 'reticulum-php' is a PHP peer, or a gateway bridge in wake mode;
+     * 'rns-post-interface' is a gateway in poll mode (Reticulum-rust and
+     * python/ PostInterface register_with_remote). Browsers ('rns-js') and
+     * any client not named here are only counted.
+     */
+    public const HEALTH_LISTED_CLIENTS = ['reticulum-php', 'rns-post-interface'];
+
+    /**
+     * The most recently seen node and gateway rows with this status. Only
+     * HEALTH_LISTED_CLIENTS; browsers never appear here.
+     *
+     * A browser's row keeps its interface_id for as long as the identity
+     * re-registers (registerInterface() re-binds by identity_hash), and
+     * created_at and the rx/tx counters with it, so listing browser rows on the
+     * public /health published when each Retichat identity was online, under a
+     * stable pseudonym, even with identity_hash gone. Nothing reads browser
+     * rows there (the consumers named at publicInterfaceView() read the bridge
+     * and peer rows); the summary still counts every row. Selecting nodes in
+     * SQL also stops five busy browsers from pushing the bridge out of
+     * recent_online, which rnsd-redeploy.sh reads the bridge's id from.
+     */
+    public function recentNodeInterfacesByStatus(string $status, int $limit): array
     {
+        // The LIKE only narrows the scan to poll-mode gateways; the client is
+        // checked exactly below. encodeJson() writes "key":"value" with no
+        // spaces, and the value holds no character LIKE or json_encode treats
+        // specially.
         $stmt = $this->db->prepare(
             'SELECT
                 interface_id,
@@ -249,10 +280,12 @@ trait RequestDebugReportTrait
                 tx_bytes
              FROM interfaces
              WHERE status = :status
+               AND (peer_url IS NOT NULL OR metadata_json LIKE :poll_gateway)
              ORDER BY last_seen_at DESC, created_at DESC
              LIMIT :limit'
         );
         $stmt->bindValue(':status', $status, PDO::PARAM_STR);
+        $stmt->bindValue(':poll_gateway', '%"client":"rns-post-interface"%', PDO::PARAM_STR);
         $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
         $stmt->execute();
 
@@ -264,6 +297,9 @@ trait RequestDebugReportTrait
 
             $row['metadata'] = self::decodeJson((string) ($row['metadata_json'] ?? '{}'));
             unset($row['metadata_json']);
+            if (!in_array($row['metadata']['client'] ?? null, self::HEALTH_LISTED_CLIENTS, true)) {
+                continue;
+            }
             $interfaces[] = $row;
         }
 
