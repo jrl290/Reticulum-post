@@ -30,6 +30,17 @@ function monitorLoadConfig(string $root): array
 
 $root = __DIR__;
 $config = monitorLoadConfig($root);
+
+// No authentication here, and the page deletes every table on a POST. It
+// answers only where config.toml sets [debug] enabled = true, the same gate
+// as index.php's /debug and /v1/monitor (2026-09-30; it answered everywhere).
+// 'true' and 'yes' are what index.php's TOML reader takes as true.
+if (!in_array(strtolower((string) ($config['debug']['enabled'] ?? '')), ['true', 'yes'], true)) {
+    http_response_code(404);
+    header('Content-Type: text/plain');
+    echo "not found\n";
+    exit;
+}
 $storage = $config['storage'] ?? [];
 $backend = $storage['backend'] ?? 'mysql';
 
