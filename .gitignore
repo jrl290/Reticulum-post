@@ -33,3 +33,7 @@ chat.history
 # See deploy.env.example. Never commit the real one.
 deploy.env
 .deploy.log
+
+# Build stamp: deploy.sh writes it on its git-archive stage only (see
+# write-build-stamp.sh). A copy in the tree is never deployed.
+php/src/build.json

@@ -776,6 +776,37 @@ final class Environment
     }
 }
 
+/**
+ * The commit this node runs, as deploy.sh stamped it.
+ *
+ * Nodes are deployed from `git archive`, so there is no .git to ask. deploy.sh
+ * (through write-build-stamp.sh) writes build.json next to index.php from the
+ * ref it deploys, and uploads it last, after the code has landed and parsed.
+ * A node without a stamp (staging's php -S, a hand copy, a deploy from before
+ * 2026-09-30) reports null rather than a guess, and so does a malformed file:
+ * nothing but a 40-hex commit and a UTC timestamp is ever echoed.
+ */
+final class BuildStamp
+{
+    public const FILE = 'build.json';
+
+    /** @return array{commit: ?string, stamped_at: ?string} */
+    public static function read(string $dir): array
+    {
+        $path = rtrim($dir, '/') . '/' . self::FILE;
+        $raw = is_file($path) ? @file_get_contents($path) : false;
+        $data = is_string($raw) ? json_decode($raw, true) : null;
+        $commit = is_array($data) && is_string($data['commit'] ?? null)
+            && preg_match('/^[0-9a-f]{40}$/', $data['commit']) === 1
+            ? $data['commit'] : null;
+        $stampedAt = $commit !== null && is_string($data['stamped_at'] ?? null)
+            && preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/', $data['stamped_at']) === 1
+            ? $data['stamped_at'] : null;
+
+        return ['commit' => $commit, 'stamped_at' => $stampedAt];
+    }
+}
+
 final class ApiError extends RuntimeException
 {
     public function __construct(
@@ -1512,14 +1543,16 @@ final class HttpApi
 
     public function __construct(
         private readonly array $config,
-        private readonly Storage $storage
+        private readonly Storage $storage,
+        private readonly string $buildStampDir = __DIR__
     ) {
     }
 
     /**
      * GET /health is public. Every key is named here; the interface rows go
-     * through Storage::publicInterfaceView(), an allowlist.
-     * Pinned by tests/health_allowlist_test.php.
+     * through Storage::publicInterfaceView(), an allowlist. 'build' is the
+     * commit deploy.sh installed (verify-live-stamp.sh compares it with a
+     * ref, no credentials needed). Pinned by tests/health_allowlist_test.php.
      */
     private function healthBody(): array
     {
@@ -1527,6 +1560,7 @@ final class HttpApi
             'status' => 'ok',
             'transport_basis' => requestTransportMechanism(),
             'environment' => Environment::verify(),
+            'build' => BuildStamp::read($this->buildStampDir),
             'queues' => $this->storage->healthSummary(),
             'php_interface_registry' => $this->storage->healthInterfaceRegistry(5),
         ];

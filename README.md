@@ -147,7 +147,14 @@ rns.addInterface(iface);
 source deploy.env        # see deploy.env.example
 ./deploy.sh              # test, deploy HEAD to both nodes, verify
 ./verify-deploy.sh       # just ask: do the nodes match HEAD?
+./verify-live-stamp.sh   # same question, no credentials: /health's build stamp
 ```
+
+`deploy.sh` stamps each deploy: `build.json` (from `write-build-stamp.sh`)
+names the commit, and `GET /health` publishes it as `build.commit`.
+`verify-live-stamp.sh [ref] [retichat|selectiv]` compares that with a ref from
+anywhere, with no SSH. It proves which deploy last completed, not the bytes;
+`verify-deploy.sh` is still the byte-for-byte check.
 
 `deploy.sh` refuses a dirty working tree, refuses a red test suite, deploys from
 `git archive <ref>` rather than from your filesystem, syntax-checks what landed,

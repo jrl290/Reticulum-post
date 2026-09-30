@@ -19,8 +19,8 @@
  *
  * It also pins what the consumers read, so a later trim cannot break them:
  *   test-harnesses/staging/staging.sh status, e2e-local/start.sh,
- *   OPNS-RNS-Post-Bridge/rnsd-redeploy.sh + RNSD_REDEPLOY.md, and the
- *   storage budget notes (queues.storage_*).
+ *   OPNS-RNS-Post-Bridge/rnsd-redeploy.sh + RNSD_REDEPLOY.md, the storage
+ *   budget notes (queues.storage_*), and verify-live-stamp.sh (build.commit).
  *
  * Run: php tests/health_allowlist_test.php
  */
@@ -142,8 +142,10 @@ foreach ($rows as $row) {
 }
 $topKeys = array_keys($decoded);
 sort($topKeys);
-check('top level is status, transport_basis, environment, queues, php_interface_registry',
-    $topKeys === ['environment', 'php_interface_registry', 'queues', 'status', 'transport_basis'], implode(',', $topKeys));
+check('top level is status, transport_basis, environment, build, queues, php_interface_registry',
+    $topKeys === ['build', 'environment', 'php_interface_registry', 'queues', 'status', 'transport_basis'], implode(',', $topKeys));
+check('build is exactly commit and stamped_at (tests/build_stamp_test.php covers the stamp)',
+    array_keys($decoded['build'] ?? []) === ['commit', 'stamped_at'], json_encode($decoded['build'] ?? null));
 
 // ── (c) what the consumers read is still there ─────────────────────────
 echo "(c) every field a consumer reads is still published\n";

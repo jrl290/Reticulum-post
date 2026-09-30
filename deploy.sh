@@ -23,6 +23,13 @@
 #   3. deploy from `git archive <ref>`  — never from the working directory
 #   4. hash-verify every node afterward — proof, not hope
 #
+# It also leaves a build stamp: build.json (write-build-stamp.sh) names the
+# commit, and GET /health publishes it, so verify-live-stamp.sh can say which
+# commit each node runs without credentials. The stamp is uploaded last, only
+# once the code has landed and parses, and the rollback copy carries the
+# previous stamp (or an explicit "unknown"), so a rollback does not leave the
+# new commit's name on old code.
+#
 # Credentials come from the environment. Keep them in a gitignored deploy.env:
 #
 #   export RETICHAT_SSH_PASS=...   RETICHAT_SSH_HOST=retichat@retichat.com
@@ -144,6 +151,9 @@ done
 FILE_COUNT="$(find "$STAGE_SRC" -name '*.php' -type f | wc -l | tr -d ' ')"
 echo "  ${GREEN}✓${NC} ${FILE_COUNT} php files staged from git (working tree untouched)"
 
+"$REPO_DIR/write-build-stamp.sh" "$REF" "$STAGE_SRC" || die "could not write the build stamp"
+echo "  ${GREEN}✓${NC} build stamp: $(cat "$STAGE_SRC/build.json")"
+
 # ── 4. Push ──────────────────────────────────────────────────────────────
 deploy_node() {
   local label="$1" host_var="$2" pass_var="$3"
@@ -165,8 +175,11 @@ deploy_node() {
   fi
 
   echo "  ${DIM}backing up current state${NC}"
+  # The rollback copy keeps the node's current stamp; a node deployed before
+  # stamps gets an explicit unknown one, so restoring the copy never leaves
+  # this deploy's commit named on the old code.
   "${ssh_cmd[@]}" "$host" \
-    "cd ~/${REMOTE_DIR} && rm -rf ../reticulum-rollback && mkdir -p ../reticulum-rollback/lib && cp *.php ../reticulum-rollback/ 2>/dev/null; cp lib/*.php ../reticulum-rollback/lib/ 2>/dev/null; true" \
+    "cd ~/${REMOTE_DIR} && rm -rf ../reticulum-rollback && mkdir -p ../reticulum-rollback/lib && cp *.php ../reticulum-rollback/ 2>/dev/null; cp lib/*.php ../reticulum-rollback/lib/ 2>/dev/null; if [ -f build.json ]; then cp build.json ../reticulum-rollback/; else echo '{\"commit\":null}' > ../reticulum-rollback/build.json; fi; true" \
     || die "${label}: backup failed"
 
   "${ssh_cmd[@]}" "$host" "mkdir -p ~/${REMOTE_DIR}/lib" || die "${label}: mkdir failed"
@@ -187,6 +200,10 @@ deploy_node() {
     echo "${YELLOW}  roll back with: ${ssh_cmd[*]} ${host} 'cp -r ~/reticulum-rollback/* ~/${REMOTE_DIR}/'${NC}"
     die "${label}: deployed code does not parse"
   fi
+
+  # Last: the code is in place and parses, so the node may now say it runs it.
+  "${scp_cmd[@]}" "$STAGE_SRC/build.json" "$host:~/${REMOTE_DIR}/build.json" >/dev/null \
+    || die "${label}: upload of the build stamp failed (code is deployed; /health still names the previous commit)"
 
   echo "  ${GREEN}✓${NC} ${label} — uploaded and parsing (rollback in ~/reticulum-rollback)"
 }
