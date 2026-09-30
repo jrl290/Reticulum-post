@@ -187,5 +187,11 @@ $first = $monitorRows[0] ?? [];
 check('monitor rows keep name, status, rx/tx, last_seen_at, interface_id',
     isset($first['name'], $first['status'], $first['rx_packets'], $first['tx_packets'], $first['last_seen_at'], $first['interface_id']));
 
+// /debug is public whenever a node sets debug.enabled.
+$debugJson = json_encode($storage->debugReport(20), JSON_THROW_ON_ERROR);
+foreach ($secrets as $what => $value) {
+    check("/debug omits the $what", !str_contains($debugJson, $value));
+}
+
 echo "\n$pass passed, $fail failed\n";
 exit($fail === 0 ? 0 : 1);

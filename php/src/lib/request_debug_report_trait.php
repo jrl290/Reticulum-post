@@ -408,8 +408,13 @@ trait RequestDebugReportTrait
     {
         $limit = max(1, $limit);
 
+        // /debug is public whenever debug.enabled is set, so its interface
+        // rows get the same allowlist as /health and the monitor.
         return [
-            'recent_interfaces' => $this->recentInterfaces($limit),
+            'recent_interfaces' => array_map(
+                static fn (array $row): array => self::publicInterfaceView($row, true),
+                $this->recentInterfaces($limit)
+            ),
             'recent_inbound_batches' => $this->recentInboundBatches($limit),
             'recent_inbound_packets' => $this->recentInboundPackets($limit),
             'recent_path_entries' => $this->recentPathEntries($limit),
