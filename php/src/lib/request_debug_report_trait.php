@@ -70,9 +70,64 @@ trait RequestDebugReportTrait
                 'online' => $this->countByQuery("SELECT COUNT(*) FROM interfaces WHERE status = 'online'"),
                 'offline' => $this->countByQuery("SELECT COUNT(*) FROM interfaces WHERE status = 'offline'"),
             ],
-            'recent_online' => $this->recentInterfacesByStatus('online', $limit),
-            'recent_offline' => $this->recentInterfacesByStatus('offline', $limit),
+            'recent_online' => array_map(
+                static fn (array $row): array => self::publicInterfaceView($row, false),
+                $this->recentInterfacesByStatus('online', $limit)
+            ),
+            'recent_offline' => array_map(
+                static fn (array $row): array => self::publicInterfaceView($row, false),
+                $this->recentInterfacesByStatus('offline', $limit)
+            ),
         ];
+    }
+
+    /**
+     * The only interface fields a public report (/health, /v1/monitor) may
+     * carry. An allowlist, never a denylist: a field or metadata key that is
+     * not named here does not leave the node, whatever a client puts in its
+     * registration.
+     *
+     * Until 2026-09-30 the whole metadata_json went out. For a PHP peer that
+     * is its registration body, whose peer_interface_id + peer_session_token
+     * are the credentials exchangeWithPhpPeer() presents to the other node's
+     * /v1/interfaces/exchange, and /v1/monitor also listed the
+     * peer_session_token column; for a web client it is identity_hash, the
+     * key registerInterface() re-binds a browser's row by. Both production
+     * nodes published a peer_session_token this way.
+     *
+     * Kept because something reads them: interface_id, name, rx/tx and
+     * last_seen_at (staging.sh status, e2e-local/start.sh,
+     * OPNS-RNS-Post-Bridge/rnsd-redeploy.sh), metadata client and mode
+     * (staging.sh, the bridge check in the gateway notes). peer_url only on the
+     * monitor page, which labels PHP peers by it.
+     * Pinned by tests/health_allowlist_test.php.
+     */
+    public static function publicInterfaceView(array $row, bool $withPeerUrl): array
+    {
+        $fields = ['interface_id', 'name', 'bitrate', 'mtu', 'status', 'created_at', 'last_seen_at',
+                   'rx_packets', 'rx_bytes', 'tx_packets', 'tx_bytes'];
+        if ($withPeerUrl) {
+            $fields[] = 'peer_url';
+        }
+        $view = [];
+        foreach ($fields as $field) {
+            if (array_key_exists($field, $row)) {
+                $view[$field] = $row[$field];
+            }
+        }
+
+        $metadata = is_array($row['metadata'] ?? null) ? $row['metadata'] : [];
+        $publicMetadata = [];
+        foreach (['client', 'implementation', 'mode', 'transport'] as $key) {
+            $value = $metadata[$key] ?? null;
+            if (is_string($value) || is_int($value)) {
+                $publicMetadata[$key] = $value;
+            }
+        }
+        // An object even when empty: readers call .get() on it.
+        $view['metadata'] = (object) $publicMetadata;
+
+        return $view;
     }
 
     public function recentInboundPackets(int $limit): array
@@ -374,7 +429,10 @@ trait RequestDebugReportTrait
     public function monitorData(): array
     {
         return [
-            'interfaces' => $this->recentInterfaces(50),
+            'interfaces' => array_map(
+                static fn (array $row): array => self::publicInterfaceView($row, true),
+                $this->recentInterfaces(50)
+            ),
             'outbound_pending' => $this->pendingOutboundByInterface(),
             'recent_inbound' => $this->recentInboundPackets(20),
             'recent_outbound' => $this->recentOutboundPackets(20),

@@ -1516,6 +1516,22 @@ final class HttpApi
     ) {
     }
 
+    /**
+     * GET /health is public. Every key is named here; the interface rows go
+     * through Storage::publicInterfaceView(), an allowlist.
+     * Pinned by tests/health_allowlist_test.php.
+     */
+    private function healthBody(): array
+    {
+        return [
+            'status' => 'ok',
+            'transport_basis' => requestTransportMechanism(),
+            'environment' => Environment::verify(),
+            'queues' => $this->storage->healthSummary(),
+            'php_interface_registry' => $this->storage->healthInterfaceRegistry(5),
+        ];
+    }
+
     public function handle(string $method, string $uri, array $server): never
     {
         try {
@@ -1577,13 +1593,7 @@ final class HttpApi
             }
 
             if ($method === 'GET' && $path === '/health') {
-                $this->respond(200, [
-                    'status' => 'ok',
-                    'transport_basis' => requestTransportMechanism(),
-                    'environment' => Environment::verify(),
-                    'queues' => $this->storage->healthSummary(),
-                    'php_interface_registry' => $this->storage->healthInterfaceRegistry(5),
-                ]);
+                $this->respond(200, $this->healthBody());
             }
 
             if ($method === 'GET' && $path === '/debug') {
