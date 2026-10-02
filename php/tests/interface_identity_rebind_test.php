@@ -21,9 +21,18 @@
  * is the separate follow-up redesign). So it is honoured for row matching ONLY
  * when it is a well-formed identity hash — exactly 32 lowercase hex characters —
  * and the lookup is an EXACT match on the row's own TOP-LEVEL metadata
- * identity_hash (narrow with an escaped LIKE, then json_decode and hash_equals
- * in PHP). A legitimate re-registration with the same hash still re-binds in
- * place; a different valid hash gets its own row.
+ * identity_hash (a LIKE only narrows the candidates; each is json_decoded and
+ * compared with hash_equals in PHP). A legitimate re-registration with the same
+ * hash still re-binds in place; a different valid hash gets its own row.
+ *
+ * Each defence is pinned on its own, because either one alone stops the
+ * wildcard attack on the victim in (1):
+ *   - the validation, by (5): a malformed claim never re-binds even a row that
+ *     was made with the SAME malformed claim, and by (6): every malformed claim
+ *     (including 32 hex + a trailing newline) is logged [REG-BAD-IDENTITY];
+ *   - the exact top-level compare, by (2): the nested-key row.
+ * The SQL itself must also prepare on MySQL/MariaDB, which SQLite cannot show;
+ * no_backslash_in_sql_literals_test.php guards that.
  *
  * This test runs against the real trait (SQLite in-memory). It asserts the
  * fixed behaviour, so on an export of 35314f4 (REG_TRAIT_PATH=/path/to/old.php)
@@ -124,6 +133,22 @@ final class RebindHarness
     }
 }
 
+// Capture error_log so the [REG-BAD-IDENTITY] contract is asserted, not assumed.
+$logFile = tempnam(sys_get_temp_dir(), 'reg-bad-identity-');
+ini_set('error_log', $logFile);
+
+/** Number of [REG-BAD-IDENTITY] lines error_log received while $fn ran. */
+function badIdentityLogsDuring(callable $fn): int
+{
+    global $logFile;
+    clearstatcache(true, $logFile);
+    $offset = (int) filesize($logFile);
+    $fn();
+    clearstatcache(true, $logFile);
+
+    return substr_count((string) file_get_contents($logFile, false, null, $offset), '[REG-BAD-IDENTITY]');
+}
+
 $pass = 0;
 $fail = 0;
 function check(string $label, bool $ok): void
@@ -211,6 +236,51 @@ $anon1 = $h->registerBrowser('');
 $anon2 = $h->registerBrowser('');
 check('two empty-claim registrations are two distinct rows', $anon1['interface_id'] !== $anon2['interface_id']);
 check('empty-claim registrations created two rows', $h->rowCount() === $before + 2);
+
+// ── The validation is pinned on its own ─────────────────────────────────
+// (1) cannot tell whether the validation or the exact compare stopped the
+// attack. Here the earlier row was made with the SAME malformed claim, so the
+// exact compare WOULD match it: only the validation keeps the second
+// registration from re-binding (and so rotating the first one's token).
+echo "\n(5) a malformed claim never re-binds, even a row made with the same claim\n";
+$malformed = [
+    "wildcard '%'"                  => '%',
+    "wildcard '_%'"                 => '_%',
+    "non-hex 'ZZZZ'"                => 'ZZZZ',
+    'upper-case hash'               => strtoupper($victimHash),
+    '31-character hash'             => substr($victimHash, 0, 31),
+    '32 hex + trailing newline'     => $victimHash . "\n",
+];
+foreach ($malformed as $label => $claim) {
+    $first = $h->registerBrowser($claim);
+    $second = $h->registerBrowser($claim);
+    check("[$label] registered twice gives two distinct rows", $first['interface_id'] !== $second['interface_id']);
+    check("[$label] the first registration's token still authenticates", $h->authOk($first['interface_id'], $first['session_token']));
+}
+
+// ── A dropped claim speaks (silent-failures rule) ───────────────────────
+echo "\n(6) every malformed claim is logged [REG-BAD-IDENTITY]; valid and absent claims are not\n";
+$logged = [
+    "wildcard '%'"                  => '%',
+    "wildcard '_%'"                 => '_%',
+    'upper-case hash'               => strtoupper($victimHash),
+    '33-character hash'             => $victimHash . 'a',
+    'hash with a backslash'         => substr($victimHash, 0, 31) . '\\',
+    '32 hex + trailing newline'     => $victimHash . "\n",
+    'non-string claim (array)'      => [$victimHash],
+    'non-string claim (int)'        => 12345,
+];
+foreach ($logged as $label => $claim) {
+    $n = badIdentityLogsDuring(static fn () => $h->registerBrowser($claim));
+    check("[$label] logged [REG-BAD-IDENTITY] once (got $n)", $n === 1);
+}
+$n = badIdentityLogsDuring(static fn () => $h->registerBrowser($victimHash));
+check("a valid 32-hex claim is not logged (got $n)", $n === 0);
+$n = badIdentityLogsDuring(static fn () => $h->registerBrowser(''));
+check("an empty claim is not logged (got $n)", $n === 0);
+$n = badIdentityLogsDuring(static fn () => $h->registerInterface('Retichat Web', 1000000, 500, ['client' => 'rns-js']));
+check("an absent claim is not logged (got $n)", $n === 0);
+@unlink($logFile);
 
 echo "\nResults: $pass passed, $fail failed\n";
 exit($fail > 0 ? 1 : 0);

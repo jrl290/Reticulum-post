@@ -118,7 +118,13 @@ trait RequestInterfaceRegistryTrait
             // (silent-failures rule). An absent claim (null or '') is the
             // normal "no identity" case and is not noise worth logging.
             if ($rawIdentityClaim !== null && $rawIdentityClaim !== '') {
-                error_log('[REG-BAD-IDENTITY] interface register: identity_hash claim is not 32 lowercase hex; treating as no identity (new row, no re-bind)');
+                // The claim itself is attacker-controlled, so only its shape is
+                // logged: enough to tell a client bug (say, upper-case) from noise.
+                error_log(sprintf(
+                    '[REG-BAD-IDENTITY] interface register: identity_hash claim (%s, length %d) is not 32 lowercase hex; treating as no identity (new row, no re-bind)',
+                    get_debug_type($rawIdentityClaim),
+                    is_string($rawIdentityClaim) ? strlen($rawIdentityClaim) : -1
+                ));
             }
         }
 
@@ -416,7 +422,9 @@ trait RequestInterfaceRegistryTrait
         if (!is_string($claim)) {
             return null;
         }
-        if (preg_match('/^[0-9a-f]{32}$/', $claim) !== 1) {
+        // \A and \z, not ^ and $: PCRE's $ also matches before a final "\n",
+        // which would accept a 33-byte claim of 32 hex characters plus a newline.
+        if (preg_match('/\A[0-9a-f]{32}\z/', $claim) !== 1) {
             return null;
         }
 
@@ -430,25 +438,31 @@ trait RequestInterfaceRegistryTrait
      * This is an EXACT match on the top-level value, never a bare LIKE. A LIKE
      * match let a claim of '%' or '_%' re-bind an arbitrary browser row with no
      * knowledge, and let a nested {"x":{"identity_hash":"…"}} in some unrelated
-     * row's metadata match another client's claim. We narrow candidate rows
-     * with an escaped LIKE — portable across SQLite (staging) and MySQL 8.4 /
-     * MariaDB 11.4 (production) — then json_decode each candidate and compare
-     * the top-level metadata.identity_hash with hash_equals, so neither a
-     * wildcard nor a nested key can ever match.
+     * row's metadata match another client's claim. The LIKE below only narrows
+     * the candidate rows; each candidate is then json_decoded and its top-level
+     * metadata.identity_hash compared with hash_equals, so neither a wildcard
+     * nor a nested key can ever match.
      */
     private function interfaceByIdentityHash(string $identityHash): ?array
     {
-        // Narrowing filter only; the exact check happens in PHP below. The hash
-        // is already [0-9a-f]{32} so it carries no LIKE metacharacter, but we
-        // still escape %, _ and \ and declare the escape character, so the
-        // pattern stays exact even if normaliseIdentityHashClaim() is loosened.
-        $escaped = str_replace(['\\', '%', '_'], ['\\\\', '\\%', '\\_'], $identityHash);
-        $pattern = '%"identity_hash":"' . $escaped . '"%';
+        // Narrowing filter only; the exact check is the hash_equals below.
+        //
+        // No ESCAPE clause, and no SQL string literal at all. MySQL and MariaDB
+        // treat a backslash in a string literal as an escape (Database::connect
+        // does not set NO_BACKSLASH_ESCAPES), so ESCAPE '\' is an unterminated
+        // literal there: every browser registration would fail to prepare while
+        // SQLite, which the tests use, accepts it. The claim reaching here is
+        // already [0-9a-f]{32} (normaliseIdentityHashClaim), so the pattern
+        // carries no LIKE metacharacter and no backslash on any engine; were the
+        // validation ever loosened, a wildcard would only widen the candidates,
+        // and hash_equals still rejects every row whose top-level value differs.
+        // tests/no_backslash_in_sql_literals_test.php guards the literal.
+        $pattern = '%"identity_hash":"' . $identityHash . '"%';
 
         $stmt = $this->db->prepare(
-            "SELECT interface_id, name, metadata_json
+            'SELECT interface_id, name, metadata_json
              FROM interfaces
-             WHERE metadata_json LIKE :hash_pattern ESCAPE '\\'"
+             WHERE metadata_json LIKE :hash_pattern'
         );
         $stmt->bindValue(':hash_pattern', $pattern, PDO::PARAM_STR);
         $stmt->execute();
