@@ -71,8 +71,20 @@ trait RequestInterfaceRegistryTrait
         // the same browser/client across restarts reuses its interface.
         // Avoids name+client collisions where multiple different clients
         // share the same name (e.g. "Retichat Web").
-        $identityHash = (string) ($metadata['identity_hash'] ?? '');
-        if ($identityHash !== '') {
+        //
+        // A raw identity_hash is only an UNAUTHENTICATED ownership claim (no
+        // signature yet — that is the follow-up redesign). So it is honoured
+        // for row matching ONLY when it is a well-formed identity hash:
+        // exactly 32 lowercase hex characters (RNS TRUNCATED_HASHLENGTH is
+        // 128 bits = 16 bytes = 32 hex), which is what Retichat-js sends.
+        // Anything else — a SQL LIKE wildcard like '%' or '_%', a wrong length,
+        // upper-case, a value
+        // carrying quotes or backslashes, or a non-string — is treated as NO
+        // identity claim: the client gets a fresh row and can never re-bind,
+        // let alone re-bind an arbitrary existing row. A malformed-but-present
+        // claim is logged, never swallowed.
+        $identityHash = self::normaliseIdentityHashClaim($metadata['identity_hash'] ?? null);
+        if ($identityHash !== null) {
             $existing = $this->interfaceByIdentityHash($identityHash);
             if ($existing !== null) {
                 $interfaceId = (string) $existing['interface_id'];
@@ -99,6 +111,14 @@ trait RequestInterfaceRegistryTrait
                     'interface_id' => $interfaceId,
                     'session_token' => $sessionToken,
                 ];
+            }
+        } else {
+            $rawIdentityClaim = $metadata['identity_hash'] ?? null;
+            // A present-but-malformed claim must speak before it is dropped
+            // (silent-failures rule). An absent claim (null or '') is the
+            // normal "no identity" case and is not noise worth logging.
+            if ($rawIdentityClaim !== null && $rawIdentityClaim !== '') {
+                error_log('[REG-BAD-IDENTITY] interface register: identity_hash claim is not 32 lowercase hex; treating as no identity (new row, no re-bind)');
             }
         }
 
@@ -374,19 +394,77 @@ trait RequestInterfaceRegistryTrait
         return null;
     }
 
+    /**
+     * Normalise a raw identity_hash claim from registration metadata.
+     *
+     * Returns the claim when it is a well-formed identity hash — exactly 32
+     * lowercase hex characters (16-byte RNS TRUNCATED_HASHLENGTH) — or null for
+     * anything else: a non-string, the empty string, a LIKE wildcard, a wrong
+     * length, upper-case, or a value carrying quotes/backslashes. Callers treat
+     * null as "no identity claim", so a claim can never re-bind a row unless it
+     * is a real identity hash.
+     *
+     * Lower-case is required, not coerced: the only browser client
+     * (Retichat-js post_interface.js, from IdMgr.hash = Buffer.toString('hex'))
+     * always sends lower-case, so an upper-case claim is not a legitimate
+     * re-registration and is treated as no identity. If a client that emits
+     * upper-case is ever added, normalise it at that boundary — not here, where
+     * loosening the match is what a wildcard attack would exploit.
+     */
+    private static function normaliseIdentityHashClaim(mixed $claim): ?string
+    {
+        if (!is_string($claim)) {
+            return null;
+        }
+        if (preg_match('/^[0-9a-f]{32}$/', $claim) !== 1) {
+            return null;
+        }
+
+        return $claim;
+    }
+
+    /**
+     * Find the interface row whose metadata's TOP-LEVEL identity_hash equals the
+     * given (already normalised, 32 lowercase hex) claim.
+     *
+     * This is an EXACT match on the top-level value, never a bare LIKE. A LIKE
+     * match let a claim of '%' or '_%' re-bind an arbitrary browser row with no
+     * knowledge, and let a nested {"x":{"identity_hash":"…"}} in some unrelated
+     * row's metadata match another client's claim. We narrow candidate rows
+     * with an escaped LIKE — portable across SQLite (staging) and MySQL 8.4 /
+     * MariaDB 11.4 (production) — then json_decode each candidate and compare
+     * the top-level metadata.identity_hash with hash_equals, so neither a
+     * wildcard nor a nested key can ever match.
+     */
     private function interfaceByIdentityHash(string $identityHash): ?array
     {
+        // Narrowing filter only; the exact check happens in PHP below. The hash
+        // is already [0-9a-f]{32} so it carries no LIKE metacharacter, but we
+        // still escape %, _ and \ and declare the escape character, so the
+        // pattern stays exact even if normaliseIdentityHashClaim() is loosened.
+        $escaped = str_replace(['\\', '%', '_'], ['\\\\', '\\%', '\\_'], $identityHash);
+        $pattern = '%"identity_hash":"' . $escaped . '"%';
+
         $stmt = $this->db->prepare(
             "SELECT interface_id, name, metadata_json
              FROM interfaces
-             WHERE metadata_json LIKE :hash_pattern
-             LIMIT 1"
+             WHERE metadata_json LIKE :hash_pattern ESCAPE '\\'"
         );
-        $stmt->bindValue(':hash_pattern', '%"identity_hash":"' . $identityHash . '"%', PDO::PARAM_STR);
+        $stmt->bindValue(':hash_pattern', $pattern, PDO::PARAM_STR);
         $stmt->execute();
-        $row = $stmt->fetch(PDO::FETCH_ASSOC);
 
-        return is_array($row) ? $row : null;
+        while (($row = $stmt->fetch(PDO::FETCH_ASSOC)) !== false) {
+            if (!is_array($row)) {
+                continue;
+            }
+            $metadata = self::decodeJson((string) ($row['metadata_json'] ?? ''));
+            $stored = $metadata['identity_hash'] ?? null;
+            if (is_string($stored) && hash_equals($stored, $identityHash)) {
+                return $row;
+            }
+        }
+
+        return null;
     }
 
     public function touchPeerWakeSent(string $interfaceId): void
