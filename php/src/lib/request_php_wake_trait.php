@@ -259,9 +259,22 @@ trait RequestPhpWakeTrait
      * for us.
      *
      * This is a SYNCHRONOUS operation — it blocks until the peer responds.
-     * It is called from the wake runner (background process spawned via exec()),
-     * NOT from the main exchange epilogue. This keeps the main request path
-     * non-blocking while still allowing full bidirectional exchange.
+     * Its caller is the POST /v1/wake handler, inline, with the waker_url
+     * from the request body.
+     *
+     * The peer's credentials go ONLY to the URL stored on the peer's row.
+     * Until 2026-10-03 they went to $peerUrl . '/v1/interfaces/exchange',
+     * the caller's own string. The row lookup compares under the table's
+     * utf8mb4_unicode_ci collation on MySQL/MariaDB, which ignores case,
+     * accents, fullwidth forms and trailing spaces, so a wake from
+     * https://rétichat.com/reticulum (an IDN look-alike anyone can register,
+     * with its own certificate) found the row for retichat.com and was sent
+     * retichat.com's peer_interface_id and peer_session_token. SQLite compares
+     * bytes, so no test saw it. The lookup is therefore not an identity check:
+     * the caller's URL must equal the row's peer_url byte for byte after the
+     * same normalisation (canonicalPeerBaseUrl), compared here in PHP, or
+     * nothing is sent and nothing owed to the real peer is drained.
+     * Pinned by tests/wake_exchanges_only_with_stored_peer_url_test.php.
      */
     public function exchangeWithPhpPeer(string $peerUrl): array
     {
@@ -269,6 +282,25 @@ trait RequestPhpWakeTrait
         if ($peer === null) {
             return ['status' => 'unknown_peer', 'peer_url' => $peerUrl];
         }
+
+        $storedBaseUrl = self::canonicalPeerBaseUrl((string) ($peer['peer_url'] ?? ''));
+        $callerBaseUrl = self::canonicalPeerBaseUrl($peerUrl);
+        if ($storedBaseUrl === '' || !hash_equals($storedBaseUrl, $callerBaseUrl)) {
+            // Not [WAKE-DROP]: that is a wake of ours that did not leave. This
+            // is someone else's wake that the lookup matched to a peer it is
+            // not. json_encode escapes non-ASCII and control characters, so
+            // the look-alike shows as what it is and cannot forge a log line.
+            error_log(sprintf(
+                '[WAKE-REFUSED] waker_url %s matched peer row %s, whose peer_url is %s; '
+                    . 'not the same bytes, so no exchange and no credentials sent',
+                self::wakeLogValue($peerUrl),
+                self::wakeLogValue((string) ($peer['interface_id'] ?? '')),
+                self::wakeLogValue((string) ($peer['peer_url'] ?? ''))
+            ));
+
+            return ['status' => 'refused', 'reason' => 'waker_url_is_not_the_stored_peer_url', 'peer_url' => $peerUrl];
+        }
+        $peerUrl = $storedBaseUrl;
 
         $peerInterfaceId = (string) ($peer['peer_interface_id'] ?? '');
         $peerSessionToken = (string) ($peer['peer_session_token'] ?? '');
@@ -279,8 +311,9 @@ trait RequestPhpWakeTrait
         // Collect pending ack batch IDs owed to this peer.
         $ackBatchIds = $this->drainPeerAckBatchIds((string) $peer['interface_id']);
 
-        // Call the peer's exchange endpoint.
-        $exchangeUrl = $peerUrl . '/v1/interfaces/exchange';
+        // Call the peer's exchange endpoint: the STORED URL, never the
+        // request's string (see above).
+        $exchangeUrl = $storedBaseUrl . '/v1/interfaces/exchange';
 
         try {
             $payload = json_encode([
@@ -326,6 +359,40 @@ trait RequestPhpWakeTrait
             'delivery_packets' => count($deliveryPackets),
             'delivery_batch_id' => $deliveryBatchId,
         ];
+    }
+
+    /**
+     * A PHP peer's base URL, as both sides of the wake comparison see it:
+     * trailing '/' removed, then one trailing '/v1/wake' removed (rows and
+     * wakers have carried either form), then trailing '/' again. Nothing
+     * else changes: no case folding, no IDN conversion, no default-port
+     * removal; anything looser would only widen what a look-alike can match.
+     * A legitimate waker sends its host_url, rtrim(trim(), '/'). On the node
+     * it registered at, the row holds that same string (registerInterface
+     * stored it). On the initiator, the row holds the initiator's own
+     * [interfaces] node_url for it (connectToPeer stored it), so the two
+     * configs must spell the URL with the same bytes; if they differ, say
+     * only in case, that node's wakes are refused and say [WAKE-REFUSED].
+     */
+    private static function canonicalPeerBaseUrl(string $url): string
+    {
+        $url = rtrim($url, '/');
+        if (str_ends_with($url, '/v1/wake')) {
+            $url = rtrim(substr($url, 0, -strlen('/v1/wake')), '/');
+        }
+
+        return $url;
+    }
+
+    /** A request-supplied string made safe and bounded for one error_log line. */
+    private static function wakeLogValue(string $value): string
+    {
+        $encoded = json_encode(
+            strlen($value) > 200 ? substr($value, 0, 200) . '...' : $value,
+            JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE
+        );
+
+        return is_string($encoded) ? $encoded : '"(unencodable)"';
     }
 
     private function drainPeerAckBatchIds(string $peerInterfaceId): array
