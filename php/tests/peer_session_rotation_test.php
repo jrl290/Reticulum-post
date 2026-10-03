@@ -22,14 +22,35 @@
  * A has an [interfaces] block for B, as an initiator does. Driven over HTTP;
  * the SQL step runs on A's database, as `node.sh sql-<node>` runs it.
  *
+ * The same credentials leaked a second way until 2026-10-03: POST /v1/wake
+ * sent a row's peer_interface_id + peer_session_token to any waker_url the
+ * row lookup matched, which on MySQL/MariaDB includes accent and case
+ * look-alikes (tests/wake_exchanges_only_with_stored_peer_url_test.php).
+ * (a) shows a wake sends exactly the pair this procedure revokes. A rotation
+ * done while either node still runs the old wake code can leak the new pair
+ * the same way, so README gates the procedure on that fix being live on
+ * every node; (d) pins that gate and checks its git query names the fix.
+ *
  * Run: php tests/peer_session_rotation_test.php
+ * ROTATION_README_PATH and ROTATION_WAKE_TRAIT_PATH point (d) at other
+ * copies, for mutation checks.
  */
 declare(strict_types=1);
 
 $src = dirname(__DIR__) . '/src';
+$repoRoot = dirname(__DIR__, 2);
+$readmePath = getenv('ROTATION_README_PATH') ?: $repoRoot . '/README.md';
+$wakeTraitPath = getenv('ROTATION_WAKE_TRAIT_PATH') ?: $src . '/lib/request_php_wake_trait.php';
 
 /** The procedure's SQL step, exactly as README gives it. */
 const ROTATE_SQL = 'DELETE FROM interfaces WHERE peer_url = :peer_url AND peer_interface_id IS NOT NULL';
+
+/**
+ * README's gate on the wake fix, exactly as README gives it. The `:?` makes
+ * an empty result an error: verify-live-stamp.sh reads an empty ref as HEAD.
+ */
+const GATE_FIX_LINE = 'FIX="$(git log --reverse --format=%H -S canonicalPeerBaseUrl -- php/src/lib/request_php_wake_trait.php | head -1)"';
+const GATE_STAMP_LINE = './verify-live-stamp.sh "${FIX:?the wake fix is not in this checkout}"';
 
 $pass = 0;
 $fail = 0;
@@ -172,6 +193,12 @@ check('the credential A holds for B is B\'s row id and token',
     $leakedAtB === [(string) ($rowB['interface_id'] ?? '-'), (string) ($rowB['session_token'] ?? '-')]);
 check('A accepts an exchange with the credential B\'s /health leaked', exchange($a, ...$leakedAtA) === 200);
 check('B accepts an exchange with the credential A\'s monitor leaked', exchange($b, ...$leakedAtB) === 200);
+// A wake into B makes B present the pair it holds for A at A's exchange; A
+// accepts only leakedAtA for that row. Before the wake fix B sent that same
+// pair to a look-alike waker_url instead, so it is what (c) must see dead.
+[$status, $woke] = http('POST', $b['base'] . '/v1/wake', ['waker_url' => $a['base']]);
+check('a wake into B sends A the credential B\'s /health leaked, and A accepts it',
+    $status === 200 && ($woke['exchange']['status'] ?? null) === 'ok', json_encode($woke));
 
 echo "(b) rotate: the SQL step on A, peer traffic, then GET /v1/initialize\n";
 $stmt = db($a)->prepare(ROTATE_SQL);
@@ -202,9 +229,48 @@ check('B holds A\'s new credential', ($newB['peer_interface_id'] ?? null) === $n
     && ($newB['peer_session_token'] ?? null) === ($newA['session_token'] ?? '-'));
 check('A accepts B with the new credential', exchange($a, (string) ($newB['peer_interface_id'] ?? ''), (string) ($newB['peer_session_token'] ?? '')) === 200);
 check('B accepts A with the new credential', exchange($b, (string) ($newA['peer_interface_id'] ?? ''), (string) ($newA['peer_session_token'] ?? '')) === 200);
+[$status, $woke] = http('POST', $b['base'] . '/v1/wake', ['waker_url' => $a['base']]);
+check('a wake into B now sends A the new credential, and A accepts it',
+    $status === 200 && ($woke['exchange']['status'] ?? null) === 'ok', json_encode($woke));
 
 stopNode($a);
 stopNode($b);
+
+echo "(d) README's gate: rotate only once both leaks are closed on every node\n";
+$readme = (string) @file_get_contents($readmePath);
+$sectionAt = strpos($readme, "## Rotating a PHP peering's credentials");
+$stepOneAt = $sectionAt === false ? false : strpos($readme, "\n1. **Read", $sectionAt);
+$gate = ($sectionAt !== false && $stepOneAt !== false) ? substr($readme, $sectionAt, $stepOneAt - $sectionAt) : '';
+check('README has the rotation section, with its gate before step 1', $gate !== '', $readmePath);
+check('the gate: /health and /v1/monitor publish no peer_session_token',
+    str_contains($gate, 'grep -c peer_session_token') && str_contains($gate, '/v1/monitor/data'));
+check('the gate: every node runs the /v1/wake fix, by build stamp, failing on an empty ref',
+    str_contains($gate, '`POST /v1/wake`') && str_contains($gate, GATE_FIX_LINE) && str_contains($gate, GATE_STAMP_LINE));
+// The gate finds the fix by the first commit that added canonicalPeerBaseUrl
+// to the wake trait. If the fix is renamed, the query silently finds nothing.
+$wakeTrait = (string) @file_get_contents($wakeTraitPath);
+check('the name the gate searches for is the wake fix: exchangeWithPhpPeer compares canonicalPeerBaseUrl() forms',
+    preg_match('/private static function canonicalPeerBaseUrl\(/', $wakeTrait) === 1
+        && str_contains($wakeTrait, 'self::canonicalPeerBaseUrl($peerUrl)')
+        && str_contains($wakeTrait, 'hash_equals($storedBaseUrl, $callerBaseUrl)'),
+    $wakeTraitPath);
+$git = 'git -C ' . escapeshellarg($repoRoot) . ' ';
+exec($git . 'rev-parse --is-inside-work-tree 2>/dev/null', $ignored, $rc);
+if ($rc !== 0) {
+    echo "  skip the gate's git query: $repoRoot is not a git checkout\n";
+} else {
+    $found = [];
+    exec($git . 'log --reverse --format=%H -S canonicalPeerBaseUrl -- php/src/lib/request_php_wake_trait.php 2>&1', $found, $rc);
+    $fix = $found[0] ?? '';
+    check('the gate\'s git query finds a commit in this checkout', $rc === 0 && preg_match('/^[0-9a-f]{40}$/', $fix) === 1, implode(' ', $found));
+    if (preg_match('/^[0-9a-f]{40}$/', $fix) === 1) {
+        $atFix = (string) shell_exec($git . 'show ' . escapeshellarg($fix . ':php/src/lib/request_php_wake_trait.php') . ' 2>/dev/null');
+        $beforeFix = (string) shell_exec($git . 'show ' . escapeshellarg($fix . '^:php/src/lib/request_php_wake_trait.php') . ' 2>/dev/null');
+        check('that commit is the wake fix: it adds the check, its parent has none',
+            str_contains($atFix, 'hash_equals($storedBaseUrl, $callerBaseUrl)') && !str_contains($beforeFix, 'canonicalPeerBaseUrl'),
+            substr($fix, 0, 7));
+    }
+}
 
 echo "\n$pass passed, $fail failed\n";
 exit($fail === 0 ? 0 : 1);

@@ -188,9 +188,34 @@ the peer, which keeps them as `peer_interface_id` + `peer_session_token`. The
 peer's own row id and token travel back the same way. Until 2026-09-30 `/health`
 published the peer's copy of the initiator's credential in the row metadata, and
 `/v1/monitor` published the `peer_session_token` column, so both halves were
-public. Rotate only once every node runs code that publishes neither (check with
-`curl -s https://<node>/reticulum/health | grep -c peer_session_token`, and the
-same for `/v1/monitor/data`: both must print 0), or the new tokens leak too.
+public.
+
+`POST /v1/wake` handed them out too, from 606d800 (2026-07-10) until the fix
+that added `canonicalPeerBaseUrl()` (2026-10-03). A wake sent a row's
+`peer_interface_id` + `peer_session_token` to whatever `waker_url` the request
+named, as long as the row lookup matched it, and on MySQL/MariaDB
+`utf8mb4_unicode_ci` matches look-alikes such as `https://rétichat.com/reticulum`.
+Nothing logged where they went. Treat the credentials in use when that fix goes
+live as leaked, including the ones the 2026-10-01 rotation made, and rotate
+again once it is live on both nodes.
+
+Rotate only once every node runs code that closes both leaks, or the new tokens
+leak too:
+
+- **Publishes neither.** `curl -s https://<node>/reticulum/health | grep -c peer_session_token`,
+  and the same for `/v1/monitor/data`, must both print 0.
+- **Sends a peer's credentials only to the row's own URL.** Every node must be
+  at the wake fix (✓) or "ahead of" it. Anything else ("behind", "diverged",
+  no stamp, no answer) means the fix is not proven live there: do not rotate.
+
+  ```bash
+  FIX="$(git log --reverse --format=%H -S canonicalPeerBaseUrl -- php/src/lib/request_php_wake_trait.php | head -1)"
+  ./verify-live-stamp.sh "${FIX:?the wake fix is not in this checkout}"
+  ```
+
+  The `:?` matters: given an empty ref, `verify-live-stamp.sh` compares
+  against `HEAD`, and on a checkout without the fix that would pass a node
+  that still leaks.
 
 1. **Read, on both nodes.** Which one has the block, and the "before" state
    (fingerprints, never tokens):
@@ -242,10 +267,10 @@ those users should reload. The peer's row, its queue and its paths survive.
 
 The gateway bridge needs none of this: the `peer_session_token` it registers is
 never checked (Reticulum-rust `post_interface.rs` wake server), and the bridge's
-real `session_token` was never published.
+real `session_token` was never published. A wake sends only the unchecked one.
 
 `php/tests/peer_session_rotation_test.php` runs this procedure on two real
-nodes, with a peer exchange between the two commands.
+nodes, with a peer exchange between the two commands, and pins the gate above.
 
 ## Storage Budget
 
