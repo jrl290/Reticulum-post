@@ -46,10 +46,10 @@
 #           its live name (lib/ first, so a request that meets a new entry
 #           point meets the whole new lib/; each rename is atomic and the set
 #           takes milliseconds) and removes the RETIRED files. If a rename or
-#           removal fails, the same command puts back what it had changed, from
-#           the rollback copy, stamp included. It ignores a hang-up, so a
-#           dropped connection does not stop it half way. The live files are
-#           then linted again.
+#           removal fails, the same command puts back what it had changed, by
+#           renames out of the rollback copy (no free space needed), stamp
+#           included. It ignores a hang-up, so a dropped connection does not
+#           stop it half way. The live files are then linted again.
 #
 # It also leaves a build stamp: build.json (write-build-stamp.sh) names the
 # commit, and GET /health publishes it, so verify-live-stamp.sh can say which
@@ -370,9 +370,11 @@ swap_node() {
   # "unknown" (from here until the stamp step the node's code is unproven),
   # every file is renamed over its live name, and the RETIRED files the ref
   # does not ship are removed. If any of that fails, it puts back what it had
-  # changed, each file by a rename again: from the rollback copy what was
+  # changed, each file by a rename again: out of the rollback copy what was
   # there before, and back into ~/reticulum-incoming what was not (it never
-  # deletes a file to undo), then the old stamp.
+  # deletes a file to undo), then the old stamp. Renames need no free space,
+  # so the undo still works on the full disk that may have stopped the swap;
+  # the copy is spent by it, and the next deploy makes a new one.
   local inc="~/${INCOMING_DIR}" rb="~/${ROLLBACK_DIR}"
   local swap="cd ~/${REMOTE_DIR} || exit 1"
   swap+="; trap '' HUP PIPE"
@@ -386,7 +388,7 @@ swap_node() {
     swap+="; if [ -z \"\$failed\" ]; then for f in ${REMOVE_FILES}; do rm -f \$f || { failed=\$f; break; }; done; fi"
   fi
   swap+="; if [ -n \"\$failed\" ]; then bad="
-  swap+="; put_back() { cp ${rb}/\$1 ${inc}/.put-back && mv -f ${inc}/.put-back \$1; }"
+  swap+="; put_back() { mv -f ${rb}/\$1 \$1; }"
   swap+="; for f in \$moved; do if [ -f ${rb}/\$f ]; then put_back \$f || bad=\"\$bad \$f\"; else mv -f \$f ${inc}/\$f || bad=\"\$bad \$f\"; fi; done"
   if [[ -n "$REMOVE_FILES" ]]; then
     swap+="; for f in ${REMOVE_FILES}; do [ -f \$f ] || [ ! -f ${rb}/\$f ] || put_back \$f || bad=\"\$bad \$f\"; done"

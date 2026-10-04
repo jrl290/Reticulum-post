@@ -174,7 +174,8 @@ renames every file over its live name (`lib/` first; each rename is atomic and
 the set takes milliseconds) and removes the files listed in `RETIRED` in
 `deploy.sh`. Before the swap the node's code and stamp are copied to
 `~/reticulum-rollback`. If a rename or removal fails, the same command puts
-the previous release back from that copy, stamp included. It ignores a
+the previous release back, stamp included, by renames out of that copy, which
+need no free space (a full disk is the likeliest cause). It ignores a
 hang-up, so a connection that drops part way leaves the node to finish the
 swap. A failure after the swap prints the command that puts the copy back. A
 commit that deletes a file under `php/src` adds it to `RETIRED`; an entry can

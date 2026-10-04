@@ -39,9 +39,10 @@
  *       after the swap would otherwise stop it with one node already live; a
  *       node file whose name has a space, and a RETIRED file that no longer
  *       parses, stop nothing (scenario (a));
- *   (h) a rename that fails part way through the swap: the same command puts
- *       the previous release back, stamp included, the files it added moved
- *       back to ~/reticulum-incoming;
+ *   (h) a rename that fails part way through the swap, the disk full from
+ *       then on: the same command puts the previous release back, stamp
+ *       included, by renames out of ~/reticulum-rollback, the files it added
+ *       moved back to ~/reticulum-incoming;
  *   (i) a connection that drops part way through the swap (SIGHUP and SIGPIPE
  *       to the node's shell, the answer lost): the node finishes the swap;
  *   (j) deploy.sh refuses a RETIRED list naming a file the node owns
@@ -430,7 +431,8 @@ SH,
     $remoteBin . '/mv' => <<<'SH'
 #!/usr/bin/env bash
 # mv on the node: logs what the stamp said at the instant of each rename.
-# STUB_MV_FAIL=<rel>: renaming ~/reticulum-incoming/<rel> fails (a full disk).
+# STUB_MV_FAIL=<rel>: renaming ~/reticulum-incoming/<rel> fails, and the
+# disk is full from then on: every cp on the node fails.
 # STUB_MV_HUP=<rel>: before renaming it, the connection drops: the shell
 # running the command gets SIGHUP and SIGPIPE, and the ssh stand-in returns
 # none of its output.
@@ -440,6 +442,7 @@ for a in "$@"; do case "$a" in -*) ;; *) ops+=("$a") ;; esac; done
 src=$(abs_path "${ops[0]:-}")
 if [[ -n "${STUB_MV_FAIL:-}" && "$src" == "$HOME/reticulum-incoming/$STUB_MV_FAIL" ]]; then
   printf 'MVFAIL\t%s\t%s\t%s\n' "${STUB_OP:-?}" "${STUB_NODE:-?}" "$src" >> "$STUB_LOG"
+  : > "$STUB_LOG.full"
   echo "mv: cannot move '${ops[0]}': Disk quota exceeded" >&2
   exit 1
 fi
@@ -464,7 +467,13 @@ SH,
     $remoteBin . '/cp' => <<<'SH'
 #!/usr/bin/env bash
 # cp on the node. With STUB_CP_DROP=<path under the live directory>, a copy
-# into ~/reticulum-rollback loses that one file, as a full disk would.
+# into ~/reticulum-rollback loses that one file, as a full disk would. Once
+# the mv stand-in has filled the disk (STUB_MV_FAIL), every cp fails.
+if [[ -f "$STUB_LOG.full" ]]; then
+  printf 'CPFULL\t%s\t%s\n' "${STUB_OP:-?}" "${STUB_NODE:-?}" >> "$STUB_LOG"
+  echo "cp: Disk quota exceeded" >&2
+  exit 1
+fi
 /bin/cp "$@"
 rc=$?
 if [[ -n "${STUB_CP_DROP:-}" ]]; then
@@ -611,6 +620,7 @@ $readLog = static function () use ($stubLog): array {
 $deploy = static function (string $ref, string $only = '', array $extraEnv = []) use ($isolated, $readLog, $wrapper, $fakeEnv, $clone, $stubLog, $stubOps): array {
     @unlink($stubLog);
     @unlink($stubOps);
+    @unlink($stubLog . '.full');
     [$code, $out] = $isolated(implode(' ', array_map('esc', array_filter(
         ['bash', $wrapper, $fakeEnv, $clone . '/deploy.sh', $ref, $only],
         static fn (string $a): bool => $a !== '',
@@ -956,7 +966,7 @@ foreach ($nodes as $name => $nodeHome) {
 }
 
 // ── (h) a rename that fails part way ─────────────────────────────────────
-echo "(h) a swap that fails part way puts the previous release back in the same command\n";
+echo "(h) a swap that fails part way, on a full disk, puts the previous release back in the same command\n";
 $added = 'lib/added_by_this_release.php';
 $withAdded = $commitOnHead(["php/src/$added" => "<?php\n// new in this release\n"], 'deploy test: a release that adds a file');
 $resetNode($home);
@@ -969,8 +979,8 @@ $swapOps = array_values(array_filter($log['ops'], static fn (array $o): bool => 
 $swapMvs = array_values(array_filter($log['mvs'], static fn (array $m): bool => $m['op'] === ($swapOps[0]['op'] ?? -1)));
 $addedIn = array_filter($swapMvs, static fn (array $m): bool => $m['src'] === "$home/reticulum-incoming/$added" && $m['dst'] === "$live/$added");
 $addedOut = array_filter($swapMvs, static fn (array $m): bool => $m['src'] === "$live/$added" && $m['dst'] === "$home/reticulum-incoming/$added");
-$putBack = array_filter($swapMvs, static fn (array $m): bool => $m['src'] === "$home/reticulum-incoming/.put-back" && within($m['dst'], $live));
-check('...one command renamed lib/ in, the new file included, failed at the entry point, and renamed it all back',
+$putBack = array_filter($swapMvs, static fn (array $m): bool => within($m['src'], "$home/reticulum-rollback") && within($m['dst'], $live));
+check('...one command renamed lib/ in, the new file included, failed at the entry point, and renamed it all back out of ~/reticulum-rollback',
     count($swapOps) === 1 && $addedIn !== [] && $addedOut !== [] && count($putBack) > 1
     && array_filter($log['ops'], static fn (array $o): bool => $o['changed']) === [],
     count($swapOps) . ' swap command(s), ' . count($swapMvs) . ' renames, ' . count($putBack) . ' put back');
@@ -980,14 +990,8 @@ check('...the file the release added went back to ~/reticulum-incoming, not dele
     !file_exists("$live/$added") && is_file("$home/reticulum-incoming/$added"));
 check('...no rm touched the live directory', array_filter($log['rms'], static fn (array $r): bool => within($r['path'], $live)) === [],
     implode(', ', array_column($log['rms'], 'path')));
-check('...and ~/reticulum-rollback still holds the previous tree', (function () use ($beforeH, $home, $isLiveCode): bool {
-    foreach ($beforeH as $rel => $hash) {
-        if ($isLiveCode($rel) && @md5_file("$home/reticulum-rollback/" . substr($rel, strlen('public_html/reticulum/'))) !== $hash) {
-            return false;
-        }
-    }
-    return true;
-})());
+check('...all of it with the disk full from the failed rename on (the stand-in\'s cp refused from then)',
+    is_file($stubLog . '.full'));
 
 // ── (i) the connection drops part way through the swap ──────────────────
 echo "(i) a connection that drops part way through the swap does not stop it there\n";
