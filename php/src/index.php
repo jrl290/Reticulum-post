@@ -24,7 +24,6 @@ require_once __DIR__ . '/lib/request_path_state_trait.php';
 require_once __DIR__ . '/lib/request_relay_routing_trait.php';
 require_once __DIR__ . '/lib/request_schema_trait.php';
 require_once __DIR__ . '/lib/request_storage_budget_trait.php';
-require_once __DIR__ . '/lib/request_wake_dispatch_trait.php';
 require_once __DIR__ . '/lib/request_php_wake_trait.php';
 
 // Reticulum-php is request-operated. Queued transport bytes only move during
@@ -497,19 +496,6 @@ final class Config
         $debugConfig['max_rows'] = self::positiveConfigIntOrDefault($debugConfig, 'max_rows', 'debug.max_rows', 20);
         $config['debug'] = $debugConfig;
 
-        $wakeConfig = $config['wake'] ?? [];
-        if (!is_array($wakeConfig)) {
-            throw new RuntimeException('wake configuration must be an object');
-        }
-
-        $wakeProfiles = $wakeConfig['profiles'] ?? [];
-        if (!is_array($wakeProfiles)) {
-            throw new RuntimeException('wake.profiles configuration must be an object');
-        }
-
-        $wakeConfig['profiles'] = $wakeProfiles;
-        $config['wake'] = $wakeConfig;
-
         $config = self::normalizeTcpBridgeConfig($projectRoot, $config);
         return $config;
     }
@@ -571,20 +557,6 @@ final class Config
         $legacyBridge['wake_profile'] = $wakeProfile;
         $legacyBridge['wake_target'] = self::optionalConfigString($legacyBridge, 'wake_target') ?? $bridgeName;
         $config['tcp_bridge'] = $legacyBridge;
-
-        if (isset($config['wake']['profiles'][$wakeProfile])) {
-            return $config;
-        }
-
-        $config['wake']['profiles'][$wakeProfile] = [
-            'type' => 'command',
-            'command' => [
-                PHP_BINARY !== '' ? PHP_BINARY : 'php',
-                resolveRuntimeScriptPath($projectRoot, 'tcp_bridge.php'),
-                'wake',
-                $statePath,
-            ],
-        ];
 
         return $config;
     }
@@ -1198,315 +1170,6 @@ final class TransportConstants
     public const PATH_REQUEST_TIMEOUT = 15;
 }
 
-final class WakeConfig
-{
-    public static function fromMetadata(array $metadata): ?array
-    {
-        $wakeUrl = $metadata['wake_url'] ?? null;
-        if (!is_string($wakeUrl) || trim($wakeUrl) === '') {
-            return null;
-        }
-
-        $wakeUrl = rtrim(trim($wakeUrl), '/');
-        return [
-            'profile' => '__http_wake__',
-            'target' => $wakeUrl,
-            'data' => ['wake_url' => $wakeUrl],
-        ];
-    }
-}
-
-// Wake is not a second transport path. Reticulum-php deliberately consolidates
-// bidirectional transfer into a request/response exchange, so wake providers
-// exist only to nudge a peer or local helper to originate the next request when
-// queued data must reach an address we cannot directly push to, such as a node
-// behind NAT.
-interface WakeProvider
-{
-    public function dispatch(array $profile, array $event): array;
-}
-
-final class LogWakeProvider implements WakeProvider
-{
-    public function dispatch(array $profile, array $event): array
-    {
-        $logPath = $profile['log_path'] ?? null;
-        if (!is_string($logPath) || trim($logPath) === '') {
-            throw new RuntimeException('log wake profile requires a non-empty log_path');
-        }
-
-        $payload = [
-            'wake_event' => $event,
-            'dispatched_at' => time(),
-        ];
-        $line = json_encode($payload, JSON_THROW_ON_ERROR | JSON_PARTIAL_OUTPUT_ON_ERROR) . PHP_EOL;
-        if (file_put_contents($logPath, $line, FILE_APPEND | LOCK_EX) === false) {
-            throw new RuntimeException('failed to append wake event to log sink');
-        }
-
-        return [
-            'type' => 'log',
-            'log_path' => $logPath,
-        ];
-    }
-}
-
-final class CommandWakeProvider implements WakeProvider
-{
-    public function dispatch(array $profile, array $event): array
-    {
-        $command = $profile['command'] ?? null;
-        if (!is_array($command) || $command === []) {
-            throw new RuntimeException('command wake profile requires a non-empty command array');
-        }
-
-        foreach ($command as $part) {
-            if (!is_string($part) || $part === '') {
-                throw new RuntimeException('command wake profile command entries must be non-empty strings');
-            }
-        }
-
-        $cwd = $profile['cwd'] ?? null;
-        if ($cwd !== null && (!is_string($cwd) || trim($cwd) === '')) {
-            throw new RuntimeException('command wake profile cwd must be a non-empty string when present');
-        }
-
-        $descriptors = [
-            0 => ['pipe', 'r'],
-            1 => ['pipe', 'w'],
-            2 => ['pipe', 'w'],
-        ];
-        $process = proc_open($command, $descriptors, $pipes, $cwd ?: null);
-        if (!is_resource($process)) {
-            throw new RuntimeException('failed to start wake command');
-        }
-
-        fwrite($pipes[0], json_encode($event, JSON_THROW_ON_ERROR));
-        fclose($pipes[0]);
-
-        $stdout = stream_get_contents($pipes[1]);
-        fclose($pipes[1]);
-
-        $stderr = stream_get_contents($pipes[2]);
-        fclose($pipes[2]);
-
-        $exitCode = proc_close($process);
-        if ($exitCode !== 0) {
-            $stderr = trim((string) $stderr);
-            throw new RuntimeException(
-                $stderr === ''
-                    ? 'wake command exited with status ' . $exitCode
-                    : 'wake command exited with status ' . $exitCode . ': ' . $stderr
-            );
-        }
-
-        return [
-            'type' => 'command',
-            'exit_code' => $exitCode,
-            'stdout' => self::trimOutput((string) $stdout),
-        ];
-    }
-
-    private static function trimOutput(string $output): ?string
-    {
-        $output = trim($output);
-        if ($output === '') {
-            return null;
-        }
-
-        if (strlen($output) > 512) {
-            return substr($output, 0, 512);
-        }
-
-        return $output;
-    }
-}
-
-final class HttpWakeProvider implements WakeProvider
-{
-    public function dispatch(array $profile, array $event): array
-    {
-        $wakeData = $event['wake_data'] ?? null;
-        if (!is_array($wakeData)) {
-            throw new RuntimeException('http wake requires wake_data with wake_url');
-        }
-
-        $wakeUrl = $wakeData['wake_url'] ?? null;
-        if (!is_string($wakeUrl) || trim($wakeUrl) === '') {
-            throw new RuntimeException('http wake requires wake_data.wake_url');
-        }
-
-        $url = rtrim(trim($wakeUrl), '/') . '/v1/wake';
-
-        $hostUrl = $profile['host_url'] ?? null;
-        if (!is_string($hostUrl) || trim($hostUrl) === '') {
-            $hostUrl = $wakeData['host_url'] ?? $wakeUrl;
-        }
-
-        $payload = [
-            'waker_url' => rtrim(trim((string) $hostUrl), '/'),
-            'queue_reason' => (string) ($event['queue_reason'] ?? ''),
-            'queued_packet_count' => (int) ($event['queued_packet_count'] ?? 0),
-        ];
-
-        $response = $this->requestJson(
-            trim($url),
-            $payload,
-            (int) ($profile['http_timeout_seconds'] ?? 5),
-            (int) ($profile['connect_timeout_seconds'] ?? 5),
-        );
-
-        return [
-            'type' => 'http',
-            'status' => (string) ($response['status'] ?? 'ok'),
-            'response' => $response,
-        ];
-    }
-
-    private function requestJson(string $url, array $payload, int $httpTimeoutSeconds, int $connectTimeoutSeconds): array
-    {
-        $headers = ['Content-Type: application/json'];
-        $body = json_encode($payload, JSON_THROW_ON_ERROR | JSON_PARTIAL_OUTPUT_ON_ERROR);
-
-        if (function_exists('curl_init')) {
-            return $this->requestJsonWithCurl($url, $headers, $body, $httpTimeoutSeconds, $connectTimeoutSeconds);
-        }
-
-        return $this->requestJsonWithStreams($url, $headers, $body, $httpTimeoutSeconds);
-    }
-
-    private function requestJsonWithCurl(string $url, array $headers, string $body, int $httpTimeoutSeconds, int $connectTimeoutSeconds): array
-    {
-        $curl = curl_init($url);
-        if ($curl === false) {
-            throw new RuntimeException('Unable to initialise cURL for HTTP wake request');
-        }
-
-        curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
-        curl_setopt($curl, CURLOPT_CUSTOMREQUEST, 'POST');
-        curl_setopt($curl, CURLOPT_HTTPHEADER, $headers);
-        curl_setopt($curl, CURLOPT_TIMEOUT, $httpTimeoutSeconds);
-        curl_setopt($curl, CURLOPT_CONNECTTIMEOUT, $connectTimeoutSeconds);
-        curl_setopt($curl, CURLOPT_POSTFIELDS, $body);
-
-        $responseBody = curl_exec($curl);
-        if ($responseBody === false) {
-            $error = curl_error($curl);
-            throw new RuntimeException('HTTP wake request failed: ' . $error);
-        }
-
-        $statusCode = (int) curl_getinfo($curl, CURLINFO_RESPONSE_CODE);
-
-        if ($statusCode < 200 || $statusCode >= 300) {
-            throw new RuntimeException('HTTP wake request returned ' . $statusCode . ': ' . $responseBody);
-        }
-
-        $decoded = json_decode($responseBody, true, flags: JSON_THROW_ON_ERROR);
-        if (!is_array($decoded)) {
-            throw new RuntimeException('HTTP wake response was not a JSON object');
-        }
-
-        return $decoded;
-    }
-
-    private function requestJsonWithStreams(string $url, array $headers, string $body, int $httpTimeoutSeconds): array
-    {
-        $context = stream_context_create([
-            'http' => [
-                'method' => 'POST',
-                'header' => implode("\r\n", $headers),
-                'content' => $body,
-                'timeout' => $httpTimeoutSeconds,
-                'ignore_errors' => true,
-            ],
-        ]);
-
-        $responseBody = @file_get_contents($url, false, $context);
-        if ($responseBody === false) {
-            $error = error_get_last();
-            throw new RuntimeException('HTTP wake request failed: ' . ($error['message'] ?? 'unknown error'));
-        }
-
-        $headersResponse = $http_response_header ?? [];
-        $statusCode = 0;
-        if (isset($headersResponse[0]) && preg_match('/\s(\d{3})\s/', $headersResponse[0], $matches) === 1) {
-            $statusCode = (int) $matches[1];
-        }
-
-        if ($statusCode < 200 || $statusCode >= 300) {
-            throw new RuntimeException('HTTP wake request returned ' . $statusCode . ': ' . $responseBody);
-        }
-
-        $decoded = json_decode($responseBody, true, flags: JSON_THROW_ON_ERROR);
-        if (!is_array($decoded)) {
-            throw new RuntimeException('HTTP wake response was not a JSON object');
-        }
-
-        return $decoded;
-    }
-}
-
-final class WakeDispatcher
-{
-    public function __construct(private readonly array $config)
-    {
-    }
-
-    public static function validateMetadata(array $metadata, array $config): ?array
-    {
-        $wakeConfig = WakeConfig::fromMetadata($metadata);
-        if ($wakeConfig === null) {
-            return null;
-        }
-
-        return $wakeConfig;
-    }
-
-    public function dispatch(array $event): array
-    {
-        $profileName = (string) ($event['wake_profile'] ?? '');
-        $profile = $this->profileConfig($profileName);
-
-        return match ($profile['type']) {
-            'log' => (new LogWakeProvider())->dispatch($profile, $event),
-            'command' => (new CommandWakeProvider())->dispatch($profile, $event),
-            'http' => (new HttpWakeProvider())->dispatch($profile, $event),
-            default => throw new RuntimeException('unsupported wake provider type: ' . $profile['type']),
-        };
-    }
-
-    private function profileConfig(string $profileName): array
-    {
-        if ($profileName === '__http_wake__') {
-            $hostUrl = $this->config['host_url'] ?? ($this->config['http']['advertise_url'] ?? null);
-            return [
-                'type' => 'http',
-                'host_url' => is_string($hostUrl) ? rtrim(trim($hostUrl), '/') : null,
-                'http_timeout_seconds' => 5,
-                'connect_timeout_seconds' => 5,
-            ];
-        }
-
-        if ($profileName === '') {
-            throw new RuntimeException('wake profile name is required');
-        }
-
-        $profiles = $this->config['wake']['profiles'] ?? [];
-        if (!is_array($profiles) || !isset($profiles[$profileName]) || !is_array($profiles[$profileName])) {
-            throw new RuntimeException('unknown wake profile: ' . $profileName);
-        }
-
-        $profile = $profiles[$profileName];
-        $type = $profile['type'] ?? null;
-        if (!is_string($type) || trim($type) === '') {
-            throw new RuntimeException('wake profile ' . $profileName . ' requires a non-empty type');
-        }
-
-        $profile['type'] = trim($type);
-        return $profile;
-    }
-}
-
 final class Storage
 {
     use RequestControlPlaneTrait;
@@ -1523,7 +1186,6 @@ final class Storage
     use RequestRelayRoutingTrait;
     use RequestSchemaTrait;
     use RequestStorageBudgetTrait;
-    use RequestWakeDispatchTrait;
     use RequestPhpWakeTrait;
 
     private PDO $db;
@@ -1685,7 +1347,6 @@ final class HttpApi
                 if (!$isPhpPeer) {
                     try {
                         $maxPacketBytes = $this->storage->maxPacketBytesForMetadata($metadata);
-                        WakeDispatcher::validateMetadata($metadata, $this->config);
                     } catch (RuntimeException $error) {
                         throw new ApiError(400, $error->getMessage(), ['error' => $error->getMessage()]);
                     }
@@ -2697,15 +2358,9 @@ function runIndexCli(string $projectRoot, array $argv): int
             true,
         );
 
-        $wake = $reticulumPhpStorage->dispatchPendingWakeEvents(
-            (int) ($reticulumPhpConfig['wake']['dispatch_limit'] ?? 32),
-            new WakeDispatcher($reticulumPhpConfig),
-        );
-
         $summary = [
             'status' => 'ok',
             'transport_basis' => requestTransportMechanism(),
-            'wake' => $wake,
             'maintenance' => $maintenance,
             'queues' => $reticulumPhpStorage->healthSummary(),
         ];
@@ -2722,22 +2377,6 @@ function runIndexCli(string $projectRoot, array $argv): int
         $result = $reticulumPhpStorage->reclaimStorage();
         fwrite(STDOUT, json_encode($result, JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR) . PHP_EOL);
         return 0;
-    }
-
-    if ($mode === 'wake-event') {
-        $wakeEventId = isset($argv[2]) ? (int) $argv[2] : 0;
-        if ($wakeEventId <= 0) {
-            fwrite(STDERR, "wake-event mode requires a positive wake event id\n");
-            return 1;
-        }
-
-        $result = $reticulumPhpStorage->dispatchWakeEventById(
-            $wakeEventId,
-            (int) (getmypid() ?: 0),
-            new WakeDispatcher($reticulumPhpConfig),
-        );
-        fwrite(STDOUT, json_encode($result, JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR) . PHP_EOL);
-        return ($result['status'] ?? null) === 'failed' ? 1 : 0;
     }
 
     fwrite(STDERR, "Unsupported index mode: {$mode}\n");

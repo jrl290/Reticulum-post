@@ -1,8 +1,5 @@
 host_url = "https://your-domain.com/reticulum"
 
-[wake]
-dispatch_limit = 4
-
 [storage]
 backend = "mysql"
 mysql_host = "127.0.0.1"

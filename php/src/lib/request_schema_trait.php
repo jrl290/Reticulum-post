@@ -117,6 +117,14 @@ trait RequestSchemaTrait
             ? 'BIGINT AUTO_INCREMENT PRIMARY KEY'
             : 'INTEGER PRIMARY KEY AUTOINCREMENT';
 
+        // wake_events and post_interface_peers are no longer created: their
+        // only readers and writers (the wake_url path and the PostInterface
+        // client of [post_interface_peers]) were removed on 2026-10-04.
+        // Nothing here drops them either. A database that has them (both
+        // live nodes) keeps them, rows and all, and no statement in this
+        // migration names them, so the changed fingerprint costs one more
+        // run of the CREATE ... IF NOT EXISTS / column / index steps below.
+        // RequestStorageBudgetTrait still measures them where they exist.
         $tables = [
             'interfaces' => "
                 CREATE TABLE IF NOT EXISTS interfaces (
@@ -296,24 +304,6 @@ trait RequestSchemaTrait
                     PRIMARY KEY (destination_hash_hex)
                 ){$engine}",
 
-            'wake_events' => "
-                CREATE TABLE IF NOT EXISTS wake_events (
-                    wake_event_id {$idColumn},
-                    interface_id VARCHAR(64) NOT NULL DEFAULT '',
-                    wake_profile VARCHAR(64) DEFAULT NULL,
-                    wake_target VARCHAR(512) DEFAULT NULL,
-                    wake_data_json TEXT,
-                    queue_reason VARCHAR(64) DEFAULT NULL,
-                    queued_packet_count INT NOT NULL DEFAULT 0,
-                    created_at INT NOT NULL DEFAULT 0,
-                    dispatched_at INT DEFAULT NULL,
-                    failed_at INT DEFAULT NULL,
-                    dispatch_result_json TEXT,
-                    failure_message TEXT,
-                    claimed_at INT DEFAULT NULL,
-                    claimed_by_pid INT DEFAULT NULL
-                ){$engine}",
-
             'php_peer_sessions' => "
                 CREATE TABLE IF NOT EXISTS php_peer_sessions (
                     peer_name VARCHAR(128) NOT NULL DEFAULT '',
@@ -322,29 +312,6 @@ trait RequestSchemaTrait
                     remote_url VARCHAR(512) NOT NULL,
                     updated_at INT NOT NULL DEFAULT 0,
                     PRIMARY KEY (local_interface_id, remote_url)
-                ){$engine}",
-
-            'post_interface_peers' => "
-                CREATE TABLE IF NOT EXISTS post_interface_peers (
-                    peer_id {$idColumn},
-                    name VARCHAR(255) NOT NULL DEFAULT '',
-                    local_interface_id VARCHAR(64) NOT NULL,
-                    remote_node_url VARCHAR(512) DEFAULT NULL,
-                    local_wake_url VARCHAR(512) DEFAULT NULL,
-                    remote_interface_id VARCHAR(64) DEFAULT NULL,
-                    remote_session_token VARCHAR(128) DEFAULT NULL,
-                    remote_max_batch_packets INT NOT NULL DEFAULT 64,
-                    remote_idle_exchange_interval_ms INT NOT NULL DEFAULT 1000,
-                    remote_max_packet_bytes INT NOT NULL DEFAULT 512,
-                    bitrate INT NOT NULL DEFAULT 1000000,
-                    mtu INT NOT NULL DEFAULT 500,
-                    poll_interval_seconds INT NOT NULL DEFAULT 10,
-                    http_timeout_seconds INT NOT NULL DEFAULT 10,
-                    connect_timeout_seconds INT NOT NULL DEFAULT 5,
-                    registered_at INT NOT NULL DEFAULT 0,
-                    last_exchange_at INT DEFAULT NULL,
-                    last_error_message TEXT,
-                    status VARCHAR(32) NOT NULL DEFAULT 'offline'
                 ){$engine}",
 
             'transport_state' => "
@@ -601,8 +568,6 @@ trait RequestSchemaTrait
         $tables = [
             'inbound_packets' => 'packet_record_id',
             'outbound_packets' => 'packet_id',
-            'wake_events' => 'wake_event_id',
-            'post_interface_peers' => 'peer_id',
         ];
         foreach ($tables as $table => $idColumn) {
             try {
@@ -650,7 +615,6 @@ trait RequestSchemaTrait
             'CREATE INDEX idx_path_entries_packet_hash ON path_entries (packet_hash_hex)',
             'CREATE INDEX idx_reverse_path_created ON reverse_path_entries (created_at)',
             'CREATE INDEX idx_link_transport_updated ON link_transport_entries (updated_at)',
-            'CREATE INDEX idx_wake_events_created ON wake_events (created_at)',
             // Exchange hot-path indexes
             'CREATE INDEX idx_interfaces_status ON interfaces (status, last_seen_at)',
             'CREATE INDEX idx_outbound_packets_acked ON outbound_packets (acked_at)',
@@ -662,10 +626,6 @@ trait RequestSchemaTrait
             'CREATE INDEX idx_interfaces_peer_url ON interfaces (peer_url)',
             'CREATE INDEX idx_known_dest_identity ON known_destinations (identity_hash_hex)',
             'CREATE INDEX idx_local_dest_iface ON local_destinations (interface_id)',
-            // wake_events has no status column; pending rows are dispatched_at IS NULL.
-            // The old (status, created_at) form failed on every run — silently on MySQL
-            // (1072 is in the benign list), loudly on SQLite.
-            'CREATE INDEX idx_wake_events_pending ON wake_events (dispatched_at, created_at)',
             'CREATE INDEX idx_outbound_packets_queued ON outbound_packets (queued_at)',
         ];
 

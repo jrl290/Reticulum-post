@@ -27,7 +27,6 @@ namespace ReticulumPhp;
  *      - Process any inline delivery (local destinations, path responses).
  *
  *   3. EPILOGUE (runInterfaceRequestEpilogue)
- *      - Spawn detached wake runners for pending wake events.
  *      - Dispatch fire-and-forget wakes to PHP peers with pending data.
  *      - See RequestPhpWakeTrait for the wake dispatch architecture.
  *
@@ -40,9 +39,10 @@ namespace ReticulumPhp;
  *   - Maintenance is rate-limited to once per 2 seconds (avoids redundant
  *     DELETE locks that deadlock with concurrent INSERTs/UPDATEs).
  *   - Wake dispatch is capped at 1000ms per peer (see RequestPhpWakeTrait).
- *   - Wake runners are spawned via exec() in the background — the spawn
- *     itself is fast (exec returns immediately), and the actual wake work
- *     happens in a separate PHP process.
+ *   - No request starts a process for a wake. The only process the node
+ *     ever starts is the detached storage reclaim
+ *     (RequestStorageBudgetTrait::spawnDetachedStorageReclaim), pinned by
+ *     tests/only_storage_reclaim_starts_a_process_test.php.
  *
  * PERF LOGGING
  * ------------
@@ -51,13 +51,12 @@ namespace ReticulumPhp;
  *   ack    = acknowledge outbound batches time
  *   ingest = ingest inbound packets time
  *   fetch  = fetch outbound batch time
- *   epi    = epilogue time (wake dispatch + wake runner spawn)
+ *   epi    = epilogue time (wake dispatch)
  *   total  = total request time
  *
  * If `epi` exceeds 1000ms, check:
  *   - Is fireAndForgetWakeWithCurl's timeout cap still at 1000ms?
  *   - Is the peer server slow to respond?
- *   - Are there excessive wake events being spawned?
  *
  * REGRESSION PREVENTION
  * ---------------------
@@ -104,71 +103,31 @@ trait RequestHttpApiHelperTrait
     }
 
     /**
-     * Exchange epilogue: spawn wake runners and dispatch peer wakes.
+     * Exchange epilogue: dispatch peer wakes.
      *
      * This runs INSIDE the request cycle and its duration is measured
      * as the `epi` metric in the perf log. Keep it fast.
      *
-     * Two-phase wake dispatch:
-     *   1. Detached wake runners: spawn background PHP processes via exec()
-     *      for each pending wake event. These run exchangeWithPhpPeer()
-     *      asynchronously. The exec() call returns immediately.
-     *   2. Fire-and-forget peer wakes: send a quick HTTP request to each
-     *      PHP peer with pending outbound data, telling them to call us
-     *      back. Capped at 1000ms per peer (see RequestPhpWakeTrait).
+     * Fire-and-forget peer wakes: send a quick HTTP request to each PHP
+     * peer (another PHP node, or a gateway registered as reticulum-php with
+     * a peer_url) with pending outbound data, telling it to call us back.
+     * Capped at 1000ms per peer (see RequestPhpWakeTrait).
+     *
+     * Until 2026-10-04 this also spawned a detached `php index.php
+     * wake-event <id>` for every wake_events row: the wake_url path of
+     * 2026-07-03, superseded by these inline wakes on 2026-07-10 and never
+     * removed. Any client could register with metadata.wake_url and have
+     * this node start a process and POST that URL whenever packets queued
+     * for it. registerInterface() now strips wake_url.
      */
     private function runInterfaceRequestEpilogue(): void
     {
-        $wakeEventIds = $this->storage->pendingWakeEventIdsForSpawn(
-            (int) ($this->config['wake']['dispatch_limit'] ?? 32),
-        );
-
-        foreach ($wakeEventIds as $wakeEventId) {
-            try {
-                $this->spawnDetachedWakeRunner((int) $wakeEventId);
-            } catch (\Throwable $error) {
-                $message = 'failed to spawn wake runner: ' . $error->getMessage();
-                $this->storage->failWakeEvent((int) $wakeEventId, $message);
-                $this->log('error', 'Wake runner spawn failed for wake_event_id ' . $wakeEventId . ': ' . $error->getMessage());
-            }
-        }
-
         // Fire-and-forget wakes to PHP peer nodes with pending outbound packets.
         // These MUST be non-blocking — see RequestPhpWakeTrait for the contract.
         try {
             $this->storage->dispatchWakes();
         } catch (\Throwable $error) {
             $this->log('error', 'Wake dispatch failed: ' . $error->getMessage());
-        }
-    }
-
-    /**
-     * Spawn a background PHP process to run exchangeWithPhpPeer().
-     *
-     * Uses exec() with '&' to detach. The exec() call returns immediately;
-     * the actual peer exchange happens in a separate process that doesn't
-     * block the current request.
-     *
-     * NOTE: exec() may be disabled on some shared hosting configurations.
-     * If so, wake events will accumulate and fail. The fallback is that
-     * the peer will eventually pull during its own idle exchange cycle.
-     */
-    private function spawnDetachedWakeRunner(int $wakeEventId): void
-    {
-        $phpBinary = PHP_BINARY !== '' ? PHP_BINARY : 'php';
-        $workerScript = dirname(__DIR__) . '/index.php';
-        $command = sprintf(
-            '%s %s wake-event %d > /dev/null 2>&1 &',
-            escapeshellarg($phpBinary),
-            escapeshellarg($workerScript),
-            $wakeEventId,
-        );
-
-        $output = [];
-        $exitCode = 0;
-        exec($command, $output, $exitCode);
-        if ($exitCode !== 0) {
-            throw new \RuntimeException('wake runner spawn exited with status ' . $exitCode);
         }
     }
 

@@ -14,6 +14,7 @@ trait RequestInterfaceRegistryTrait
 {
     public function registerInterface(string $name, int $bitrate, int $mtu, array $metadata): array
     {
+        $metadata = self::withoutWakeUrl($metadata);
         $now = time();
         $sessionToken = bin2hex(random_bytes(32));
 
@@ -398,6 +399,38 @@ trait RequestInterfaceRegistryTrait
         }
 
         return null;
+    }
+
+    /**
+     * Registration metadata without a client-supplied wake_url.
+     *
+     * Until 2026-10-04 a wake_url stored here made this node insert a
+     * wake_events row whenever packets queued for the row (every announce),
+     * then start `php index.php wake-event <id>` from the next request's
+     * epilogue, which POSTed <wake_url>/v1/wake: any client could make the
+     * node start processes and send requests to a URL of its choosing. That
+     * path (2026-07-03) was superseded on 2026-07-10 by peer_url and the
+     * inline wakes of RequestPhpWakeTrait, and nothing reads wake_url now, so
+     * it is not stored. A present key is logged once per registration, by
+     * shape only (the value is the client's), so a client still sending it
+     * can be found. Rows stored before the change keep theirs, unread.
+     * Pinned by tests/wake_url_path_removed_test.php.
+     */
+    private static function withoutWakeUrl(array $metadata): array
+    {
+        if (!array_key_exists('wake_url', $metadata)) {
+            return $metadata;
+        }
+
+        $claim = $metadata['wake_url'];
+        error_log(sprintf(
+            '[REG-WAKE-URL-IGNORED] interface register: metadata.wake_url (%s, length %d) is no longer used; not stored',
+            get_debug_type($claim),
+            is_string($claim) ? strlen($claim) : -1
+        ));
+        unset($metadata['wake_url']);
+
+        return $metadata;
     }
 
     /**

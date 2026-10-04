@@ -66,7 +66,7 @@ $TABLES = [
     'packet_hashes', 'path_request_tags',
     'reverse_path_entries', 'link_transport_entries',
     'path_entries', 'known_destinations', 'local_destinations',
-    'wake_events', 'php_peer_sessions', 'post_interface_peers',
+    'php_peer_sessions',
     'transport_state',
     'interfaces',
 ];

@@ -53,10 +53,6 @@ trait RequestDebugReportTrait
             'outbound_relay_packets_pending' => $this->countByQuery("SELECT COUNT(*) FROM outbound_packets WHERE acked_at IS NULL AND queue_reason = 'relay'"),
             'outbound_packets_pending' => $this->countByQuery('SELECT COUNT(*) FROM outbound_packets WHERE acked_at IS NULL'),
             'outbound_batches_unacked' => $this->countByQuery('SELECT COUNT(*) FROM outbound_batches WHERE acked_at IS NULL'),
-            'wake_events_pending' => $this->countByQuery('SELECT COUNT(*) FROM wake_events WHERE dispatched_at IS NULL AND failed_at IS NULL'),
-            'wake_events_claimed' => $this->countByQuery('SELECT COUNT(*) FROM wake_events WHERE dispatched_at IS NULL AND failed_at IS NULL AND claimed_at IS NOT NULL'),
-            'wake_events_dispatched' => $this->countByQuery('SELECT COUNT(*) FROM wake_events WHERE dispatched_at IS NOT NULL'),
-            'wake_events_failed' => $this->countByQuery('SELECT COUNT(*) FROM wake_events WHERE failed_at IS NOT NULL'),
         ];
     }
 
@@ -404,42 +400,6 @@ trait RequestDebugReportTrait
         return $batches;
     }
 
-    public function recentWakeEvents(int $limit): array
-    {
-        $stmt = $this->db->prepare(
-            'SELECT
-                wake_event_id,
-                interface_id,
-                wake_profile,
-                wake_target,
-                wake_data_json,
-                queue_reason,
-                queued_packet_count,
-                created_at,
-                dispatched_at,
-                failed_at,
-                failure_message
-             FROM wake_events
-             ORDER BY wake_event_id DESC
-             LIMIT :limit'
-        );
-        $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
-        $stmt->execute();
-
-        $events = [];
-        while (($row = $stmt->fetch(PDO::FETCH_ASSOC)) !== false) {
-            if (!is_array($row)) {
-                continue;
-            }
-
-            $row['wake_data'] = self::decodeJson((string) ($row['wake_data_json'] ?? '{}'));
-            unset($row['wake_data_json']);
-            $events[] = $row;
-        }
-
-        return $events;
-    }
-
     public function debugReport(int $limit): array
     {
         $limit = max(1, $limit);
@@ -456,7 +416,6 @@ trait RequestDebugReportTrait
             'recent_path_entries' => $this->recentPathEntries($limit),
             'recent_outbound_packets' => $this->recentOutboundPackets($limit),
             'recent_outbound_batches' => $this->recentOutboundBatches($limit),
-            'recent_wake_events' => $this->recentWakeEvents($limit),
         ];
     }
 
@@ -513,7 +472,7 @@ trait RequestDebugReportTrait
             'packet_hashes', 'path_request_tags',
             'reverse_path_entries', 'link_transport_entries',
             'path_entries', 'known_destinations', 'local_destinations',
-            'wake_events', 'php_peer_sessions', 'post_interface_peers',
+            'php_peer_sessions',
             'transport_state',
             'interfaces',
         ];

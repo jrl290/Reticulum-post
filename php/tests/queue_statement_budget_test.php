@@ -9,6 +9,8 @@ declare(strict_types=1);
  * assignOutboundBatch issued one UPDATE per packet, and the peer and
  * public-key lookups were repeated for every packet of a request. This pins
  * the once-per-request shape by counting statements through CountingPdo.
+ * Since 2026-10-04 queueing makes no wake decision at all: the wake_url path
+ * that read wake_events here is gone (tests/wake_url_path_removed_test.php).
  */
 
 $root = dirname(__DIR__);
@@ -71,7 +73,7 @@ $metadataLookups = $count('/^SELECT metadata_json FROM interfaces/i');
 $check($inserts === 5, "five packets inserted ($inserts)");
 $check($capChecks === 1, "queue cap checked once per interface per request ($capChecks)");
 $check($pendingCounts <= 1, "pending count once per interface per request ($pendingCounts)");
-$check($wakeChecks <= 1, "pending-wake lookup once per interface per request ($wakeChecks)");
+$check($wakeChecks === 0, "queueing reads no wake_events ($wakeChecks)");
 $check($keyLookups === 1, "public key looked up once per destination per request ($keyLookups)");
 $check($metadataLookups === 1, "interface metadata looked up once per request ($metadataLookups)");
 $perPacket = (ReticulumPhp\CountingPdo::$total - 4) / 5.0; // minus the one-off lookups above

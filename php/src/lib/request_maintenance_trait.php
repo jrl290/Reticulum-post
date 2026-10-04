@@ -63,8 +63,7 @@ use RuntimeException;
  *   9. path_entries          (independent)
  *  10. known_destinations    (independent)
  *  11. local_destinations    (independent)
- *  12. wake_events           (independent, small)
- *  13. interfaces            (parent of many — DELETE LAST)
+ *  12. interfaces            (parent of many — DELETE LAST)
  *
  * interface_stale_after_seconds: How long an interface can be unseen before
  *   it's marked stale and its associated packets/paths are cleaned up.
@@ -126,7 +125,6 @@ trait RequestMaintenanceTrait
             'expired_path_request_tags' => 0,
             'expired_reverse_paths' => 0,
             'expired_link_transport' => 0,
-            'expired_wake_events' => 0,
             'packet_storage_bytes_before' => 0,
             'packet_storage_bytes_after' => 0,
             'trimmed_inbound_packets' => 0,
@@ -235,13 +233,9 @@ trait RequestMaintenanceTrait
                 $summary
             );
 
-            // Phase 9: Expire old wake events
-            $wakeEventTtl = $this->maintenanceConfigInt('wake_event_ttl_seconds', 86400);
-            $summary['expired_wake_events'] = $this->deleteExpiredWakeEvents(
-                $now - $wakeEventTtl,
-                $backend,
-                $summary
-            );
+            // Phase 9 expired wake_events rows. The table has had no writer
+            // since 2026-10-04 (the wake_url path is gone) and a fresh install
+            // does not have it; rows a live database still holds stay there.
 
             // Phase 10: Bound combined packet payload storage.
             $packetStorageMaxBytes = max(
@@ -613,23 +607,6 @@ trait RequestMaintenanceTrait
         return $this->deleteBatched(
             $table,
             'updated_at < :cutoff ORDER BY updated_at',
-            [':cutoff' => $cutoff],
-            $backend,
-            $summary
-        );
-    }
-
-    // ─── Phase 9: Expired wake events ────────────────────────────────────
-
-    private function deleteExpiredWakeEvents(
-        int $cutoff,
-        string $backend,
-        array &$summary
-    ): int {
-        $table = Database::quoteTable($backend, 'wake_events');
-        return $this->deleteBatched(
-            $table,
-            'created_at < :cutoff ORDER BY created_at',
             [':cutoff' => $cutoff],
             $backend,
             $summary

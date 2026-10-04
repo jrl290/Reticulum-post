@@ -7,8 +7,8 @@ namespace ReticulumPhp;
 use PDO;
 
 // Reticulum-php is request-operated. These interface/runtime helpers prepare
-// queued packets and wake state for the next authenticated exchange; they do
-// not form an independent background transport path.
+// queued packets for the next authenticated exchange; they do not form an
+// independent background transport path.
 
 trait RequestInterfaceRuntimeTrait
 {
@@ -16,7 +16,7 @@ trait RequestInterfaceRuntimeTrait
      *  repeated SELECTs for the same interface within a single request. Called
      *  per-packet in eligibleOutboundPackets (N queries for N packets). */
     private array $metadataCache = [];
-    /** @var array<string,true> interfaces whose queue cap and wake were handled in this request */
+    /** @var array<string,true> interfaces whose queue cap was checked in this request */
     private array $queueCapCheckedThisRequest = [];
 
     private function transportIdentityHashHex(): string
@@ -41,6 +41,11 @@ trait RequestInterfaceRuntimeTrait
         return $identityHashHex;
     }
 
+    /**
+     * $currentExchangeInterfaceId (the interface whose request queued the
+     * packet) is no longer read: it only kept the wake_url path from waking
+     * the interface it was already answering, and that path is gone.
+     */
     private function queueOutboundPacket(string $interfaceId, string $packetBase64, string $reason, ?string $currentExchangeInterfaceId = null): void
     {
         $packetRaw = base64_decode($packetBase64, true);
@@ -123,9 +128,13 @@ trait RequestInterfaceRuntimeTrait
 
         // Cap pending outbound per interface at 256. Drop oldest unissued entries.
         // Python RNS caps announce_queue at MAX_QUEUED_ANNOUNCES (16384).
-        // The queue cap and the wake decision are per interface, not per
-        // packet: check them once per interface per request. A request that
-        // queues 64 announces for one browser used to run this block 64 times.
+        // The queue cap is per interface, not per packet: check it once per
+        // interface per request. A request that queues 64 announces for one
+        // browser used to run this block 64 times.
+        //
+        // Queueing never wakes anyone and never starts a process: peers are
+        // woken by the request epilogue (dispatchWakes). Until 2026-10-04 any
+        // row whose metadata carried a wake_url got a wake_events row here.
         if (isset($this->queueCapCheckedThisRequest[$interfaceId])) {
             return;
         }
@@ -171,12 +180,6 @@ trait RequestInterfaceRuntimeTrait
                 Database::executeWithRetry($delStmt, 'capOutboundQueue');
             }
         }
-
-        if ($currentExchangeInterfaceId !== null && $currentExchangeInterfaceId === $interfaceId) {
-            return;
-        }
-
-        $this->scheduleWakeEventIfNeeded($interfaceId, $reason, $this->unissuedOutboundPacketCount($interfaceId));
     }
 
     private function pendingOutboundPacketCount(string $interfaceId): int
@@ -190,93 +193,6 @@ trait RequestInterfaceRuntimeTrait
         $row = $stmt->execute(); $row = $stmt->fetch(PDO::FETCH_ASSOC);
 
         return (int) ($row['pending'] ?? 0);
-    }
-
-    private function unissuedOutboundPacketCount(string $interfaceId): int
-    {
-        $stmt = $this->db->prepare(
-            'SELECT COUNT(*) AS pending
-             FROM outbound_packets
-             WHERE interface_id = :interface_id
-               AND acked_at IS NULL
-               AND delivered_batch_id IS NULL'
-        );
-        $stmt->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
-        $row = $stmt->execute(); $row = $stmt->fetch(PDO::FETCH_ASSOC);
-
-        return (int) ($row['pending'] ?? 0);
-    }
-
-    private function scheduleWakeEventIfNeeded(string $interfaceId, string $reason, int $pendingPacketCount): void
-    {
-        // Create a wake event whenever there are unissued packets and no
-        // existing undispatched wake event already queued for this interface.
-        // This prevents wake storms (one wake per batch of packets) while
-        // allowing backlog recovery after restarts or failures.
-        if ($pendingPacketCount === 0) {
-            return;
-        }
-
-        if ($this->hasPendingWakeEvent($interfaceId)) {
-            return;
-        }
-
-        $wakeConfig = $this->wakeConfigForInterface($interfaceId);
-        if ($wakeConfig === null) {
-            return;
-        }
-
-        $stmt = $this->db->prepare(
-            'INSERT INTO wake_events (
-                interface_id,
-                wake_profile,
-                wake_target,
-                wake_data_json,
-                queue_reason,
-                queued_packet_count,
-                created_at,
-                dispatched_at,
-                failed_at,
-                failure_message
-            ) VALUES (
-                :interface_id,
-                :wake_profile,
-                :wake_target,
-                :wake_data_json,
-                :queue_reason,
-                :queued_packet_count,
-                :created_at,
-                NULL,
-                NULL,
-                NULL
-            )'
-        );
-        $stmt->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
-        $stmt->bindValue(':wake_profile', (string) $wakeConfig['profile'], PDO::PARAM_STR);
-        $stmt->bindValue(':wake_target', (string) $wakeConfig['target'], PDO::PARAM_STR);
-        $stmt->bindValue(':wake_data_json', self::encodeJson((array) $wakeConfig['data']), PDO::PARAM_STR);
-        $stmt->bindValue(':queue_reason', $reason, PDO::PARAM_STR);
-        $stmt->bindValue(':queued_packet_count', $pendingPacketCount, PDO::PARAM_INT);
-        $stmt->bindValue(':created_at', time(), PDO::PARAM_INT);
-        Database::executeWithRetry($stmt, 'queueWakeEvent');
-    }
-
-    /**
-     * Check if there's already an undispatched wake event for this interface.
-     * Prevents wake storms while allowing backlog recovery.
-     */
-    private function hasPendingWakeEvent(string $interfaceId): bool
-    {
-        $stmt = $this->db->prepare(
-            'SELECT 1 FROM wake_events
-             WHERE interface_id = :interface_id
-               AND dispatched_at IS NULL
-               AND failed_at IS NULL
-             LIMIT 1'
-        );
-        $stmt->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
-        $stmt->execute();
-        return $stmt->fetch(PDO::FETCH_ASSOC) !== false;
     }
 
     public function maxPacketBytesForMetadata(array $metadata): int
@@ -295,11 +211,6 @@ trait RequestInterfaceRuntimeTrait
     public function interfaceMetadataForInterface(string $interfaceId): array
     {
         return $this->interfaceMetadata($interfaceId);
-    }
-
-    private function wakeConfigForInterface(string $interfaceId): ?array
-    {
-        return WakeConfig::fromMetadata($this->interfaceMetadata($interfaceId));
     }
 
     private function interfaceMetadata(string $interfaceId): array

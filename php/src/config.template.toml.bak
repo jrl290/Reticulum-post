@@ -32,30 +32,19 @@ path_expiry_access_point_seconds = 86400
 path_expiry_roaming_seconds = 21600
 max_random_blobs = 64
 
-# ── PostInterface peers ──────────────────────────────────────────────────
-# Connect this Reticulum-post node to another Reticulum-post node over HTTP.
-# Each [[PostInterface]] block registers this node as an interface on the
-# remote and exchanges packets during request/response cycles.
-#
-# Poll mode (no wake_url): this node calls /v1/interfaces/exchange on the
-#   remote during each incoming HTTP request to fetch queued packets.
-# Wake mode (wake_url present): the remote sends POST /v1/wake to the
-#   configured wake_url when it has queued packets for this node. The wake
-#   handler triggers an immediate exchange back to the remote.
+# ── Peering with another PHP node ────────────────────────────────────────
+# One [[Name]] block under [interfaces] per peer, as in config.template.toml.
+# GET /v1/initialize registers this node at node_url (maintenance re-registers
+# a session that has died). From then on each node wakes the other with
+# POST /v1/wake when it has packets queued for it, and the woken node pulls
+# them with /v1/interfaces/exchange. There is no poll mode.
 #
 # [interfaces]
 #
-# [[Peer Node (poll mode)]]
+# [[Peer Node]]
 # type = PostInterface
 # enabled = yes
 # node_url = "https://other-node.example.com/reticulum"
-# bitrate = 62500
-# mtu = 500
-#
-# [[Peer Node (wake mode)]]
-# type = PostInterface
-# enabled = yes
-# node_url = "https://other-node.example.com/reticulum"
-# wake_url = "https://this-node.example.com/reticulum"
+# wake_url = "https://this-node.example.com/reticulum/v1/wake"
 # bitrate = 62500
 # mtu = 500

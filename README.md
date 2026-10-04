@@ -300,10 +300,11 @@ it was. Only a table rebuild shrinks it.
 
 A rebuild outlives a web request, so it cannot run inline. It is still the
 node's own job, not a scheduler's: when maintenance sees enough reclaimable
-space, it **spawns a detached `php index.php reclaim`** and returns immediately
-— the same mechanism already used for wake dispatch. The throttle window is
-claimed by the parent before spawning, so requests arriving during a rebuild do
-not pile up more of them.
+space, it **spawns a detached `php index.php reclaim`** and returns immediately.
+It is the only process the node ever starts: wakes to peers go out inline,
+fire-and-forget, at the end of an exchange. The throttle window is claimed by
+the parent before spawning, so requests arriving during a rebuild do not pile
+up more of them.
 
 Every operation therefore polices its own storage:
 

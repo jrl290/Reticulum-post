@@ -91,7 +91,14 @@ trait RequestStorageBudgetTrait
      * and nothing else, so a shared database that also holds unrelated tables
      * is measured fairly.
      *
-     * Keep in sync with RequestSchemaTrait::createTables().
+     * Keep in sync with RequestSchemaTrait::ensureTables(), plus two tables
+     * it no longer creates: wake_events and post_interface_peers lost their
+     * last reader and writer on 2026-10-04, but both live databases still
+     * hold them and the host bills their pages, so they stay in the measure
+     * (and a rebuild can still return their free pages). Where a table does
+     * not exist, information_schema has no row for it, ANALYZE TABLE reports
+     * it in its result set rather than failing, and the SQLite row count
+     * below is caught, so a fresh install measures the same as before.
      */
     private const STORAGE_BUDGET_TABLES = [
         'interfaces',
@@ -829,10 +836,12 @@ trait RequestStorageBudgetTrait
      * Hand the rebuild to a detached process instead of a scheduler.
      *
      * A rebuild cannot run inline on the request path — it outlives the request
-     * — but that does not make it cron's job. The node already spawns detached
-     * PHP for wake dispatch (spawnDetachedWakeRunner), and reclamation is the
-     * same shape of work: triggered by the operation that noticed it was
-     * needed, executed out of band, with the request returning immediately.
+     * — but that does not make it cron's job: it is triggered by the operation
+     * that noticed it was needed, executed out of band, with the request
+     * returning immediately. This is the only process the node ever starts
+     * (James, 2026-10-04); tests/only_storage_reclaim_starts_a_process_test.php
+     * fails on any other exec, proc_open, popen, shell_exec, system or
+     * passthru in php/src.
      *
      * The throttle is claimed *here*, in the parent, before the child is
      * spawned. Claiming it in the child would let every request that arrives
