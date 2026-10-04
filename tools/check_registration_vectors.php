@@ -9,7 +9,7 @@
  *
  * It re-derives every key, identity hash, challenge MAC, signed byte string
  * and encrypted session token from the vector inputs, verifies every
- * signature, re-derives every canonical peer URL and audience, and runs a
+ * signature, re-derives every canonical peer URL, and runs a
  * REFERENCE verifier (REGISTRATION.md section 4.3, in its normative order)
  * over every positive and negative vector, comparing the HTTP status, the
  * error code and the step that fails. The reference verifier is deliberately
@@ -26,11 +26,9 @@ declare(strict_types=1);
 const REGISTER_DOMAIN = 'reticulum-post/register/v1';
 const CHALLENGE_DOMAIN = 'reticulum-post/challenge/v1';
 const CHALLENGE_BYTES = 48;
-const REGISTRATION_KEYS = ['version', 'audience', 'public_key', 'challenge', 'signature'];
+const REGISTRATION_KEYS = ['version', 'public_key', 'challenge', 'signature'];
 const ALLOWED_METADATA_KEYS = ['client', 'implementation', 'mode', 'transport', 'peer_url', 'peer_interface_id', 'peer_session_token', 'identity_hash'];
 const KNOWN_CLIENTS = ['rns-js', 'reticulum-php', 'rns-post-interface'];
-const TRANSIT_CLIENTS = ['reticulum-php', 'rns-post-interface'];
-const AUDIENCE_PATTERN = '/\A(\[[0-9a-f:.]+\]|[a-z0-9.-]+)(:[0-9]{1,5})?\z/';
 const MAX_SAFE_INTEGER = 9007199254740991; // 2^53 - 1
 
 foreach (['sodium_crypto_sign_verify_detached', 'sodium_crypto_scalarmult', 'hash_hkdf', 'openssl_encrypt'] as $fn) {
@@ -65,14 +63,13 @@ function u64(int $v): string
     return pack('J', $v);
 }
 
-/** The thirteen signed fields, read from the decoded body before any normalisation. */
+/** The twelve signed fields, read from the decoded body before any normalisation. */
 function signedBytes(array $body): string
 {
     $md = $body['metadata'];
     $opt = static fn (string $k): string => isset($md[$k]) ? (string) $md[$k] : '';
     return lp(REGISTER_DOMAIN)
         . lp((string) hex2bin($body['registration']['challenge']))
-        . lp($body['registration']['audience'])
         . lp((string) hex2bin($body['registration']['public_key']))
         . lp($body['name'])
         . lp(u64($body['bitrate']))
@@ -161,35 +158,11 @@ function canonicalPeerUrl(mixed $u): array
     return [$scheme . '://' . $host . $port . $path, null];
 }
 
-/** What a client signs: the host part of its canonical base URL. */
-function audienceFromBaseUrl(string $u): ?string
-{
-    [$canonical] = canonicalPeerUrl($u);
-    if ($canonical === null) {
-        return null;
-    }
-    $rest = explode('://', $canonical, 2)[1];
-    return explode('/', $rest, 2)[0];
-}
-
-/** What a relay compares with: its received Host header, lower-cased, default port dropped. */
-function audienceFromHostHeader(string $hostHeader, string $scheme): string
-{
-    $h = strtolower($hostHeader);
-    if (preg_match('/\A(\[[^\]]*\]|[^:\[\]]*):([0-9]{1,5})\z/', $h, $m) === 1) {
-        $p = (int) $m[2];
-        if (($scheme === 'https' && $p === 443) || ($scheme === 'http' && $p === 80)) {
-            $h = $m[1];
-        }
-    }
-    return $h;
-}
-
 /**
- * Reference verifier: REGISTRATION.md section 4.3, steps 1-10 (step 11, the
+ * Reference verifier: REGISTRATION.md section 4.3, steps 1-8 (step 9, the
  * atomic bind, is a database property and is modelled by the row's seq).
  *
- * @param array{secret:string, host:string, transit_identities:list<string>} $relay
+ * @param array{secret:string} $relay
  * @param array{row_registration_seq:int, at_capacity:bool} $state
  * @return array{status:int, error?:string, step?:string, identity_hash?:string, registration_seq?:int}
  */
@@ -209,7 +182,6 @@ function verifySigned(array $body, array $relay, array $state): array
     sort($wantKeys);
     if ($regKeys !== $wantKeys
         || ($reg['version'] ?? null) !== 1
-        || !is_string($reg['audience'] ?? null) || strlen($reg['audience']) > 255 || preg_match(AUDIENCE_PATTERN, $reg['audience']) !== 1
         || !isLowerHex($reg['public_key'] ?? null, 128)
         || !isLowerHex($reg['challenge'] ?? null, 2 * CHALLENGE_BYTES)
         || !isLowerHex($reg['signature'] ?? null, 128)
@@ -277,34 +249,24 @@ function verifySigned(array $body, array $relay, array $state): array
         }
     }
 
-    // 5. The audience is the host this relay was reached at.
-    if ($reg['audience'] !== $relay['host']) {
-        return $bad(403, 'audience_mismatch', 'audience');
-    }
-
-    // 6. The challenge is this relay's, for this identity, at the row's current seq.
+    // 5. The challenge is this relay's, for this identity, at the row's current seq.
     $challenge = (string) hex2bin($reg['challenge']);
     if (!hash_equals(challengeMac($relay['secret'], $identityHash, $state['row_registration_seq'], substr($challenge, 0, 16)), substr($challenge, 16))) {
         return $bad(409, 'stale_challenge', 'challenge');
     }
 
-    // 7. The signature.
+    // 6. The signature.
     if (!sodium_crypto_sign_verify_detached((string) hex2bin($reg['signature']), signedBytes($body), substr($publicKey, 32, 32))) {
         return $bad(403, 'bad_registration_signature', 'signature');
     }
 
-    // 8. Transit permission.
-    if (in_array($client, TRANSIT_CLIENTS, true) && !in_array(bin2hex($identityHash), $relay['transit_identities'], true)) {
-        return $bad(403, 'transit_identity_not_allowed', 'transit_identity');
-    }
-
-    // 9. Capacity, for a new row only.
+    // 7. Capacity, for a new row only.
     if ($state['row_registration_seq'] === 0 && $state['at_capacity']) {
         return $bad(503, 'registration_capacity', 'capacity');
     }
 
-    // 10. A token must be encryptable to the X25519 half: sodium refuses an
-    //     all-zero shared secret (a low-order point) by throwing.
+    // 8. A token must be encryptable to the X25519 half: sodium refuses an
+    //    all-zero shared secret (a low-order point) by throwing.
     try {
         $shared = sodium_crypto_scalarmult(random_bytes(32), substr($publicKey, 0, 32));
         if ($shared === str_repeat("\0", 32)) {
@@ -349,7 +311,8 @@ function decryptToken(string $blob, string $x25519Private, string $identityHash)
 $expect($doc['constants']['register_domain'] === REGISTER_DOMAIN, 'register domain');
 $expect($doc['constants']['challenge_domain'] === CHALLENGE_DOMAIN, 'challenge domain');
 $expect($doc['constants']['challenge_length'] === CHALLENGE_BYTES, 'challenge length');
-$expect(count($doc['constants']['signed_field_order']) === 13, 'thirteen signed fields');
+$expect($doc['format_version'] === 3, 'format 3 (revision 3: no audience)');
+$expect($doc['constants']['signed_field_order'] === ['domain', 'challenge', 'public_key', 'name', 'bitrate', 'mtu', 'client', 'mode', 'transport', 'peer_url', 'peer_interface_id', 'peer_session_token'], 'the twelve signed fields, in order');
 foreach ($doc['lp_examples'] as $ex) {
     $in = isset($ex['input_utf8']) ? $ex['input_utf8'] : (string) hex2bin($ex['input_hex']);
     $expect(bin2hex(lp($in)) === $ex['output_hex'], 'lp example ' . $ex['output_hex']);
@@ -385,14 +348,11 @@ foreach ($doc['identities'] as $name => $id) {
 // ── Relays ─────────────────────────────────────────────────────────────────
 $relays = [];
 foreach ($doc['relays'] as $r => $relay) {
-    $relays[$r] = [
-        'secret' => (string) hex2bin($relay['relay_secret_hex']),
-        'host' => $relay['host'],
-        'transit_identities' => $relay['transit_identities'],
-    ];
-    $expect(preg_match(AUDIENCE_PATTERN, $relay['host']) === 1, "relay {$r}: host is a valid audience");
+    $relays[$r] = ['secret' => (string) hex2bin($relay['relay_secret_hex'])];
+    // Revision 3: a relay is configured by its secret alone. No host to bind
+    // (no audience) and no list of transit identities (peering is open).
+    $expect(array_keys($relay) === ['relay_secret_hex', 'description'], "relay {$r}: carries only its secret");
 }
-$expect(in_array(bin2hex($ids['gateway']['hash']), $relays['A']['transit_identities'], true), 'relay A lists the gateway');
 
 // ── Challenges ─────────────────────────────────────────────────────────────
 foreach ($doc['challenges'] as $c) {
@@ -464,19 +424,15 @@ foreach ($doc['tokens_negative'] as $v) {
     $expect($pt === null, "token negative {$v['id']}: must not decrypt");
 }
 
-// ── Canonical peer URLs and audiences ──────────────────────────────────────
+// ── Canonical peer URLs ────────────────────────────────────────────────────
 foreach ($doc['url_canonical'] as $u) {
     [$canonical, $reason] = canonicalPeerUrl($u['input']);
     $expect($canonical === $u['canonical'] && $reason === $u['refused'], 'url ' . json_encode($u['input']) . ': got ' . json_encode([$canonical, $reason]));
     $key = $canonical === null ? null : hash('sha256', $canonical);
     $expect($key === $u['peer_url_key'], 'url ' . json_encode($u['input']) . ': peer_url_key');
 }
-foreach ($doc['audience_client'] as $a) {
-    $expect(audienceFromBaseUrl($a['client_base_url']) === $a['audience'], 'client audience for ' . $a['client_base_url']);
-}
-foreach ($doc['audience_relay'] as $a) {
-    $expect(audienceFromHostHeader($a['host_header'], $a['scheme']) === $a['audience'], 'relay audience for ' . $a['host_header']);
-}
+// Revision 3: nothing in the file carries an audience.
+$expect(!str_contains((string) file_get_contents($path), 'audience'), 'no vector carries an audience');
 
 if ($failures !== []) {
     fwrite(STDERR, "FAIL: " . count($failures) . " of {$checks} checks\n");
@@ -486,7 +442,7 @@ if ($failures !== []) {
     exit(1);
 }
 
-printf("PASS: %d checks (%d registrations, %d negative, %d token negatives, %d URLs, %d audiences) with PHP %s sodium/openssl\n",
+printf("PASS: %d checks (%d registrations, %d negative, %d token negatives, %d URLs) with PHP %s sodium/openssl\n",
     $checks, count($doc['registrations']), count($doc['negative']), count($doc['tokens_negative']),
-    count($doc['url_canonical']), count($doc['audience_client']) + count($doc['audience_relay']), PHP_VERSION);
+    count($doc['url_canonical']), PHP_VERSION);
 exit(0);

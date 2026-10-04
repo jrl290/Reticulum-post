@@ -22,14 +22,14 @@ Every vector is verified before it is written:
 - every positive and negative registration with this script's own reference
   verifier (REGISTRATION.md section 4.3, in its normative order), which must
   give the expected status and error;
-- every canonical-URL and audience example with this script's own functions.
+- every canonical-URL example with this script's own function.
 
 --check additionally regenerates the file in memory and compares it byte for
 byte with the committed copy.
 
 tools/check_registration_vectors.php checks the same file independently with
 PHP sodium/openssl, the primitives the relay will use, and its own copy of the
-reference verifier, URL canonicalisation and audience rules.
+reference verifier and URL canonicalisation.
 """
 
 import argparse
@@ -60,11 +60,11 @@ LABEL_ROOT = "reticulum-post registration vectors v1"
 CHALLENGE_LENGTH = 48
 MAX_SAFE_INTEGER = 2 ** 53 - 1
 
-# The thirteen signed fields, in signing order (REGISTRATION.md section 3).
+# The twelve signed fields, in signing order (REGISTRATION.md section 3).
+# Revision 3 removed "audience" (James, 2026-10-03: no Host binding).
 SIGNED_FIELD_ORDER = [
     "domain",
     "challenge",
-    "audience",
     "public_key",
     "name",
     "bitrate",
@@ -77,13 +77,11 @@ SIGNED_FIELD_ORDER = [
     "peer_session_token",
 ]
 
-REGISTRATION_KEYS = {"version", "audience", "public_key", "challenge", "signature"}
+REGISTRATION_KEYS = {"version", "public_key", "challenge", "signature"}
 ALLOWED_METADATA_KEYS = {"client", "implementation", "mode", "transport", "peer_url",
                          "peer_interface_id", "peer_session_token", "identity_hash"}
 KNOWN_CLIENTS = ("rns-js", "reticulum-php", "rns-post-interface")
-TRANSIT_CLIENTS = ("reticulum-php", "rns-post-interface")
 
-AUDIENCE_RE = re.compile(r"(\[[0-9a-f:.]+\]|[a-z0-9.-]+)(:[0-9]{1,5})?")
 HEX_RE = re.compile(r"[0-9a-f]+")
 
 
@@ -125,7 +123,7 @@ def is_lower_hex(v, length):
 
 
 # ---------------------------------------------------------------------------
-# URLs and audiences (REGISTRATION.md sections 3 and 10.1)
+# Canonical peer URLs (REGISTRATION.md section 10.1)
 # ---------------------------------------------------------------------------
 
 def canonical_url(u):
@@ -164,24 +162,6 @@ def canonical_url(u):
 
 def url_key(canonical):
     return hashlib.sha256(canonical.encode("ascii")).hexdigest()
-
-
-def audience_from_base_url(u):
-    """What a client signs: the host it connects to, as it sends it in Host."""
-    canon, reason = canonical_url(u)
-    if canon is None:
-        return None, reason
-    rest = canon.split("://", 1)[1]
-    return rest.split("/", 1)[0], None
-
-
-def audience_from_host_header(host_header, scheme):
-    """What a relay compares with: its received Host, lower-cased, default port dropped."""
-    h = host_header.lower()
-    m = re.fullmatch(r"(\[[^\]]*\]|[^:\[\]]*):([0-9]{1,5})", h)
-    if m is not None and (scheme, int(m.group(2))) in (("https", 443), ("http", 80)):
-        h = m.group(1)
-    return h
 
 
 # ---------------------------------------------------------------------------
@@ -277,7 +257,7 @@ def make_challenge(relay_secret, identity_hash, seq, nonce):
 # ---------------------------------------------------------------------------
 
 def signed_field_values(body):
-    """The thirteen field values, as bytes, read from a register request body."""
+    """The twelve field values, as bytes, read from a register request body."""
     reg = body["registration"]
     md = body["metadata"]
 
@@ -288,7 +268,6 @@ def signed_field_values(body):
     return [
         ("domain", REGISTER_DOMAIN),
         ("challenge", bytes.fromhex(reg["challenge"])),
-        ("audience", reg["audience"].encode("utf-8")),
         ("public_key", bytes.fromhex(reg["public_key"])),
         ("name", body["name"].encode("utf-8")),
         ("bitrate", u64(body["bitrate"])),
@@ -337,7 +316,7 @@ def _present(md, key):
 
 
 def verify_reference(body, relay, state):
-    """relay: {secret, host, transit_identities}; state: {row_registration_seq, at_capacity}."""
+    """relay: {secret}; state: {row_registration_seq, at_capacity}."""
     def bad(status, error, step):
         return {"status": status, "error": error, "step": step}
 
@@ -347,8 +326,6 @@ def verify_reference(body, relay, state):
     if (not isinstance(reg, dict) or not isinstance(md, dict)
             or set(reg.keys()) != REGISTRATION_KEYS
             or not (is_int(reg.get("version")) and reg["version"] == 1)
-            or not (isinstance(reg.get("audience"), str) and 0 < len(reg["audience"]) <= 255
-                    and AUDIENCE_RE.fullmatch(reg["audience"]) is not None)
             or not is_lower_hex(reg.get("public_key"), 128)
             or not is_lower_hex(reg.get("challenge"), 2 * CHALLENGE_LENGTH)
             or not is_lower_hex(reg.get("signature"), 128)
@@ -398,32 +375,24 @@ def verify_reference(body, relay, state):
         if canonical_url(md["peer_url"])[0] is None:
             return bad(400, "peer_url_not_allowed", "client_policy")
 
-    # 5. Audience: the host this relay was reached at.
-    if reg["audience"] != relay["host"]:
-        return bad(403, "audience_mismatch", "audience")
-
-    # 6. The challenge is this relay's, for this identity, at the row's current seq.
+    # 5. The challenge is this relay's, for this identity, at the row's current seq.
     ch = bytes.fromhex(reg["challenge"])
     expected = challenge_mac(relay["secret"], h, state["row_registration_seq"], ch[:16])
     if not hmac.compare_digest(expected, ch[16:]):
         return bad(409, "stale_challenge", "challenge")
 
-    # 7. The signature, over bytes rebuilt from the received body.
+    # 6. The signature, over bytes rebuilt from the received body.
     msg, _ = signed_bytes(body)
     try:
         Ed25519PublicKey.from_public_bytes(pub[32:]).verify(bytes.fromhex(reg["signature"]), msg)
     except Exception:
         return bad(403, "bad_registration_signature", "signature")
 
-    # 8. Transit permission.
-    if client in TRANSIT_CLIENTS and h.hex() not in relay["transit_identities"]:
-        return bad(403, "transit_identity_not_allowed", "transit_identity")
-
-    # 9. Capacity (a new row only).
+    # 7. Capacity (a new row only).
     if state["row_registration_seq"] == 0 and state["at_capacity"]:
         return bad(503, "registration_capacity", "capacity")
 
-    # 10. The token must be encryptable to the key's X25519 half.
+    # 8. The token must be encryptable to the key's X25519 half.
     try:
         eph = X25519PrivateKey.from_private_bytes(label_bytes("reference-verifier/ephemeral"))
         shared = eph.exchange(X25519PublicKey.from_public_bytes(pub[:32]))
@@ -432,7 +401,7 @@ def verify_reference(body, relay, state):
     except Exception:
         return bad(400, "bad_registration", "token_encryption")
 
-    # 11. Bind (modelled by the row's seq).
+    # 9. Bind (modelled by the row's seq).
     return {"status": 200, "identity_hash": h.hex(), "registration_seq": state["row_registration_seq"] + 1}
 
 
@@ -485,20 +454,12 @@ def build():
 
     relays = {
         "A": {"relay_secret_hex": label_bytes("relay/A/secret").hex(),
-              "host": "relay-a.example.org",
-              "transit_identities": [idents["gateway"].hash.hex()],
-              "description": "the relay every vector is presented to; it lists the gateway "
-                             "identity in [registration] transit_identities"},
+              "description": "the relay every vector is presented to"},
         "B": {"relay_secret_hex": label_bytes("relay/B/secret").hex(),
-              "host": "relay-b.example.org",
-              "transit_identities": [],
-              "description": "another relay; its challenges and its audience must be refused at A"},
+              "description": "another relay; its challenges must be refused at A"},
     }
-    relay_cfg = {k: {"secret": bytes.fromhex(v["relay_secret_hex"]), "host": v["host"],
-                     "transit_identities": v["transit_identities"]} for k, v in relays.items()}
+    relay_cfg = {k: {"secret": bytes.fromhex(v["relay_secret_hex"])} for k, v in relays.items()}
     secret = {k: v["secret"] for k, v in relay_cfg.items()}
-    host_a = relays["A"]["host"]
-    host_b = relays["B"]["host"]
 
     challenges = []
     challenge_by_id = {}
@@ -528,7 +489,7 @@ def build():
         challenge_by_id[cid] = entry
         return ch
 
-    def body_for(ident_name, ch, name, bitrate, mtu, metadata, audience=host_a, signer=None):
+    def body_for(ident_name, ch, name, bitrate, mtu, metadata, signer=None):
         ident = idents[ident_name]
         body = {
             "name": name,
@@ -537,7 +498,6 @@ def build():
             "metadata": metadata,
             "registration": {
                 "version": 1,
-                "audience": audience,
                 "public_key": ident.get_public_key().hex(),
                 "challenge": ch.hex(),
                 "signature": "",
@@ -639,7 +599,7 @@ def build():
     gateway_wake = positive(
         "gateway-wake",
         "Reticulum-rust gateway (or Python PostInterface) in wake mode, signing with "
-        "its persistent transport identity, which relay A lists in transit_identities: "
+        "its persistent transport identity (no relay lists it: peering is open): "
         "client reticulum-php, mode 6, with peer_url / peer_interface_id / "
         "peer_session_token covered by the signature. Its row is at seq 5.",
         "A", "gateway", 5, "A/gateway/seq5",
@@ -750,15 +710,6 @@ def build():
         "the result validly. The MAC no longer matches: a client cannot alter a challenge.",
         b, 0, 409, "stale_challenge", "challenge")
 
-    # The audience.
-    ch = challenge("A/browser/seq0/audience-b", "A", "browser", 0)
-    b = body_for("browser", ch, "Retichat Web", 1000000, 500, dict(browser_md), audience=host_b)
-    neg("audience-mismatch",
-        "A correctly signed browser registration over a real relay-A challenge, but the "
-        "browser connected to relay B (audience relay-b.example.org) and relay B forwarded "
-        "the body to A: the relay-oracle attack. A refuses an audience that is not its own host.",
-        b, 0, 403, "audience_mismatch", "audience")
-
     # Metadata.
     b = copy.deepcopy(browser_first)
     b["metadata"]["identity_hash"] = idents["other"].hash.hex()
@@ -809,7 +760,7 @@ def build():
     b = body_for("gateway", ch, gateway_wake["name"], gateway_wake["bitrate"], gateway_wake["mtu"],
                  {"client": "reticulum-php", "implementation": "PostInterface", "mode": 6})
     neg("wake-gateway-without-peer-fields",
-        "The listed gateway, correctly signed, client reticulum-php with no peer fields. "
+        "The gateway, correctly signed, client reticulum-php with no peer fields. "
         "A wake-mode gateway must name where it is woken.",
         b, 5, 400, "peer_fields_required", "client_policy")
 
@@ -818,20 +769,9 @@ def build():
                  {"client": "rns-post-interface", "implementation": "PostInterface", "mode": 6,
                   "transport": "tcp-backbone-gateway", "peer_url": "http://gateway.example.net:4371"})
     neg("poll-gateway-with-peer-url",
-        "The listed gateway, correctly signed, client rns-post-interface carrying a "
+        "The gateway, correctly signed, client rns-post-interface carrying a "
         "peer_url. A poll-mode gateway is never woken, so it may not name a URL.",
         b, 5, 400, "metadata_not_allowed", "client_policy")
-
-    # Transit permission.
-    ch = challenge("A/other/seq0/transit", "A", "other", 0)
-    other_wake_md = dict(gateway_wake_md)
-    other_wake_md["peer_url"] = "https://transit.example.net"
-    b = body_for("other", ch, "RNS PostInterface (Not Listed)", 10000000, 500, other_wake_md)
-    neg("transit-identity-not-listed",
-        "A correctly signed wake-mode gateway registration by an identity relay A does "
-        "not list in transit_identities. Anyone can make a key; only listed identities "
-        "get a transit row.",
-        b, 0, 403, "transit_identity_not_allowed", "transit_identity")
 
     # Capacity.
     ch = challenge("A/other/seq0/capacity", "A", "other", 0)
@@ -913,24 +853,6 @@ def build():
     assert keys["https://xn--rtichat-bya.com/reticulum"] != keys["https://retichat.com/reticulum"]
     assert keys["https://rétichat.com/reticulum"] is None
 
-    audience_client = []
-    for u in ["https://relay-a.example.org/reticulum",
-              "https://Relay-A.Example.ORG:443/reticulum/",
-              "http://127.0.0.1:4370",
-              "http://localhost:80/reticulum",
-              "https://[::1]:8443/reticulum"]:
-        aud, reason = audience_from_base_url(u)
-        assert aud is not None and AUDIENCE_RE.fullmatch(aud), u
-        audience_client.append({"client_base_url": u, "audience": aud})
-    audience_relay = []
-    for hh, scheme in [("relay-a.example.org", "https"),
-                       ("Relay-A.example.org:443", "https"),
-                       ("127.0.0.1:4370", "http"),
-                       ("relay-a.example.org:80", "https"),
-                       ("[::1]:443", "https")]:
-        audience_relay.append({"host_header": hh, "scheme": scheme,
-                               "audience": audience_from_host_header(hh, scheme)})
-
     lp_examples = [
         {"input_hex": "", "output_hex": lp(b"").hex()},
         {"input_utf8": "rns-js", "output_hex": lp(b"rns-js").hex()},
@@ -939,7 +861,7 @@ def build():
 
     return {
         "spec": "Reticulum-post/REGISTRATION.md",
-        "format_version": 2,
+        "format_version": 3,
         "generator": "Reticulum-post/tools/registration_vectors.py (RNS " + RNS.__version__ + ")",
         "note": "Every byte below is derived from fixed labels; regenerate with the "
                 "generator, never by hand. Hex is lower-case throughout.",
@@ -961,8 +883,6 @@ def build():
         "negative": negative,
         "tokens_negative": tokens_negative,
         "url_canonical": url_canonical,
-        "audience_client": audience_client,
-        "audience_relay": audience_relay,
     }
 
 

@@ -4,11 +4,31 @@
 > below follows it: events, not timers; no retries; no timeouts as a fix;
 > strict ordering; §1's 5 seconds.
 
-**Status:** specification, revision 2, 2026-10-03. Not implemented.
-Revision 1 (26a8fef) went through an adversarial review, and revision 2
-answers it. §17 maps each finding to what changed. Reticulum-post `main` at
-3281ad5, the wildcard hotfix, is live on both relays. §0.1 describes a live
-defect that needs its own hotfix.
+**Status:** specification, revision 3, 2026-10-03. Not implemented.
+
+Revision 3 applies James's answers of 2026-10-03 to the questions revision 2
+put to him (§16.2). §18 maps each decision to the sections it changed.
+
+- **No audience.** James: "Don't we have ssl to prevent spoofing?" The relay's
+  host is no longer signed, the signed bytes are twelve fields again, and
+  `403 audience_mismatch` is gone. A12 is an accepted risk (§0, §3.2).
+- **Peering stays open.** James chose "Keep peering open" over an accept-list.
+  `accepted_peer_urls`, `transit_identities`, `403 peer_not_accepted` and
+  `403 transit_identity_not_allowed` are gone. A row is transit when it is
+  proven (§8.1). Because anyone can now hold a transit row, a random blob
+  already seen never creates or replaces a path on any row (§8.5): A4 is
+  closed for transit rows too.
+- **The gateway backs off.** After a failed registration it registers again
+  at 2 s, doubling, capped at 5 min, under James's decided exception to §3 of
+  the principles (§9.6).
+- **Wake-back only between configured relays** (§10.9). Credentials go only
+  to a row's stored canonical URL, as d3a0eb5 already does live (§0.1, §10.2).
+- The newest registration still wins (`409 session_superseded`, §6.1), and
+  the two enforcement switches stand (§11.1).
+
+Revision 2 (a5abab7) answered the adversarial review of revision 1 (26a8fef).
+§17 records that. Reticulum-post `main` is at bae739a. The §0.1 hotfix shipped
+as d3a0eb5 and is deployed.
 
 **Normative for:**
 
@@ -42,24 +62,24 @@ revision 1 found these attacks:
 | A1 | Re-bind any browser row by POSTing its `identity_hash`, which any `lxmf.delivery` announce reveals. The same `interface_id` comes back, the victim's token is rotated so its next exchange gets 401, and the metadata is overwritten (mode set to 6). | `rebind_probe.php` on 35314f4 | §2–§4 and §7 for signed rows. A `none` row stays open to it until `enforce_signed_registration` (§16.1). |
 | A2 | `identity_hash = '%'` or `'_%'` was a LIKE wildcard that re-bound an arbitrary browser row with no knowledge at all. | same probe; hotfix 3281ad5 (live) | hotfix; §7 deletes the metadata lookup |
 | A3 | Interception with no re-bind: register your own identity, then replay a victim's signed announce through your row. The victim's `local_destinations` binding moves to you (endpoint→endpoint overwrite), and a third party's DATA to the victim is queued to you. | `probe2/announce_replay_probe.py` on a real `php -S` node at 35314f4 | §8.2 for every signed row. For legacy rows, §8.3 narrows it from Phase 1 and enforcement closes it (§16.1). |
-| A4 | A replay with the unsigned hop count lowered to 0 pulls the path to any destination 2 or more hops away. `upsertPathFromAnnounce`'s `shorter_path_replaced` branch accepts a random blob it has already seen when the hop count is lower. Revision 1 kept that exception for every row whose `client` string said `reticulum-php` or `rns-post-interface`, and anyone can register such a row. | code reading at 35314f4 and 3281ad5 (not probed) | §8.1: only proven transit rows keep the exception. Legacy transit rows keep it until `enforce_signed_transit` (§16.1). |
+| A4 | A replay with the unsigned hop count lowered to 0 pulls the path to any destination 2 or more hops away. `upsertPathFromAnnounce`'s `shorter_path_replaced` branch accepts a random blob it has already seen when the hop count is lower. Revision 1 kept that exception for every row whose `client` string said `reticulum-php` or `rns-post-interface`, and anyone can register such a row. Revision 2 kept it for proven transit rows, and with open peering anyone can prove one. | code reading at 35314f4 and 3281ad5 (not probed) | §8.5: a seen random blob never creates or replaces a path, whatever its hop count, on every row, legacy included, from Phase 1. RNS parity. |
 | A5 | Any `client = reticulum-php` registration re-binds the row whose `peer_url` matches the claim (or the claim ± `/v1/wake`). That includes the relay's own initiator row for a PHP peer and the production gateway's wake-mode row (8d2a523d, mode 6, `peer_url http://jrl290.ddns.net`). | design map, lane 2 | §9 and §10. Legacy rows stay open until `enforce_signed_transit`. |
 | A6 | During any transition, an unsigned row with a made-up claim replays a victim's announces (A3 through a legacy row). This includes every native-app user, who never registers on a relay. | critique; review of revision 1 | §8.3 narrows it from Phase 1, and enforcement closes it (§16.1). |
 | A7 | The first signed registration inherits an attacker's squatted row, with its bindings, paths, links and queued batches. | critique | §4.5 |
 | A8 | Identity claims reach rows through other client strings (`rns-post-interface`, or a `reticulum-php` that falls through). | critique | §7 |
-| A9 | **Look-alike URLs.** On MySQL and MariaDB the tables use `utf8mb4_unicode_ci`, which ignores case and accents, so `peer_url = 'https://rétichat.com/…'` finds the row stored as `https://retichat.com/…`. That is live in the `/v1/wake` handler (§0.1). Revision 1 also sent the peer confirm to the URL in the request body. | code reading; collation checked with ICU at UCA primary strength, not on a MySQL server | §0.1 hotfix; §10.1 (ASCII canonical URL, SHA-256 key); §10.2 (outbound calls go only to configured URLs) |
-| A10 | **Transit by label.** The `client` string chose whether a row was treated as transit, so a signed row with a fresh key, or an open peering at a URL the attacker controls, got transit privileges. A browser row carrying `peer_*` fields counted as a PHP peer: always active and woken at any URL. | review of revision 1 | §4.3.1, §8.1, §10.2 |
-| A11 | **Unauthenticated outbound calls.** Revision 1 confirmed at a URL the registrant named (a tarpit holds a PHP worker for up to curl's 10 s) and woke back any URL. Its nested confirm deadlocks two relays that connect to each other at the same time. | review of revision 1; tarpit test locally | §10.2 (configured URLs only), §10.4–§10.7 (no request handler waits on another relay) |
-| A12 | **A relay as a challenge oracle.** A relay the user chose fetches another relay's challenge for the user's identity, has the browser sign it, and forwards the body there. | review of revision 1 | §3 (signed `audience`) |
+| A9 | **Look-alike URLs.** On MySQL and MariaDB the tables use `utf8mb4_unicode_ci`, which ignores case and accents, so `peer_url = 'https://rétichat.com/…'` finds the row stored as `https://retichat.com/…`. That was live in the `/v1/wake` handler until d3a0eb5 (§0.1). Revision 1 also sent the peer confirm to the URL in the request body, uncanonicalised. | code reading; collation checked with ICU at UCA primary strength, not on a MySQL server | §0.1 hotfix (d3a0eb5); §10.1 (ASCII canonical URL, SHA-256 key); §10.2 (credentials go only to a row's stored canonical URL) |
+| A10 | **Transit by label.** The `client` string chose whether a row was treated as transit, so an unsigned row that said `reticulum-php` got transit privileges. A browser row carrying `peer_*` fields counted as a PHP peer: always active and woken at any URL. Revision 2 also counted a fresh key, or a peering from a URL the attacker controls, as this attack. With open peering (James, 2026-10-03) those are allowed (§8.1). | review of revision 1 | §4.3.1, §8.1, §10.2: a row is transit only by proof (a signature whose signed `client` is a gateway client, or a nonce confirmed at the row's own URL) or as legacy under the transit switch. A browser row never is. |
+| A11 | **Unauthenticated outbound calls.** Revision 1 confirmed at a URL the registrant named from inside the request handler (a tarpit holds a PHP worker for up to curl's 10 s) and woke back any URL. Its nested confirm deadlocks two relays that connect to each other at the same time. | review of revision 1; tarpit test locally | §10.4–§10.7: no request handler waits on another relay, and the confirm runs from a detached runner. Pending confirms are bounded (§10.4). Wake-backs go only to configured relays (§10.9). Credentials go only to a row's stored canonical URL (§10.2). With open peering, confirming at the URL the registration names is the proof itself (§10.5). |
+| A12 | **A relay as a challenge oracle.** A relay the user chose fetches another relay's challenge for the user's identity, has the browser sign it, and forwards the body there. | review of revision 1 | **Accepted risk, James 2026-10-03.** Revision 2's signed `audience` is dropped. TLS does not stop this, because the forwarding relay is a real relay the user chose. What bounds it is that nobody can choose another relay: the web client's CSP `connect-src` allows only retichat.com and selectivesubconscious.com, both James's; gateways connect only to their configured node URL; PHP peers do not sign, and are confirmed at their own URL. Revisit if the web ever lets users choose other relays (§3.2). |
 | A13 | **Activity oracle.** Revision 1's challenge showed `registration_seq`, which goes up on every registration, so polling it revealed when an identity used Retichat Web on that relay. | review of revision 1 | §2 (opaque challenge) |
-| A14 | **Unbounded rows.** Every registration with a fresh key adds a permanent row. Legacy registrations already do this today, and nothing deletes `interfaces` rows. | review of revision 1; code reading | §12.4 |
+| A14 | **Unbounded rows.** Every registration with a fresh key adds a permanent row. Legacy registrations already do this today, and nothing deletes `interfaces` rows. | review of revision 1; code reading | §12.4, and §10.4 for peer rows (open peering). What stays open is in §16.1. |
 
 What a captured row gave an attacker: the session (eviction and DoS, repeatable),
 delivery of the victim's inbound packets (payloads stay end-to-end encrypted,
 but delivery is denied and link metadata is exposed), path next-hop
 capture, and the row's mode and metadata.
 
-### 0.1 Live defect: the wake handler sends a peer's credentials to the caller's URL
+### 0.1 Fixed defect: the wake handler sent a peer's credentials to the caller's URL
 
 On 3281ad5, `POST /v1/wake {"waker_url": W}` runs `exchangeWithPhpPeer(W)`
 (`index.php:1804`). That function:
@@ -92,9 +112,18 @@ Not proven against production:
 
 **Hotfix, independent of everything else in this document:**
 `exchangeWithPhpPeer` MUST POST to the stored row's `peer_url`, with any
-`/v1/wake` suffix removed, and never to its argument. It is one line, with one
-test: a look-alike `waker_url` either reaches the stored URL or nothing. James
-decides when it ships. §10 makes the rule general.
+`/v1/wake` suffix removed, and never to its argument. A look-alike
+`waker_url` either reaches the stored URL or nothing.
+
+**Shipped as d3a0eb5 and deployed.** The caller's URL must equal the row's
+`peer_url` byte for byte after the same normalisation on both sides (trailing
+`/` and one `/v1/wake` removed), compared with `hash_equals`. Otherwise
+nothing is sent and `[WAKE-REFUSED]` is logged. bae739a then made the README
+rotation wait until the fix is live on both nodes, and called for rotating the
+peering again then, because the pair in use before the fix must be treated as
+leaked.
+§10.2 makes the rule general: credentials go only to a row's stored canonical
+URL.
 
 ---
 
@@ -103,9 +132,9 @@ decides when it ships. §10 makes the rule general.
 | Registrant | `client` | Proof | Row key | Transit row? (§8.1) |
 |---|---|---|---|---|
 | Browser (Retichat-js) | `rns-js` | Ed25519 signature by its RNS identity over a relay challenge (§2–§3) | `identity_hash` | never |
-| Gateway, wake mode (Reticulum-rust / Python `PostInterface`) | `reticulum-php` | signature by its **persistent transport identity** (§9) | `identity_hash` | only if its identity hash is in `transit_identities` |
-| Gateway, poll mode | `rns-post-interface` | same signature | `identity_hash` | same |
-| PHP relay peer (Reticulum-post `connectToPeer`) | `reticulum-php` with `registration_nonce` | one-time nonce confirmed at the peer's own **configured** URL (§10) | canonical peer URL | only if that URL is accept-listed (§10.2) |
+| Gateway, wake mode (Reticulum-rust / Python `PostInterface`) | `reticulum-php` | signature by its **persistent transport identity** (§9) | `identity_hash` | yes |
+| Gateway, poll mode | `rns-post-interface` | same signature | `identity_hash` | yes |
+| PHP relay peer (Reticulum-post `connectToPeer`) | `reticulum-php` with `registration_nonce` | one-time nonce confirmed at the peer's own **canonical** URL (§10) | canonical peer URL | yes, once confirmed |
 | PHP PostInterface client (`[post_interface_peers]`, `request_post_interface_trait.php`) | `reticulum-post` | none: it has no key and no confirm path | — | legacy only, until `enforce_signed_transit`. Move any such link to `[interfaces]` peering before Phase 3c. |
 
 The identity hash is self-certifying. RNS 1.5.2 defines it as
@@ -113,9 +142,13 @@ The identity hash is self-certifying. RNS 1.5.2 defines it as
 (`RNS/Identity.py` `get_public_key`, `update_hashes`; `TRUNCATED_HASHLENGTH = 128`).
 The relay recomputes it from the 64-byte public key in the registration, so
 binding a row needs no PKI, no pin, no trust-on-first-use and no configuration.
-*Transit privileges* are a separate question. Anyone can make a key, so a
-relay grants transit treatment only to identities and URLs its operator lists
-(§8.1).
+*Transit treatment* follows from the same proofs. Peering is open (James,
+2026-10-03: "Keep peering open"), so a relay keeps no list of gateways or
+peers. A gateway that signs with its transport identity, and a PHP relay
+confirmed at its own URL, each get a transit row (§8.1). Anyone can make a key
+or run a relay, so what limits a transit row is what it may do: it never binds
+local destinations, and a random blob already seen never moves a path through
+it (§8.5).
 
 Every interface row carries a `registration_proof`:
 
@@ -123,7 +156,7 @@ Every interface row carries a `registration_proof`:
 |---|---|
 | `none` | Legacy. Nothing was proven. New ones are only possible while the matching enforcement switch is off (§11.1). |
 | `signed` | Bound by a verified signed registration. The row has `identity_hash`, `identity_public_key` and `registration_seq`. |
-| `confirmed` | A PHP peer row bound after its nonce was confirmed at the peer's configured URL (§10.7). |
+| `confirmed` | A PHP peer row bound after its nonce was confirmed at the peer's own canonical URL (§10.5, §10.7). |
 | `local` | A PHP peer row this relay created itself in `connectToPeer`, toward a URL from its own config. |
 
 ---
@@ -176,7 +209,7 @@ unambiguous. `u64be` is an unsigned 64-bit big-endian integer.
 
 The seq is bound into the MAC but not carried in the clear. To verify, the
 relay reads the row's **current** seq, or 0 if there is no row, and recomputes
-the MAC with it (§4.3 step 6). A challenge issued before the seq moved fails
+the MAC with it (§4.3 step 5). A challenge issued before the seq moved fails
 that check, as does one issued by another relay, for another identity, under
 a rotated secret, or altered in any bit. All of these fail the same way, and
 nobody outside the relay can tell them apart. `registration_seq` is a
@@ -195,14 +228,14 @@ nobody outside the relay can tell them apart. `registration_seq` is a
   intended.
 - A challenge minted by one relay fails the MAC at any other relay. That alone
   does not stop a relay the user chose from fetching another relay's challenge
-  for the user's identity and relaying it (A12). The signed `audience` (§3.2)
-  stops that.
+  for the user's identity and relaying it (A12). Revision 3 accepts that risk
+  (§3.2).
 
 ### 2.4 Single use comes from `seq`
 
 A successful signed registration moves the row from `seq` to `seq + 1`
 atomically (§4.4). Every challenge bound to the old `seq` then fails §4.3
-step 6, permanently. A captured signed body therefore works at most once, and
+step 5, permanently. A captured signed body therefore works at most once, and
 since the session token comes back encrypted to the identity (§5), the one
 who replays it gets nothing usable.
 
@@ -228,7 +261,6 @@ lp(x)  = u16be(len(x)) || x                (len(x) ≤ 65535)
 
 signed = lp("reticulum-post/register/v1")            -- 26 bytes, lp = 001a…
       || lp(challenge)                               -- 48 bytes, exactly as received
-      || lp(utf8(audience))                          -- the relay's host, §3.2
       || lp(public_key)                              -- 64 bytes: x25519_pub || ed25519_pub
       || lp(utf8(name))
       || lp(u64be(bitrate))
@@ -243,11 +275,17 @@ signed = lp("reticulum-post/register/v1")            -- 26 bytes, lp = 001a…
 signature = Ed25519-sign(ed25519_private_key, signed)  -- RNS Identity.sign, 64 bytes
 ```
 
-There is one layout, with thirteen fields, for every registrant. A browser
+There is one layout, with twelve fields, for every registrant. A browser
 signs the four optional fields as empty strings. A wake-mode gateway fills in
 the three `peer_*` fields. A poll-mode gateway may fill in `transport`. No JSON
 appears in the signed bytes: PHP's `json_encode` escapes `/` and the other
 encoders do not.
+
+Revision 2 had a thirteenth field, `audience`, after `challenge`. Revision 3
+removed it (§3.2). No port implements either layout yet: across
+Reticulum-post, Retichat-js and Reticulum-rust, only this spec, its two tools
+and the vector file contain the domain string. So the domain stays
+`reticulum-post/register/v1`.
 
 Rules for reading the values:
 
@@ -266,12 +304,10 @@ Rules for reading the values:
    `null`, or `""` encodes as `lp("")` (`0000`) and is stored as absent.
 5. `challenge`, `public_key` and `signature` are lower-case hex of exactly
    96, 128 and 128 characters.
-6. `audience`: §3.2.
 
 Why each field is covered:
 
 - `challenge` gives freshness and binds the identity's row on this relay.
-- `audience` names the relay the client meant (A12).
 - `public_key` is what is proven.
 - `name`, `bitrate`, `mtu`, `client`, `mode` and `transport` change how the
   relay treats the row.
@@ -293,8 +329,7 @@ network, other than the challenge placed in its own field.
 ### 3.1 Worked example: vector `browser-first`
 
 The identity is `browser` from the vectors (hash `20bc2200ebcd73a552b6e6a7ff2a0ba8`).
-Relay A's secret is `13cbff96…c59169`, and its host is `relay-a.example.org`.
-There is no row yet, so `seq = 0`.
+Relay A's secret is `13cbff96…c59169`. There is no row yet, so `seq = 0`.
 
 ```
 mac input  7265746963756c756d2d706f73742f6368616c6c656e67652f7631      "reticulum-post/challenge/v1"
@@ -306,7 +341,6 @@ challenge  5ab138262aa3ff7e40d3e0d18156b5b9 6bc78010…de39808a          nonce |
 
 signed     001a 7265746963756c756d2d706f73742f72656769737465722f7631  domain
            0030 5ab13826…de39808a                                      challenge (48)
-           0013 72656c61792d612e6578616d706c652e6f7267                  "relay-a.example.org"
            0040 bcf19510…4b321596                                      public key (64)
            000c 526574696368617420576562                               "Retichat Web"
            0008 00000000000f4240                                       bitrate 1000000
@@ -314,41 +348,43 @@ signed     001a 7265746963756c756d2d706f73742f72656769737465722f7631  domain
            0006 726e732d6a73                                           "rns-js"
            0001 01                                                     mode 1
            0000 0000 0000 0000                                         transport, peer_url, peer_interface_id, peer_session_token
-signature  1aba8e1a843c00a8dea30f176f6671953bd4be3efde55d57aab542958a91f537
-           9e13bd955e7f72e1e1c679e9efe6ed424889a4e136b44e22abcafe419f12610c
+                                                                       193 bytes in all
+signature  b1a0d662c1dbbb2c815bddf402f145e51a499085266f24daf539a671b31f6e12
+           15e4ced2e52956751e5c0c602b8b66063ac7357fbd1313f2de6c61622a79b804
 ```
 
 The full bytes are in the vector file.
 
-### 3.2 The audience
+### 3.2 No audience
 
-The audience is the host the client connects to, written exactly as the client
-sends it in the HTTP `Host` header: the host in lower-case ASCII, followed by
-`:port` only when the port is not the scheme's default (443 for `https`, 80
-for `http`). An IDN host is written in its `xn--` form. A client MUST NOT sign
-a non-ASCII host. Its shape is
-`(\[[0-9a-f:.]+\]|[a-z0-9.-]+)(:[0-9]{1,5})?`, at most 255 bytes.
-
-- **Browser:** `new URL(baseUrl).host`.
-- **Rust:** `url.host_str()`, plus `":" + port` when `url.port()` is
-  `Some` (the `url` crate gives `None` for a default port).
-- **Python:** from `urllib.parse.urlsplit(base_url)`, take the lower-cased
-  `hostname`, plus `":" + port` when a port is given and is not the default.
-
-The relay takes `$_SERVER['HTTP_HOST']`, lower-cases it, and drops a
-trailing `:443` on an `https` request or `:80` on an `http` request. The
-scheme is the one the request arrived with. Step 5 compares that string with
-the signed `audience`, byte for byte. A request without a `Host` header gets
+Revision 2 signed the host the client connected to (`audience`), so that a
+relay the user chose could not forward another relay's challenge (A12). Asked
+whether to keep it, James answered "Don't we have ssl to prevent spoofing?",
+and the binding was dropped on 2026-10-03. The signed bytes carry no relay
+address, the relay does not read `Host` for registration, and there is no
 `403 audience_mismatch`.
 
-The vectors pin both sides (`audience_client`, `audience_relay`). There is
-no configured URL to normalise. Both strings come from the same connection,
-so trailing slashes, paths, `www` and saved exchange URLs cannot cause a
-mismatch. The `host_url` audience of the first design pass compared with
-config, which is why revision 1 dropped it. The one thing that can
-break it is a front end that rewrites `Host`. The `audience_mismatch` message
-then names the host the relay saw, and the Phase 1 gate (§11.2) checks for it
-on both hosts.
+TLS alone does not close A12, and this spec does not claim it does. TLS proves
+which relay a client reached. It does not stop that relay, when it is the one
+the user chose, from fetching another relay's challenge for the user's
+identity, having the client sign it, and forwarding the body. The other relay
+then binds the identity's row there. The client goes on sending its session
+token to the relay it chose on every exchange, so that relay holds the
+identity's session at the other relay: it can take the identity's inbound
+there (delivery denied, link metadata seen, payloads still end-to-end
+encrypted), and the identity's own session there is superseded.
+
+The risk is accepted because nobody can choose another relay today:
+
+- **Browsers:** the web client's CSP `connect-src` (Retichat-js `.htaccess`)
+  allows only the page's own origin, `https://retichat.com/reticulum/` and
+  `https://selectivesubconscious.com/reticulum/` (and `esm.sh` for modules).
+  Both relays are James's.
+- **Gateways:** connect only to their configured node URL.
+- **PHP peers:** never sign a registration. They are confirmed at their own
+  canonical URL (§10).
+
+Revisit this if the web client ever lets users choose other relays.
 
 ---
 
@@ -365,7 +401,6 @@ POST /v1/interfaces/register
   "metadata": { "client": "rns-js", "implementation": "PostInterface", "mode": 1 },
   "registration": {
     "version": 1,
-    "audience":   "retichat.com",
     "public_key": "<128 hex>",
     "challenge":  "<96 hex, verbatim from §2.1>",
     "signature":  "<128 hex>"
@@ -375,7 +410,8 @@ POST /v1/interfaces/register
 
 `registration` is a new top-level key, so a relay that predates this spec
 ignores it, and it never reaches `metadata_json`. The `registration` object
-MUST hold exactly those five keys, and `version` MUST be `1`.
+MUST hold exactly those four keys, and `version` MUST be `1`. An `audience`
+key (revision 2) is a fifth key and gets `400 bad_registration`.
 
 **In a signed registration the metadata keys are limited** to the signed ones
 (`client`, `mode`, `transport`, `peer_url`, `peer_interface_id`,
@@ -403,26 +439,28 @@ registrations in v1. No signing client sends them today.
 ### 4.3 Verifying a signed registration
 
 The relay runs these checks in this order, cheapest first. Nothing is written
-before step 9, and step 9 only reclaims legacy rows (§12.4).
+before step 7, and step 7 only reclaims legacy rows (§12.4).
 
 | Step | Check | On failure |
 |---|---|---|
-| 1 | Shape: §3 rules 2–6, and the §4.1 `registration` object | `400 bad_registration` |
+| 1 | Shape: §3 rules 2–5, and the §4.1 `registration` object | `400 bad_registration` |
 | 2 | Metadata keys within the signed set (§4.1) | `400 unsigned_metadata` |
 | 3 | `H = SHA-256(public_key)[:16]`; `metadata.identity_hash`, if present, equals `H` | `400 identity_hash_mismatch` |
 | 4 | Client policy (§4.3.1) | `400 unknown_client`, `transit_mode_not_allowed`, `metadata_not_allowed`, `peer_fields_required` or `peer_url_not_allowed` |
-| 5 | `audience` equals the host this relay was reached at (§3.2) | `403 audience_mismatch` |
-| 6 | Read the row with `identity_hash = H` (its `registration_seq`, or 0 if there is none). Recompute the MAC (§2.2) over the derived `H`, that seq and the challenge's nonce, and compare it with the challenge's MAC in constant time. | `409 stale_challenge` |
-| 7 | `sodium_crypto_sign_verify_detached(signature, signed, public_key[32:64])` over bytes rebuilt from the received body (§3) | `403 bad_registration_signature` |
-| 8 | Transit permission: when `client` is `reticulum-php` or `rns-post-interface`, `H` is in `[registration] transit_identities` | `403 transit_identity_not_allowed` |
-| 9 | Capacity, only when step 6 found no row: §12.4 | `503 registration_capacity` |
-| 10 | Make a fresh session token and encrypt it to `public_key[0:32]` (§5). An X25519 result of all zeros (a low-order key; `sodium_crypto_scalarmult` throws) fails. | `400 bad_registration` |
-| 11 | Atomic bind (§4.4) with the token from step 10 | `409 stale_challenge` |
+| 5 | Read the row with `identity_hash = H` (its `registration_seq`, or 0 if there is none). Recompute the MAC (§2.2) over the derived `H`, that seq and the challenge's nonce, and compare it with the challenge's MAC in constant time. | `409 stale_challenge` |
+| 6 | `sodium_crypto_sign_verify_detached(signature, signed, public_key[32:64])` over bytes rebuilt from the received body (§3) | `403 bad_registration_signature` |
+| 7 | Capacity, only when step 5 found no row: §12.4 | `503 registration_capacity` |
+| 8 | Make a fresh session token and encrypt it to `public_key[0:32]` (§5). An X25519 result of all zeros (a low-order key; `sodium_crypto_scalarmult` throws) fails. | `400 bad_registration` |
+| 9 | Atomic bind (§4.4) with the token from step 8 | `409 stale_challenge` |
+
+Revision 3 removed revision 2's step 5 (`audience`, §3.2) and step 8
+(`transit_identities`, §8.1), and renumbered the rest. A signed gateway needs
+no permission beyond its signature.
 
 Each negative vector fails exactly one of these steps, so an implementation
 that orders them differently still gives the same answers. The order above is
-still the one implementations MUST use: it is the cheapest, and steps 8 and 9
-tell only the key's holder what the relay's configuration and capacity are.
+still the one implementations MUST use: it is the cheapest, and step 7 tells
+only the key's holder that the relay is full.
 
 #### 4.3.1 Client policy
 
@@ -453,11 +491,11 @@ the collation cannot fold two values together (§12.2).
 - **`seq = 0` (no signed row):** `INSERT` a new row with
   `interface_id = random 16 bytes hex`, `identity_hash = H`,
   `identity_public_key = public_key`, `registration_seq = 1`,
-  `registration_proof = 'signed'`, the token from step 10 and the signed
+  `registration_proof = 'signed'`, the token from step 8 and the signed
   parameters. A unique-constraint conflict means another registration for `H`
   won: the relay looks the row up again (only to log it) and answers
   `409 stale_challenge`. It does not insert a second time.
-- **`seq > 0`:** update in place, with the seq read in step 6.
+- **`seq > 0`:** update in place, with the seq read in step 5.
 
   ```sql
   UPDATE interfaces
@@ -472,7 +510,7 @@ the collation cannot fold two values together (§12.2).
   ```
 
   `rowCount() = 1` is required, otherwise `409 stale_challenge`.
-  `:old_token_sha256` is the SHA-256 hex of the session token step 6 read
+  `:old_token_sha256` is the SHA-256 hex of the session token step 5 read
   (§6.1). The statement always changes `registration_seq` and `session_token`,
   so MySQL's "affected rows" equals "matched rows". No
   `PDO::MYSQL_ATTR_FOUND_ROWS` is needed.
@@ -500,8 +538,9 @@ For each row it retires, it deletes, in this order:
 
 It logs `[REG-RETIRE] identity=<H> rows=<n>`.
 
-A signed registration by a **listed transit identity** (§8.1) also retires
-every `none` row of a transit-class client (`reticulum-php`,
+A signed `reticulum-php` registration (a wake-mode gateway, §9; no other
+signed client carries a `peer_url`) also retires every `none` URL row
+(`identity_hash IS NULL`) of a transit-class client (`reticulum-php`,
 `rns-post-interface`, `reticulum-post`) whose `peer_url_key` equals its own,
 with the same deletion set. It logs
 `[REG-RETIRE-URL] key=<8 hex> rows=<n>`. That is how Phase 3 removes the
@@ -509,6 +548,13 @@ legacy bridge row at the moment the signed gateway row comes up (§11.2). Paths
 through the old row are deleted with it and are learned again from the next
 announces through the new row, so nothing black-holes behind an always-active
 dead row.
+
+Revision 2 allowed this only to a listed transit identity. Peering is open
+now, so any signed gateway can do it. That opens nothing new: until
+`enforce_signed_transit`, anyone can already take over a `none` URL row by its
+URL with an unsigned `reticulum-php` registration (A5, §7.2, §16.1.2), which
+is worse than retiring it. Once the switch is on, such a row is no longer
+transit and gets `401` (§11.1), so retiring it costs nothing.
 
 Whoever holds a retired row gets `401` on its next exchange, whether it is the
 user's own stale tab or a squatter. If it then re-registers unsigned while
@@ -564,7 +610,7 @@ registrant's public key, with no ratchet:
 
 ```
 eph        = fresh X25519 key pair
-shared     = X25519(eph_private, public_key[0:32])      -- all zeros: refuse (§4.3 step 10)
+shared     = X25519(eph_private, public_key[0:32])      -- all zeros: refuse (§4.3 step 8)
 derived    = HKDF-SHA256(ikm = shared, salt = H, info = "", L = 64)
 hmac_key   = derived[0:32]      aes_key = derived[32:64]
 iv         = 16 random bytes
@@ -589,8 +635,8 @@ client stops and shows it (§6). It never falls back to a plaintext field.
 
 A legacy (unsigned) registration keeps today's response, with a plaintext
 `session_token`, until enforcement. A PHP peer receives credentials only
-inside calls to configured URLs (§10), never in a response to an
-unauthenticated request.
+inside calls a relay makes to that peer's own canonical URL (§10.2, §10.5),
+never in a response to an unauthenticated request.
 
 ---
 
@@ -603,7 +649,7 @@ the HTTP status and `error` only.
 | Status | `error` | Raised when | Client action |
 |---|---|---|---|
 | 400 | `bad_challenge_request` | challenge request without exactly one well-formed key or hash | stop, show |
-| 400 | `bad_registration` | malformed `registration` object or signed field (§3); both `registration` and `registration_nonce`; a malformed peer registration (§10.4); a key that cannot receive a token (§4.3 step 10) | stop, show |
+| 400 | `bad_registration` | malformed `registration` object or signed field (§3); both `registration` and `registration_nonce`; a malformed peer registration (§10.4); a key that cannot receive a token (§4.3 step 8) | stop, show |
 | 400 | `unsigned_metadata` | a metadata key outside the signed set (§4.1) | stop, show |
 | 400 | `identity_hash_mismatch` | `metadata.identity_hash` ≠ the key's hash | stop, show |
 | 400 | `unknown_client` | a signed registration whose `client` is not in §4.3.1 | stop, show |
@@ -611,16 +657,13 @@ the HTTP status and `error` only.
 | 400 | `metadata_not_allowed` | a signed field this client may not carry (§4.3.1) | stop, show |
 | 400 | `peer_fields_required` | `reticulum-php` without all three peer fields | stop, show |
 | 400 | `peer_url_not_allowed` | a `peer_url` that does not canonicalise (§10.1); a peer registration whose URL is not `https` (loopback `http` only with `allow_loopback_http_peers`) | stop, show |
-| 403 | `audience_mismatch` | the signed audience is not the host this relay was reached at; the message names the host the relay saw | stop, show |
 | 403 | `bad_registration_signature` | signature does not verify | stop, show |
-| 403 | `transit_identity_not_allowed` | a gateway-class signed registration by an identity that is not in `transit_identities`; the message names the identity hash | stop, show |
 | 403 | `identity_requires_signature` | legacy registration claiming an identity that has a `signed` row here | stop, show "reload this page" |
 | 403 | `signature_required` | unsigned registration while the matching enforcement switch is on (§11.1) | stop, show "reload this page" |
 | 403 | `peer_confirmation_required` | a legacy `reticulum-php` registration that would re-bind a `local` or `confirmed` row | log, stop |
-| 403 | `peer_not_accepted` | a peer registration from a URL that is not on this relay's accept-list (§10.2) | log, stop (§10.8) |
 | 409 | `stale_challenge` | the challenge does not verify against this relay, this identity and the row's current seq; or the bind race was lost | **fetch ONE new challenge and register ONCE more**; a second 409 is terminal: stop, show |
-| 503 | `registration_capacity` | a new row while the interfaces table is full (§12.4) | stop, show "this relay is full" |
-| 503 | `peer_confirm_backlog` | four peer registrations for this URL already wait for confirmation (§10.4) | log, stop (§10.8) |
+| 503 | `registration_capacity` | a new row while the interfaces table is full (§12.4), including a peer registration that would create a URL row (§10.4) | stop, show "this relay is full"; a peer: log, stop (§10.8) |
+| 503 | `peer_confirm_backlog` | four peer registrations for this URL, or 64 in all, already wait for confirmation (§10.4) | log, stop (§10.8) |
 | 202 | — (`status: confirm_pending`) | a peer registration was accepted for confirmation (§10.4) | wait for the confirm (§10.6) |
 | 401 | `unauthorized` | `/exchange`, `/tx`, `/poll`, `/goodbye` only: unknown session, or a `none` row under the matching enforcement switch | re-register once per run (§6.1) |
 | 409 | `session_superseded` | `/exchange`, `/tx`, `/poll`, `/goodbye` only: the token is the row's previous one, replaced by a newer registration of the same row | stop, show (§6.1) |
@@ -642,11 +685,17 @@ the same identity landing between challenge and register.
   reconnect cadence MUST NOT apply to these codes.
 - **Gateway:** an ERROR log line with the code. The interface goes **offline
   in Transport** with the code as its reason (visible in `rnstatus`), so
-  nothing is routed into it. It does not register again until the process
-  restarts.
+  nothing is routed into it. It registers again on the backoff schedule of
+  §9.6, James's decided exception to §3 of the principles. `409
+  session_superseded` is the exception: it stays terminal until the process
+  restarts (§6.1, §9.6).
+
+Revision 3 removed `403 audience_mismatch` (§3.2), `403
+transit_identity_not_allowed` and `403 peer_not_accepted` (§8.1, §10.2).
 
 Network failures and 5xx without one of the codes above are not protocol
-answers. The browser keeps its existing handling. The gateway follows §9.6.
+answers. The browser keeps its existing handling. When they answer the
+gateway's registration, the gateway follows §9.6.
 
 Old clients do not know these codes. An old tab treats any non-401 as
 "failed" and tries again every 5 s with the error text in its "down" reason,
@@ -672,7 +721,7 @@ answers:
 | Client | `401` | `409 session_superseded` |
 |---|---|---|
 | Browser | register again (signed: challenge, then register), once per run, as today | stop, show "This identity connected from another tab or device. Reload to connect here." |
-| Gateway | §9.5 | ERROR "another process registered this identity", offline in Transport, no registration until restart |
+| Gateway | §9.5 | ERROR "another process registered this identity", offline in Transport, no registration until restart: no backoff, and a wake does not restart it (§9.6) |
 | PHP peer (`exchangeWithPhpPeer`) | §10.8, with a compare-and-swap | log `[PEER-SUPERSEDED] <url>`, nothing else: a newer connect is already in place |
 
 This ends the eviction loop between two holders of one identity. Today, and in
@@ -693,7 +742,7 @@ so it evicts no one. The `message` tells its user to reload.
 | Registration | May create | May re-bind |
 |---|---|---|
 | signed (§4.3) | the row for its own derived identity | only that row, through §4.4 |
-| peer-confirmed (§10), accept-listed URL only | a URL row (`identity_hash IS NULL`), at promotion | the URL row with the same `peer_url_key`, whatever its proof. Never an identity row |
+| peer-confirmed (§10), any canonical `https` URL | a URL row (`identity_hash IS NULL`), at promotion | the URL row with the same `peer_url_key`, whatever its proof. Never an identity row |
 | legacy `rns-js` (`enforce_signed_registration` off) | a `none` row with `claimed_identity_hash = claim`, or with no claim | only a `none` `rns-js` row with the same `claimed_identity_hash`. Never a `signed` row |
 | legacy `reticulum-php` without a nonce (`enforce_signed_transit` off) | a `none` URL row | only a `none` URL row with the same `peer_url_key` |
 | legacy `rns-post-interface` or `reticulum-post` (`enforce_signed_transit` off) | a new `none` row (no deduplication, as today) | nothing |
@@ -701,7 +750,8 @@ so it evicts no one. The `message` tells its user to reload.
 | anything unsigned and unconfirmed, with the matching switch on | nothing (`403 signature_required`) | nothing |
 
 Every INSERT by a signed or legacy registration is subject to the capacity
-rule (§12.4).
+rule (§12.4). A peer registration that would create a URL row is checked
+against it before it is accepted (§10.4).
 
 Invariants:
 
@@ -766,36 +816,49 @@ claims are honoured (A8).
 ## 8. Transit rows and the announce guard
 
 This section is required (A3, A4, A6, A10). Signing registrations does not
-by itself close announce-replay interception, and a row's `client` string
+by itself close announce-replay interception, and an unsigned `client` string
 proves nothing.
 
 ### 8.1 Transit rows
 
+Peering is open (James, 2026-10-03: "Keep peering open"). Transit is decided
+by proof alone; no configuration lists who may be transit.
+
 `isTransitRow(R)` is true exactly when one of these holds:
 
 - `R.registration_proof` is `local` (this relay's own row toward a peer in
-  its `[interfaces]` config) or `confirmed` (§10.7), and `R.peer_url_key` is on
-  the accept-list (§10.2);
-- `R.registration_proof = 'signed'`, `R.client` is `reticulum-php` or
-  `rns-post-interface`, and `R.identity_hash` is in
-  `[registration] transit_identities`;
+  its `[interfaces]` config, §10.3) or `confirmed` (a peer whose one-time
+  nonce was confirmed at its own canonical URL, §10.5–§10.7);
+- `R.registration_proof = 'signed'` and `R.client` is `reticulum-php` or
+  `rns-post-interface`: a gateway that signed with its transport identity
+  (§9). For a signed row, `client` is one of the signed fields (§3) and passed
+  the client policy (§4.3.1), so it is part of what the signature proves, not
+  a label;
 - `R.registration_proof = 'none'`, `R.client` is `reticulum-php`,
   `rns-post-interface` or `reticulum-post`, and `enforce_signed_transit` is
   off. This is legacy, kept as it is today so that Phase 1 does not cut the
   live bridge or peering.
 
-The relay reads its configuration on every request, so a URL or identity
-removed from the config loses transit treatment at once.
+A10 stays closed: an unsigned `client` string makes a row transit only as
+legacy under the switch, `peer_*` columns never make a row a peer, and a
+browser (`rns-js`) row is never transit. What open peering gives up is the
+operator's say over *who* proves: anyone with a fresh key, or a relay at a URL
+they control, can hold a transit row. §8.5 and §16.1 say what such a row can
+and cannot do.
 
 Transit rows, and only transit rows:
 
 - skip the identity guard (§8.2), because they carry other identities'
   announces;
-- may use the seen-blob `shorter_path_replaced` exception (§8.5);
 - count as always active, and are woken at their stored `peer_url`, when they
   have one. This replaces `isPhpPeerInterface()`, which keyed on non-null
   `peer_url` and `peer_interface_id` columns that any registrant could fill;
 - never create local bindings, as today.
+
+Path updates follow §8.5, the same rule as on every other row: a random blob
+already seen never moves a path through a transit row either. Revision 2 kept
+the `shorter_path_replaced` exception for proven transit rows. With open
+peering anyone can prove one, so revision 3 removes it.
 
 Every other row is an **endpoint row**.
 
@@ -878,15 +941,56 @@ announce, replays included, matches RNS 1.5.2 (`Identity.validate_announce`
 calls `Identity.remember` and `_remember_ratchet` for every valid copy). This
 spec does not change it (§16.1).
 
-### 8.5 Path rules by row kind
+### 8.5 Path rules: a seen random blob never moves a path
 
-- **Transit rows:** today's `upsertPathFromAnnounce` rules, including
-  `shorter_path_replaced` for a seen blob with fewer hops. The exception
-  exists for the documented retichat↔selectiv direct-versus-gateway case,
-  which only transit rows produce.
-- **Endpoint rows:** an announce whose random blob is already recorded for the
-  destination never creates or replaces a path. No `shorter_path_replaced`,
-  and no `unusable_path_replaced` for a seen blob.
+On **every row**, transit and endpoint, signed, confirmed, local and legacy
+alike, from Phase 1: an announce whose random blob is already recorded for
+the destination (`path_entries.random_blobs_json`) never creates or replaces a
+path, whatever its hop count. In `upsertPathFromAnnounce`
+(`request_control_plane_trait.php:446-604` at bae739a) that means:
+
+- no `shorter_path_replaced` for a seen blob. Today that branch replaces the
+  path whenever the hop count is lower, seen or not (lines 515-526). The hop
+  count is not signed, so a replay with it lowered to 0 took the path (A4);
+- no `unusable_path_replaced` for a seen blob (lines 512-514). A path that is
+  expired, or whose row is not active, is replaced only by an announce with a
+  blob not yet seen;
+- every other branch is unchanged. They already require an unseen blob, or
+  keep the existing path.
+
+**This is RNS parity.** The reference decides it in the announce branch of
+`Transport` (`random_blobs` is the path entry's `IDX_PT_RANDBLOBS`):
+
+- **RNS 1.5.2**, the parity target (`Transport._inbound`, Transport.py:2213-2296
+  in the workspace `.venv`): an unknown destination is added (2222-2225). With
+  equal or fewer hops, the path is replaced only if `not random_blob in
+  random_blobs and announce_emitted > path_timebase` (2236-2240). With more
+  hops, an expired path is replaced only by an unseen blob (2267-2275), and a
+  live one only by a more recently emitted, unseen announce (2281-2286).
+- **RNS 1.1.3**, the `Reticulum-master` mirror in this workspace
+  (`Transport.inbound`, Transport.py:1687-1776): the same checks, except that
+  with equal or fewer hops an expired path is also replaced by any unseen blob
+  (1703-1709), and there is no gravity branch.
+
+In neither version does a lower hop count let a copy of an announce already
+heard replace a path. 1.5.2 lets such a copy (same emission time) replace a
+path in two cases, neither keyed on hop count: the copy arrived on an
+interface with a higher operator-set `gravity` than the path's (2241-2251),
+or the path was marked unresponsive by a failed link and the copy has more
+hops (2292-2295; 1.1.3 has this one too, 1766-1771). The relay has neither an
+interface gravity nor an unresponsive mark, so neither applies. If either is
+ever added, it keys on the receiving row's operator setting or on this relay's
+own failure event, never on the hop count, which nothing signs.
+
+**What it costs.** `shorter_path_replaced` was added for the documented
+retichat↔selectiv direct-versus-gateway case (comment at lines 516-524): the
+same announce arrives through the gateway (6 hops) and through the direct peer
+(2 hops), and whichever arrives first claims the blob. When the gateway copy
+wins, the direct copy no longer replaces it. The path moves to the direct
+peer only when a later announce (a new blob) reaches this relay through the
+direct peer first (`better_or_equal_hops_newer_announce`). Until then traffic
+for that destination takes the gateway. RNS's own answer to this case is
+gravity, which §16.2 puts to James.
 
 ---
 
@@ -919,13 +1023,13 @@ in `python/RNS/Interfaces/PostInterface.py` MUST reach parity.
      today. All of them are signed.
    - **Poll mode:** `client = rns-post-interface`, with `transport` and no peer
      fields.
-   - `audience`: the host of its configured node URL (§3.2).
-   - The gateway fetches its challenge with its own public key.
-3. **Listed.** The gateway's identity hash MUST be in
-   `[registration] transit_identities` on every relay it registers with.
-   Otherwise it gets `403 transit_identity_not_allowed`, which is terminal. The
-   ERROR line prints the hash to add. The gateway also logs its identity hash
-   at startup.
+   - The gateway fetches its challenge with its own public key. It signs no
+     relay address (§3.2).
+3. **No list.** Revision 2 required the gateway's identity hash in
+   `[registration] transit_identities` on every relay. Peering is open, so
+   revision 3 has no such list: a gateway that signs with its transport
+   identity gets a transit row on any relay (§8.1), and no relay's config
+   names it. The gateway logs its identity hash at startup.
 4. **One row for good.** The row is keyed by the gateway's identity hash, so
    restarts keep the same `interface_id` and PHP-side paths survive gateway
    restarts (they do not today). `peer_url` becomes an address attribute that
@@ -940,36 +1044,74 @@ in `python/RNS/Interfaces/PostInterface.py` MUST reach parity.
    is gone and the relay will not wake the gateway. The gateway's next
    outbound packet still drives an exchange, because backbone announces never
    stop. That exchange gets the 401 and re-registers.
-6. **Failure, without timers.**
-   - A terminal code (§6) or `409 session_superseded`: ERROR, the interface goes
-     offline in Transport with the code as its reason, and it does not register
-     again until the process restarts.
-   - A registration that fails on the network or with a 5xx: ERROR, and the
-     interface goes offline in Transport with the reason. Registration starts
-     again on the **next wake from the relay** (wake mode) or a process
-     restart. It does not start again on every outbound packet: revision 1 did
-     that, and it would hammer a failing relay at traffic rate. Poll mode has
-     no wakes, so a restart starts it again.
-   - When a relay's DB was reset *and* it answered 5xx, it cannot wake a
-     gateway it no longer knows, so the gateway needs one restart
-     (`rnsd-redeploy.sh`) once the relay is healthy. The ERROR line says so.
-   - Only one registration is in flight at a time. There is no backoff sleep:
-     the current back-off of up to 60 s is removed (§3/§4 of the principles).
+6. **Failure: exponential backoff, James's decided exception to §3 of the
+   principles.** `DESIGN_PRINCIPLES.md` §3 forbids retries. Its decided
+   exception of 2026-10-03 for "the gateway's registration at a PHP relay
+   after a hard refusal" says: when a relay answers the gateway's signed
+   registration with a server error or a terminal refusal code, "the gateway
+   re-registers with exponential backoff — 2 s, doubling, capped at 5 min —
+   and resets the backoff on a successful registration or whenever the relay
+   wakes it". James's decision covers a network failure the same way. The
+   exception covers that registration only: exchanges, sends, links and path
+   requests are still never retried.
+   - **What starts it.** A registration that fails on the network, is
+     answered with a 5xx, or is answered with a terminal code from §6. That
+     includes the challenge request that precedes it, a second
+     `409 stale_challenge`, and a signed answer without
+     `session_token_encrypted` (step 7). A challenge `404` is not a failure:
+     the gateway registers legacy (§11.4). A first `409 stale_challenge` is
+     not a failure either: it is the one protocol step of §6.
+   - **Surfaced while it lasts.** Each failed attempt logs ERROR with the
+     relay, the status, the code and the delay before the next attempt
+     (§13). The interface is offline in Transport with that code as its
+     reason, visible in `rnstatus`, so nothing is routed into it. Each
+     attempt is still a network send under §1 of the principles: a late
+     success is asserted and logged.
+   - **Schedule.** After the n-th consecutive failed registration the next
+     one starts `min(2 s × 2^(n−1), 300 s)` later: 2, 4, 8, 16, 32, 64, 128,
+     256, 300, 300 … seconds.
+   - **Resets.** A successful registration puts the interface back online in
+     Transport and resets the delay to 2 s. A wake from the relay (wake mode)
+     resets the delay to 2 s and starts a registration at once, in place of
+     the pending wait. Poll mode has no wakes, so only a success resets it.
+   - **One in flight.** Only one registration is in flight at a time. A wake
+     that arrives while one is in flight resets the delay, so a failure of
+     that attempt waits 2 s, and starts nothing else.
+   - **Outbound packets start nothing.** Revision 1 re-registered on every
+     outbound packet, which would hammer a failing relay at traffic rate.
+     Nothing is routed into an offline interface, and only the schedule, a
+     wake or a restart starts a registration.
+   - **`409 session_superseded` is terminal, with no backoff.** It answers an
+     exchange, not a registration, so the exception does not cover it.
+     Another process with the same transport identity registered after this
+     one, and the newest registration wins (§6.1). Registering again would
+     evict it, and the two would take turns. The interface stays offline in
+     Transport until the process restarts, and a wake does not restart it.
+   - **Exchanges are not retried.** The exchange back-off of up to 60 s in
+     today's `post_interface.rs` exchange worker (`consecutive_errors`) is
+     removed (§3 and §4 of the principles). A failed exchange is logged, and
+     the next exchange waits for the next wake, outbound packet or (poll mode)
+     poll. A `401` is the event of step 5.
+   - A relay whose DB was reset and that answered 5xx no longer needs a
+     gateway restart: the schedule reaches it once it is healthy, at most
+     5 min later.
 7. **Decrypting.** The gateway decrypts `session_token_encrypted` with the
    transport identity (§5).
    - If the challenge endpoint answers `404`, it registers legacy and accepts
      a plaintext token, until `enforce_signed_transit` (§11).
    - If a signed registration is answered without `session_token_encrypted`,
-     that is a protocol error (terminal).
+     that is a protocol error: terminal, under the backoff of step 6.
 
 ---
 
-## 10. PHP relay peers: a one-time nonce confirmed at the peer's configured URL
+## 10. PHP relay peers: a one-time nonce confirmed at the peer's own URL
 
 A PHP relay has no Reticulum key; its "transport identity" is a random
 `identity_hash_hex`. A peer proves the URL it claims instead. Only
 `connectToPeer` on the relay at that URL can issue the nonce, and the
-receiving relay confirms it **at that URL, as its own config names it**.
+receiving relay confirms it **at that URL, in canonical form** (§10.5).
+Peering is open (James, 2026-10-03): the receiving relay needs no
+configuration for the peer.
 
 A plain callback to the peer's `/v1/interfaces/exchange` would prove nothing.
 Registration at the peer is open, so an attacker can obtain valid credentials
@@ -997,46 +1139,70 @@ exchange already relies on.
 
 `peer_url_key = SHA-256 hex of canonical(u)`. The relay stores `peer_url` in
 canonical form together with `peer_url_key`, and **every lookup by URL is
-`peer_url_key = :key`** (§12.2). Config values (`node_url`, `host_url`,
-`accepted_peer_urls`) are trimmed and then canonicalised when loaded. One that
-does not canonicalise is a config error: it is logged and that peer is
-skipped.
+`peer_url_key = :key`** (§12.2). Config values (`node_url`, `host_url`) are
+trimmed and then canonicalised when loaded. One that does not canonicalise is
+a config error: it is logged and that peer is skipped.
 
 A relay's canonical `host_url` MUST equal the canonical `node_url` its peers
 configure for it. This is already required today for deduplication.
 
 ### 10.2 Who may peer, and where calls go
 
-- **The accept-list** is the canonical `[interfaces]` `node_url`s plus the
-  canonical `[registration] accepted_peer_urls`.
-- A peer registration whose canonical `peer_url` is not on the accept-list gets
-  `403 peer_not_accepted`. **Open peering is closed in v1** (§16.2). A relay
-  that only *receives* a peering (it has no `[interfaces]` block for the
-  initiator) MUST list the initiator in `accepted_peer_urls`.
-- **Every outbound call to a peer** (register, confirm, exchange, wake,
-  wake-back) goes to an accept-listed URL taken from the config, or to the
-  stored canonical URL of a row whose key is accept-listed. It never goes to a
-  URL taken from a request. §0.1 is the live case of breaking this rule.
+- **Anyone may peer.** James chose "Keep peering open" over revision 2's
+  accept-list. A peer registration from any canonical URL that meets the
+  scheme rule below is taken for confirmation (§10.4), and a confirmed peer
+  gets a transit row (§8.1). There is no `accepted_peer_urls` and no
+  `403 peer_not_accepted`. A relay that only *receives* a peering needs no
+  configuration for the initiator.
+- **Calls that start a peering go only to configured relays.** The register
+  of `connectToPeer` (§10.3) and the wake-back (§10.9) use a canonical
+  `[interfaces]` `node_url` from the config.
+- **Credentials go only to a row's stored canonical URL.** The exchange
+  (`exchangeWithPhpPeer`) uses the stored canonical `peer_url` of the row it
+  serves, and so does the wake, which carries none. The confirm (§10.5) goes
+  to the canonical URL stored with the pending record: the URL the peer
+  registration named, which becomes that row's URL. The credentials it
+  carries are for that URL's row, and reaching that URL is what proves it. No
+  call ever goes to a URL taken from any other request field (a `waker_url`,
+  a `confirmer_url`). §0.1 is the case of breaking this rule, fixed live by
+  d3a0eb5.
+- **A confirmed peer this relay does not configure** is a transit row like
+  any other: it is exchanged with and woken at its stored URL. It gets no
+  wake-back (§10.9), and this relay never reconnects it (§10.8). Only a relay
+  that configures it reconnects it.
 - A peer URL MUST be `https`, except for a loopback
   `http://127.0.0.1|[::1]|localhost…` when
   `[registration] allow_loopback_http_peers = true` (staging only). Anything
   else gets `400 peer_url_not_allowed`. A gateway is not a peer. Its `http`
-  `peer_url` is allowed (§4.3.1) because only listed identities' rows are ever
-  woken (§8.1).
+  `peer_url` is allowed (§4.3.1), and is woken unproven. Revision 2 woke only
+  listed identities; with open peering any signed gateway's URL is woken
+  (§16.1.10, a question in §16.2).
 
 ### 10.3 The initiator (`connectToPeer` toward configured peer B, URL `U_B`)
 
-**Exactly one relay initiates for each pair.** When only one relay configures
-the other, that relay is the initiator. When both configure each other, the
-initiator is the relay whose canonical `host_url` comes first in byte order.
-Both relays compute the same answer, because each one's `host_url` is the
-other's `node_url` (§10.1). The other relay never runs `connectToPeer` for
-that pair. It receives, promotes and wakes back. Without this rule, two
-relays connecting to each other at the same moment could interleave the two
-credential hand-offs. Each would then hold a token the other had superseded,
-and both would drop on `409` with nothing left to repair the peering. In
-§10.8 and §10.9, "configured" means configured **and** the initiator for that
-pair.
+**Exactly one relay initiates for each pair.** A relay initiates toward a peer
+in its own `[interfaces]` only when its own canonical `host_url` comes before
+that peer's canonical `node_url` in byte order. Otherwise it is the receiver:
+it never runs `connectToPeer` for that peer, and it receives, promotes and
+wakes back. When both relays configure each other, both compute the same
+answer, because each one's `host_url` is the other's `node_url` (§10.1). For
+retichat.com and selectivesubconscious.com, which James configures both ways,
+retichat.com initiates. Without this rule, two relays connecting to each other
+at the same moment could interleave the two credential hand-offs. Each would
+then hold a token the other had superseded, and both would drop on `409` with
+nothing left to repair the peering. In §10.8, "configured" means configured
+**and** the initiator for that pair. §10.9 says "in `[interfaces]`" where it
+means configured, initiator or not.
+
+**What a relay cannot see.** Revision 2 also said that when only one relay
+configures the other, that relay initiates. A relay cannot see another relay's
+config, so it cannot know it is the only one. Revision 2's closed peering hid
+this, because James configures both relays. With open peering it matters: a
+third-party relay that configures one of ours, while ours does not configure
+it, can initiate only if its URL sorts first. One whose URL sorts after ours
+treats ours as the initiator, ours never connects, and the peering does not
+form. Revision 3 keeps the safe rule above, which never lets two hand-offs
+interleave, and puts the fix to James (§16.1.12, §16.2).
 
 `connectToPeer` runs in the detached runner (job `peer-connect`, spawned the
 way `spawnDetachedWakeRunner` spawns wake runners), never inside a request
@@ -1107,12 +1273,21 @@ It makes no outbound call and never touches the live row.
 
    Anything else gets `400 bad_registration`.
 2. `U = canonical(peer_url)`, which MUST satisfy §10.2's scheme rule.
-   Otherwise `400 peer_url_not_allowed`.
-3. `key(U)` MUST be on the accept-list. Otherwise `403 peer_not_accepted`.
-4. Fewer than **four** `peer_registration_pending` records for `key(U)` may
-   exist. Otherwise `503 peer_confirm_backlog`.
+   Otherwise `400 peer_url_not_allowed`. Any such `U` is accepted: there is no
+   accept-list (§10.2).
+3. **Pending bound.** Fewer than **four** `peer_registration_pending` records
+   for `key(U)`, and fewer than **64** in all, may exist. Otherwise
+   `503 peer_confirm_backlog`. Revision 2 bounded only the records per URL,
+   because only accept-listed URLs got this far. With open peering any URL
+   does, so the total is bounded too: each record holds one detached confirm
+   runner (§10.5).
+4. **Capacity.** If there is no URL row for `key(U)`, promotion will INSERT
+   one, so the interfaces table must have room: §12.4 steps 1–3, which may
+   reclaim legacy rows. Otherwise `503 registration_capacity`. Promotion
+   itself is not checked again (§12.4).
 5. INSERT a `peer_registration_pending` record:
    - `peer_url_key` and `nonce_hex` (together the primary key);
+   - `peer_url = U`, canonical: the confirm goes there (§10.5);
    - `peer_interface_id` and `peer_session_token` from the body;
    - `new_interface_id`: the existing URL row's `interface_id`, or a fresh
      16 bytes hex if there is none;
@@ -1130,7 +1305,7 @@ It can only occupy a pending slot until its confirm fails.
 
 One runner per pending record:
 
-1. POST `<U as configured>/v1/peers/confirm`:
+1. POST `<the record's canonical peer_url>/v1/peers/confirm`:
 
    ```json
    {"nonce": "<nonce_hex>", "peer_interface_id": "<Lid>",
@@ -1138,8 +1313,12 @@ One runner per pending record:
     "interface_id": "<new_interface_id>", "session_token": "<new_session_token>"}
    ```
 
-   These credentials go only to the configured URL, so only the real peer can
-   receive them.
+   These credentials go only to the canonical URL the registration named, so
+   only whoever serves that URL can receive them, and they are credentials for
+   that URL's row. A registrant that named a URL it does not serve sends that
+   URL's owner credentials for the owner's own row. The owner issued no such
+   nonce, so it answers `403 unknown_nonce` (§10.6) and the record is deleted
+   (step 3). The registrant gets nothing.
 2. **On `200` with `{"confirmed": true}`:**
    - Promote the record (§10.7), unless first use already did.
    - Log `[PEER-CONFIRM] <U> <created|rebound> interface=<id8>`.
@@ -1215,8 +1394,8 @@ Promotion happens at **whichever comes first**:
   `new_session_token = token` (`hash_equals`).
 
 Presenting that token proves the peer accepted the nonce. The runner sent it
-only to the configured URL, and the initiator keeps it only after its nonce
-check. So the peer can use its new credentials the moment it has them, and the
+only to the peer's canonical URL (§10.5), and the initiator keeps it only
+after its nonce check. So the peer can use its new credentials the moment it has them, and the
 outcome never depends on which message lands first.
 
 In the transition, either side may present a credential the other has just
@@ -1234,14 +1413,19 @@ connect:
 | Event | Condition | Action |
 |---|---|---|
 | Maintenance | a configured peer has **no row** | connect |
-| A wake from an accept-listed peer URL (§10.9) | this relay has **no row** for it and is the pair's initiator | connect |
+| A wake from a peer URL in `[interfaces]` (§10.9) | this relay has **no row** for it and is the pair's initiator | connect |
 | `GET /v1/initialize` | a configured peer is not connected (refused included) | connect, inline |
-| `401` on this relay's pull from the peer | the row's stored `peer_session_token` still equals the token that got the 401 (compare-and-swap) | `peer_state = 'lost'`, then connect if the URL is configured. Otherwise log `[PEER-401-UNCONFIGURED]` and stop. |
+| `401` on this relay's pull from the peer | the row's stored `peer_session_token` still equals the token that got the 401 (compare-and-swap) | `peer_state = 'lost'`, then connect if the URL is configured. Otherwise (a confirmed peer this relay does not configure, or one it is the receiver for) log `[PEER-401-UNCONFIGURED]` and stop: the relay that initiates reconnects it. |
 | `409 session_superseded` on that pull | — | log `[PEER-SUPERSEDED]`, nothing else |
 | An authenticated exchange **from** the peer | this relay's row for it is `refused` or has no remote credentials, and the URL is configured | connect |
 
 Other rules:
 
+- **Only configured peers are connected.** With open peering, a relay may
+  hold confirmed rows for peers it does not configure. None of the events
+  above connects such a peer, and it gets no wake-back (§10.9, James
+  2026-10-03). Only the relay that configures this one reconnects the pair;
+  §10.10 says when it cannot see that it must.
 - **Nothing else connects.** A refused or connecting row is never retried on a
   clock. Its state stays until one of these events arrives. The
   `peer_session_heal_after_seconds` rule (3600 s offline) is removed, and so
@@ -1262,15 +1446,24 @@ Other rules:
 
 `POST /v1/wake {"waker_url": W}`:
 
-- **`key(canonical(W))` matches a transit row:** ordinary wake handling,
-  exchanging with the row's **stored** URL (§0.1).
-- **No such row, the key is accept-listed, and this relay is the pair's
-  initiator (§10.3):** log `[WAKE-UNKNOWN-PEER] <W>` and connect (§10.8).
-- **No such row, the key is accept-listed, this relay is not the initiator,
-  and the body has no `"session_lost": true`:** log `[WAKE-UNKNOWN-PEER] <W>`,
-  then send **one** fire-and-forget wake to the accept-listed URL from the
-  config, with `{"waker_url": "<own host_url>", "session_lost": true}`.
-- **Otherwise:** log `[WAKE-UNKNOWN-PEER] <W>` and do nothing else.
+- **`key(canonical(W))` matches a transit URL row:** ordinary wake handling,
+  exchanging with the row's **stored** URL (§0.1; live since d3a0eb5, which
+  logs `[WAKE-REFUSED]` when W does not match the stored URL).
+- **No such row, the key is a `node_url` in this relay's `[interfaces]`, and
+  this relay is the pair's initiator (§10.3):** log `[WAKE-UNKNOWN-PEER] <W>`
+  and connect (§10.8).
+- **No such row, the key is a `node_url` in this relay's `[interfaces]`, this
+  relay is not the initiator, and the body has no `"session_lost": true`:**
+  log `[WAKE-UNKNOWN-PEER] <W>`, then send **one** fire-and-forget wake to that
+  `node_url` from the config, with
+  `{"waker_url": "<own host_url>", "session_lost": true}`.
+- **Otherwise,** including every W that is not in this relay's
+  `[interfaces]`: log `[WAKE-UNKNOWN-PEER] <W>` and do nothing else.
+
+Wake-back happens only between configured relays (James, 2026-10-03). With
+open peering a relay may have peered with relays it does not configure. If it
+loses its row for one of them, that relay's wakes get no answer here, and the
+peering stays down until that relay's operator reconnects it (§10.10).
 
 A wake that carries `session_lost` is never answered with another wake, so the
 reflection happens once and cannot loop. The relay that receives it runs its
@@ -1285,7 +1478,8 @@ principles).
 | Event | What happens |
 |---|---|
 | Initiator DB reset | A's first request runs maintenance, which finds no row and connects. A wake from B does the same. B confirms at A's URL and promotes in place, so B's queue and paths survive. |
-| Receiver DB reset (whether or not it also configures the initiator) | A's next wake reaches B, which has no row and is not the initiator, so it wakes back with `session_lost`. A pulls from B, gets `401`, and connects once. B confirms and inserts the row. The announces A relays to B keep its queue for B non-empty, so A's next wake does not wait for a user to send something. |
+| Receiver DB reset, receiver configures the initiator | A's next wake reaches B, which has no row and is not the initiator, so it wakes back with `session_lost`. A pulls from B, gets `401`, and connects once. B confirms and inserts the row. The announces A relays to B keep its queue for B non-empty, so A's next wake does not wait for a user to send something. |
+| Receiver DB reset, receiver does **not** configure the initiator (open peering) | A's wakes reach B, which has no row and does not configure A, so it logs `[WAKE-UNKNOWN-PEER]` and does nothing else: no wake-back to an unconfigured relay (James, 2026-10-03). A's row still reads `connected`, and A pulls from B only when B wakes it, so A never sees a `401`. The peering stays down until A's operator rotates it (README: `DELETE` A's row, then `/v1/initialize`). James's own relays configure each other, so this never applies between them (§16.1.12). |
 | B's confirm runner never runs (spawn failure, logged at B) | A's row is unchanged and still works if it worked before. A's nonce record waits until the next connect replaces it. |
 | B's runner dies between A's `200` and the promotion | B→A traffic promotes on first use. A→B pulls by B get `409 session_superseded` and are dropped until the next connect. B logs ERROR `[PEER-SUPERSEDED] … pending confirm unfinished`. |
 | README "Rotating a PHP peering's credentials" | Unchanged: `DELETE` the initiator's row, then `/v1/initialize`. A creates a new `Lid` (proof `local`) and a nonce, and B promotes its row in place. Every confirmed connect also rotates both session tokens, so `/v1/initialize` on a peer that is not connected is a rotation too. The procedure applies only to URL rows, never to identity rows (§12.5). |
@@ -1305,11 +1499,12 @@ connecting to each other at the same moment cannot deadlock.
 [registration]
 enforce_signed_registration = false   # browsers. James flips to true on a date he sets.
 enforce_signed_transit      = false   # gateways and PHP peers. James flips once Phases 3 and 3b are verified.
-accepted_peer_urls          = []      # PHP relays allowed to peer here, in addition to [interfaces] node_urls
-transit_identities          = []      # identity hashes (32 hex) of gateways allowed a transit row
 max_interface_rows          = 20000   # §12.4
 allow_loopback_http_peers   = false   # staging only: true
 ```
+
+Revision 2's `accepted_peer_urls` and `transit_identities` are gone: peering
+is open (§8.1, §10.2). A relay that still has them in its config ignores them.
 
 While a switch is off ("accept-both"), every path in this spec is live:
 signed and confirmed registrations are preferred, and legacy registrations are
@@ -1330,6 +1525,10 @@ accepted and logged `[REG-LEGACY] client=<c> type=<t>`.
 - `none` rows of those clients stop being transit rows (§8.1), and
   `authenticateInterface` answers them `401`.
 
+The transit switch ends *unproven* transit, not open peering. Under it, any
+gateway that signs and any PHP relay confirmed at its own URL still gets a
+transit row, with no list (§8.1).
+
 Gateways and peers are few and operator-run. They can be moved within days,
 so the transit switch does not have to wait for the last cached browser tab.
 
@@ -1346,10 +1545,10 @@ suite, then `verify-live-stamp.sh`; the web has its boot gate, CSP check and
 
 | Phase | What | Gate and notes |
 |---|---|---|
-| 0 | Staging only (`staging.sh`, `STAGING_PHP=local`, gateway in wake mode) | The §15 before/after stage MUST fail on 3281ad5 (and on Reticulum-rust before its change) and pass on the fix. Staging is SQLite, so it cannot show A9 (§12.2). |
-| 1 | Relays, accept-both: selectiv, then retichat.com | **Config first**, on each host: `transit_identities` lists the gateway's identity hash where the gateway registers (retichat.com), and the receiving side of the peering lists the initiator in `accepted_peer_urls` unless its `[interfaces]` already names it. **Gates:** (a) schema probe: the columns, the UNIQUE index, both new tables, and `peer_url_key` filled for every row with a `peer_url`. A failed MySQL `ALTER` leaves the fingerprint unrecorded and would make every signed registration 500. (b) One signed test registration against each relay succeeds, which shows that nothing in front of PHP rewrites `Host` (§3.2). (c) `/health` shows `registration_proof` and `peer_state` per node and gateway row. |
+| 0 | Staging only (`staging.sh`, `STAGING_PHP=local`, gateway in wake mode) | The §15 before/after stage MUST fail on bae739a (and on Reticulum-rust before its change) and pass on the fix. Staging is SQLite, so it cannot show A9 (§12.2). |
+| 1 | Relays, accept-both: selectiv, then retichat.com | No new config: peering is open, so there is no list to fill in (§11.1). **Gates:** (a) schema probe: the columns, the UNIQUE index, both new tables (`peer_registration_pending` with its `peer_url`), and `peer_url_key` filled for every row with a `peer_url`. A failed MySQL `ALTER` leaves the fingerprint unrecorded and would make every signed registration 500. (b) One signed test registration against each relay succeeds. (c) `/health` shows `registration_proof` and `peer_state` per node and gateway row. From this phase §8.5 holds on every row, so watch for its cost: a selectiv destination that retichat.com reaches through the gateway rather than the direct peer. |
 | 2 | Retichat-js | New page loads sign. Against a relay still on old code, the client gets a `404` from the challenge endpoint and registers legacy. |
-| 3 | Gateway: James pushes Reticulum-rust and redeploys (`rnsd-redeploy.sh`) | It registers signed and gets an identity row. That registration retires the legacy bridge row with the same canonical `peer_url` at once (§4.5, `[REG-RETIRE-URL]`), and paths are learned again from the next announces. Its `interface_id` changes this one time and is stable from then on. Check rx/tx per minute (runbook §5). Python bridges follow the same path. |
+| 3 | Gateway: James pushes Reticulum-rust and redeploys (`rnsd-redeploy.sh`) | It registers signed and gets an identity row; no relay needs its identity hash. That registration retires the legacy bridge row with the same canonical `peer_url` at once (§4.5, `[REG-RETIRE-URL]`), and paths are learned again from the next announces. Its `interface_id` changes this one time and is stable from then on. Check rx/tx per minute (runbook §5). Python bridges follow the same path. |
 | 3b | PHP peering | `GET /v1/initialize` on the initiator (retichat.com). Its connect is confirmed at selectiv. The rows become `local` + `confirmed`, and both keep their `interface_id`s. **Gate:** `/health` on both relays shows those proofs and `peer_state = connected`. |
 | 3c | `enforce_signed_transit` on both relays, on James's word | **Gate:** `/health` on both relays lists no `none` node or gateway row, and `[REG-LEGACY]` shows no `reticulum-php`, `rns-post-interface` or `reticulum-post` line since Phase 3b. |
 | 4 | `enforce_signed_registration`, on James's date: selectiv, then retichat.com | A config edit on each host. |
@@ -1398,7 +1597,7 @@ fallback. A forged `404` would need someone on the path inside HTTPS.
 
 ### 11.5 Rollback
 
-- **A relay back to 3281ad5:**
+- **A relay back to bae739a:**
   - The new columns and tables are ignored, and signed rows' `metadata_json`
     carries no identity, so nothing breaks.
   - New browsers get `404` from the challenge endpoint and register legacy. The
@@ -1408,7 +1607,7 @@ fallback. A forged `404` would need someone on the path inside HTTPS.
     Stored URLs are canonical, which is the form the configs already use.
 
   **This restores every attack in §0 except A2**, which the hotfix keeps
-  closed, and A9's live case if §0.1 has shipped.
+  closed, and A9's live case, which d3a0eb5 keeps closed (§0.1).
 - **Forward again:** `migrateIfNeeded()` runs, because the fingerprint
   differs. The `peer_url_key` and `claimed_identity_hash` backfills fill rows
   that old code wrote, and `authenticateInterface` fills any it missed (§12.3).
@@ -1446,8 +1645,13 @@ again.
 | `interfaces.previous_session_token_hash` | `VARCHAR(64) DEFAULT NULL` |
 | `interfaces.peer_state` | `VARCHAR(64) DEFAULT NULL` |
 | `peer_registration_nonces` | `peer_url_key VARCHAR(64) NOT NULL PRIMARY KEY, peer_url VARCHAR(512) NOT NULL, nonce_hex VARCHAR(32) NOT NULL, local_interface_id VARCHAR(64) NOT NULL, next_session_token VARCHAR(128) NOT NULL, created_at INT NOT NULL DEFAULT 0` |
-| `peer_registration_pending` | `peer_url_key VARCHAR(64) NOT NULL, nonce_hex VARCHAR(32) NOT NULL, peer_interface_id VARCHAR(64) NOT NULL, peer_session_token VARCHAR(128) NOT NULL, new_interface_id VARCHAR(64) NOT NULL, new_session_token VARCHAR(128) NOT NULL, created_at INT NOT NULL DEFAULT 0, PRIMARY KEY (peer_url_key, nonce_hex)` + an index on `new_interface_id` |
+| `peer_registration_pending` | `peer_url_key VARCHAR(64) NOT NULL, nonce_hex VARCHAR(32) NOT NULL, peer_url VARCHAR(512) NOT NULL, peer_interface_id VARCHAR(64) NOT NULL, peer_session_token VARCHAR(128) NOT NULL, new_interface_id VARCHAR(64) NOT NULL, new_session_token VARCHAR(128) NOT NULL, created_at INT NOT NULL DEFAULT 0, PRIMARY KEY (peer_url_key, nonce_hex)` + an index on `new_interface_id` |
 | `transport_state` row | `registration_challenge_secret_hex` |
+
+Revision 3 adds `peer_registration_pending.peer_url`, the canonical URL the
+confirm goes to (§10.5). Revision 2 took it from the config, which an open
+peering may not have. No column is removed: the accept-list and
+`transit_identities` were config, never schema.
 
 ### 12.2 Lookups never compare free text (A9)
 
@@ -1495,12 +1699,17 @@ Before a signed or legacy registration INSERTs into `interfaces`:
    `[REG-CAPACITY] client=<c>`.
 
 Signed, `local` and `confirmed` rows are never reclaimed (§12.5). A
-re-registration of an existing row never counts. A peer promotion (§10.7) and
-`connectToPeer`'s own row are exempt. They are bounded by the accept-list, and
-refusing one would leave the peer holding credentials for a row that does not
-exist, which its 401 would turn into a loop of connects. With nothing to
-schedule, the bound is enforced by the only operations that grow the table
-without limit, as the no-cron rule asks.
+re-registration of an existing row never counts. `connectToPeer`'s own row is
+exempt: it is bounded by the config. A peer promotion (§10.7) is not checked
+when it inserts, because refusing it then would leave the peer holding
+credentials for a row that does not exist, which its 401 would turn into a
+loop of connects. Revision 2 relied on the accept-list to bound promotions.
+With peering open, the check moves to the peer registration instead: one that
+would create a URL row gets `503 registration_capacity` when the table is
+full (§10.4 step 4). At most 64 records are pending (§10.4 step 3), so
+promotions can take the table at most 64 rows past `max_interface_rows`. With
+nothing to schedule, the bound is enforced by the only operations that grow
+the table without limit, as the no-cron rule asks.
 
 ### 12.5 Invariants and operator rules
 
@@ -1542,34 +1751,52 @@ public. Logs give them in full or as 8-hex prefixes.
 | Tag | When |
 |---|---|
 | `[REG-SIGNED] identity=<H> interface=<id8> <created\|rebound> client=<c>` | a signed registration succeeded |
-| `[REG-REFUSED] <status> <error> client=<c> [identity=<H>]` | any 4xx or 5xx from register or challenge |
+| `[REG-REFUSED] <status> <error> client=<c> [identity=<H>] [key=<8>]` | any 4xx or 5xx from register or challenge; `key` is the canonical peer URL's key, for a peer registration |
 | `[REG-LEGACY] client=<c> type=<browser\|peer\|gateway\|other> action=<created\|rebound> …` | accept-both |
 | `[REG-RETIRE] identity=<H> rows=<n>`, `[REG-RETIRE-URL] key=<8> rows=<n>` | §4.5 |
 | `[REG-RECLAIM] rows=<n>`, `[REG-CAPACITY] client=<c>` | §12.4 |
 | `[REG-BAD-IDENTITY]` | malformed legacy claim (existing) |
 | `[SESSION-SUPERSEDED] interface=<id8>` | §6.1, at most once per row per token, so an old tab's 5 s loop does not flood the log |
 | `[PEER-REGISTER]`, `[PEER-REGISTER-LEGACY]`, `[PEER-CONFIRM]`, `[PEER-CONFIRMED-BY]`, `[PEER-CONFIRM-FAIL]`, `[PEER-CONFIRM-LATE]`, `[PEER-PROMOTE-MISMATCH]`, `[PEER-HTTP]`, `[PEER-SUPERSEDED]`, `[PEER-401-UNCONFIGURED]`, `[WAKE-UNKNOWN-PEER]` | §10. `exchangeWithPhpPeer` logs every non-2xx as `[PEER-HTTP] <url> -> <status> <error>`, and `httpPostJson` must return the status, not `null`. |
+| `[WAKE-REFUSED]` | a wake whose `waker_url` does not match the stored URL (§0.1; live since d3a0eb5) |
 | `[ANNOUNCE-FOREIGN]`, `[ANNOUNCE-LEGACY-REFUSED]` | §8 |
 | `[SCHEMA-PEER-URL]` | §12.3 |
+
+The gateway (§9) logs, at ERROR, every failed registration with the relay's
+URL, the HTTP status (`0` for a network failure), the code and the delay
+before the next attempt (§9.6); at NOTICE, each reset of that delay and its
+cause (`registered` or `wake`); at ERROR, a `409 session_superseded` and that
+it will not register again until restarted; and at startup, its transport
+identity hash. The reason it gives Transport for being offline carries the
+same code, so `rnstatus` shows it.
 
 ---
 
 ## 14. Test vectors
 
-The vector file (format 2) contains:
+The vector file (format 3) contains:
 
 | Section | Contents |
 |---|---|
-| `relays.A` / `relays.B` | `relay_secret`, `host` (the audience each relay accepts) and `transit_identities` for each relay. Every vector is presented to A, which lists the gateway. |
+| `relays.A` / `relays.B` | `relay_secret` for each relay, and nothing else: no `host` (no audience, §3.2) and no `transit_identities` (open peering, §8.1). Every vector is presented to A. |
 | `identities` | `browser`, `gateway` and `other`: private key (`x25519_prv \|\| ed25519_seed`, RNS layout), public key and identity hash. `lowx`: an Ed25519 seed with an all-zero X25519 half and no X25519 private key. |
 | `challenges` | the MAC input, MAC and 48-byte challenge for every challenge used, with the seq each binds, including relay B's and one minted for another identity. Each `challenge_response` example carries no seq. |
-| `registrations` | four end-to-end positive vectors: `browser-first` (seq 0 → 1, INSERT), `browser-reregister` (seq 1 → 2, non-ASCII name), `gateway-wake` (`reticulum-php`, mode 6, peer fields, seq 5 → 6) and `gateway-poll` (`rns-post-interface`, `transport`). Each has the request body, the field-by-field `lp` breakdown, the signed bytes, the signature, the expected identity hash and new seq, a response example, and an encrypted token pinned by a fixed ephemeral key and IV, with the shared key, derived key, HMAC key and AES key for debugging. |
-| `negative` | twenty-two vectors, each failing exactly one §4.3 step: tampered name, bitrate, `peer_url` and `peer_session_token`; another key's signature; a replay after success; a lower-seq challenge; relay B's MAC; a challenge for another identity; an altered nonce; **relay B's audience**; a mismatched `metadata.identity_hash`; an unsigned metadata key; an upper-case public key; a browser asking for mode 6; a browser carrying `peer_url`; an unknown client; a wake gateway without peer fields; a poll gateway with `peer_url`; an identity not in `transit_identities`; a relay at capacity; a low-order X25519 key |
+| `registrations` | four end-to-end positive vectors: `browser-first` (seq 0 → 1, INSERT), `browser-reregister` (seq 1 → 2, non-ASCII name), `gateway-wake` (`reticulum-php`, mode 6, peer fields, seq 5 → 6, an identity no relay lists) and `gateway-poll` (`rns-post-interface`, `transport`). Each has the request body, the field-by-field `lp` breakdown, the signed bytes, the signature, the expected identity hash and new seq, a response example, and an encrypted token pinned by a fixed ephemeral key and IV, with the shared key, derived key, HMAC key and AES key for debugging. |
+| `negative` | twenty vectors, each failing exactly one §4.3 step: tampered name, bitrate, `peer_url` and `peer_session_token`; another key's signature; a replay after success; a lower-seq challenge; relay B's MAC; a challenge for another identity; an altered nonce; a mismatched `metadata.identity_hash`; an unsigned metadata key; an upper-case public key; a browser asking for mode 6; a browser carrying `peer_url`; an unknown client; a wake gateway without peer fields; a poll gateway with `peer_url`; a relay at capacity; a low-order X25519 key. Revision 3 removed revision 2's `audience-mismatch` and `transit-identity-not-listed`, with the two challenges only they used. |
 | `tokens_negative` | a flipped ciphertext bit, and decryption by the wrong identity. Both MUST fail to decrypt. |
 | `url_canonical` | nineteen inputs to §10.1, with the canonical form and key or the reason for refusal. They include the look-alike `https://rétichat.com/…` (refused), its ASCII form `xn--rtichat-bya.com` (accepted, under a different key), case, port, `/v1/wake`, userinfo, query and fragment. |
-| `audience_client`, `audience_relay` | §3.2 on both sides: a client base URL to the audience it signs, and a received `Host` header plus scheme to the audience the relay compares |
 
-How the file was checked when it was committed (revision 2):
+Revision 3 removed revision 2's `audience_client` and `audience_relay`
+sections. No vector carries an audience, and the PHP checker fails if one
+does.
+
+What changed from format 2: every signed byte string and signature (the
+`audience` field is gone, so each signed string is 21 bytes shorter for relay
+A's 19-byte host), and the sections above. The identities, challenges, nonces,
+MACs, pinned encrypted tokens, token negatives and canonical URLs are
+byte-identical, because none of them depended on the audience.
+
+How the file was checked when it was committed (revision 3):
 
 - **RNS 1.5.2:** `.venv/bin/python Reticulum-post/tools/registration_vectors.py --check`.
   `Identity.validate` accepts every signature (the RNS Ed25519 key for `lowx`),
@@ -1577,30 +1804,32 @@ How the file was checked when it was committed (revision 2):
   pinned token, and the generator's own §4.3 reference verifier gives every
   positive `200` and every negative its expected status, error and step.
 - **PHP sodium/openssl:** `php Reticulum-post/tools/check_registration_vectors.php`
-  (298 checks). It re-derives keys, MACs, signed bytes, pinned tokens,
-  canonical URLs and audiences. It runs its own §4.3 verifier over all
-  twenty-six registration vectors, comparing the status, the error and the
-  failing step, and it decrypts every token. A mutated copy of the file
-  (a changed expected error, a positive's audience, a canonical URL, the
-  transit list, a seq added to a challenge response) fails it.
-- **Not yet re-run on revision 2:** the Retichat-js `lib/rns/identity.js`
+  (271 checks). It re-derives keys, MACs, signed bytes, pinned tokens and
+  canonical URLs. It runs its own §4.3 verifier over all twenty-four
+  registration vectors, comparing the status, the error and the failing step,
+  and it decrypts every token. It fails on revision 2's file, and on each of
+  these mutated copies: a changed expected error, an `audience` added back to
+  a positive's `registration`, `audience` added back to the field order, a
+  `transit_identities` list added to relay A, a canonical URL, a seq added to
+  a challenge response, and one hex digit of a gateway signature.
+- **Not re-run on revisions 2 or 3:** the Retichat-js `lib/rns/identity.js`
   (Node) and Reticulum-rust `identity.rs` cross-checks that revision 1
   recorded. The deterministic Ed25519 signature and the token derivation are
-  unchanged primitives, but the signed bytes changed (48-byte challenge,
-  `audience`), so each port re-checks them in its own suite (below).
+  unchanged primitives, and revision 3's signed bytes have revision 1's
+  twelve fields again, but with the 48-byte challenge, so each port re-checks
+  them in its own suite (below).
 
 Each implementation MUST pin these vectors in its own test suite:
 
 - **Reticulum-post:** feed every registration and negative vector through the
-  real `registerInterface()` / challenge code. Set the relay secret, host and
-  `transit_identities` from `relays.A`, and the row's `seq` and capacity from
-  `relay_state_before`. Pin `url_canonical` and `audience_relay` against the
-  real functions.
+  real `registerInterface()` / challenge code. Set the relay secret from
+  `relays.A`, and the row's `seq` and capacity from `relay_state_before`. Pin
+  `url_canonical` against the real function.
 - **Retichat-js:** check that `signRegistration()` reproduces
-  `signed_bytes_hex` and `signature_hex`, that the audience function
-  reproduces `audience_client`, and that decryption yields the plaintext.
-- **Rust and Python:** the same, through the gateway's own signing, audience
-  and decryption paths.
+  `signed_bytes_hex` and `signature_hex`, and that decryption yields the
+  plaintext.
+- **Rust and Python:** the same, through the gateway's own signing and
+  decryption paths.
 
 ---
 
@@ -1615,7 +1844,10 @@ Reticulum-post, against the real traits (SQLite in memory or `php -S`):
   - replay → 409;
   - a tampered field → 403;
   - relay B's challenge → 409;
-  - relay B's audience → 403;
+  - a `registration` object with an `audience` key (revision 2's body) →
+    `400 bad_registration`, and nothing is written;
+  - a gateway identity that no config names registers `reticulum-php` and
+    gets a transit row (open peering);
   - the challenge response contains no seq;
   - the response has no plaintext token and its encrypted token decrypts;
   - a low-order key → 400, and nothing is written;
@@ -1633,7 +1865,8 @@ Reticulum-post, against the real traits (SQLite in memory or `php -S`):
   - `identity_hash` from a non-`rns-js` client is ignored;
   - identity fields never appear in `metadata_json`;
   - a squatted row is retired, not adopted;
-  - a listed gateway retires the legacy bridge row by URL;
+  - a signed gateway retires the legacy bridge row with its URL, and only
+    `none` URL rows of transit-class clients;
   - each enforcement switch refuses its unsigned registrations and 401s its
     `none` rows;
   - the capacity rule reclaims legacy rows and then answers 503.
@@ -1643,11 +1876,20 @@ Reticulum-post, against the real traits (SQLite in memory or `php -S`):
   - a legacy row cannot bind a destination held through the gateway (the
     native-user case) or one whose blob is seen;
   - a dropped announce leaves `known_destinations` untouched;
-  - the A4 hop-0 replay through an endpoint row, and through a signed
-    `reticulum-php` row whose identity is not listed, does not move a path;
-  - a browser's own `lxmf.delivery` and rfed announces still bind;
-  - the seen-blob shortening still works on a `local` peer row and on a listed
-    gateway row.
+  - **the seen-blob rule on every row kind (§8.5):** the A4 replay of a seen
+    blob with its hop count lowered to 0 neither creates nor replaces a path
+    through an endpoint row, a signed gateway row, a `confirmed` peer row, a
+    `local` peer row or a legacy transit row, with the existing path usable,
+    expired, or through an inactive row (no `shorter_path_replaced`, no
+    `unusable_path_replaced` for a seen blob). Each case fails on bae739a;
+  - on each of those row kinds, an announce with a new blob still replaces a
+    path when the rules allow (`better_or_equal_hops_newer_announce`,
+    `expired_path_replaced`, `newer_announce_replaced`,
+    `unusable_path_replaced`);
+  - the direct-versus-gateway order: the gateway copy first, then the direct
+    copy of the same announce, keeps the gateway path; a later announce
+    through the direct peer first moves it (the cost §8.5 states);
+  - a browser's own `lxmf.delivery` and rfed announces still bind.
 - **`peer_url_canonical_test.php`:**
   - pins `url_canonical`;
   - a static check that no SQL in `php/src` compares `peer_url` (only
@@ -1656,18 +1898,32 @@ Reticulum-post, against the real traits (SQLite in memory or `php -S`):
 - **`peer_confirm_test.php`:**
   - re-bind attempts by `peer_url` and its `/v1/wake` variants without a valid
     nonce are refused;
-  - a URL that is not accept-listed → 403, and no outbound call happens;
+  - a peer registration from an https URL this relay does not configure is
+    accepted (`202`), confirmed at that URL's canonical form and nowhere else,
+    and promoted to a `confirmed` transit row (open peering);
+  - a registration that names a URL its sender does not serve gets the
+    confirm sent to that URL only, whose `403 unknown_nonce` deletes the
+    record and leaves no row;
   - the register handler makes no outbound call and leaves the live row
     unchanged until promotion;
   - the nonce is single use;
   - a nonce confirmed with another `confirmer_url` → 403;
   - promotion on first use;
-  - the backlog bound → 503;
+  - the pending bounds: a fifth record for one URL, and a 65th in all, → `503
+    peer_confirm_backlog`, with no runner spawned;
+  - a registration that would create a URL row while the table is full →
+    `503 registration_capacity`; one for an existing row is accepted;
   - with both relays configured for each other, only the pair's initiator
     connects, and two connects that overlap end in one consistent pair of
     credentials;
-  - recovery after an initiator DB reset, a receiver DB reset, and a one-sided
-    receiver reset (wake-back to the configured URL only);
+  - recovery after an initiator DB reset and a receiver DB reset, each with
+    the receiver configuring the initiator (wake-back to its `node_url` only);
+  - a wake from a confirmed peer this relay does not configure, after this
+    relay lost its row, gets no wake-back and no connect; a `401` on a pull
+    from such a peer logs `[PEER-401-UNCONFIGURED]` and connects nothing;
+  - the exchange with a confirmed, unconfigured peer goes only to its stored
+    canonical URL (as `wake_exchanges_only_with_stored_peer_url_test.php`
+    pins for d3a0eb5);
   - a signed row naming a peer's URL is invisible to the wake lookups.
 - **`peer_session_rotation_test.php`** stays green. It drives the connect and
   confirm runners and asserts the end state rather than `/v1/initialize`'s
@@ -1688,7 +1944,7 @@ Reticulum-post, against the real traits (SQLite in memory or `php -S`):
 Retichat-js:
 
 - `post_interface_signed.test.mjs`:
-  - challenge, then sign (with the audience), then decrypt;
+  - challenge, then sign (twelve fields, no relay address), then decrypt;
   - a 409 `stale_challenge` leads to one more challenge, and a second 409
     stops;
   - `session_superseded` stops with its message;
@@ -1701,20 +1957,36 @@ Reticulum-rust and Python:
 
 - vector tests;
 - a 401 re-registers without ever going offline in Transport;
-- a 5xx or terminal code takes the interface offline with the reason, and a
-  wake (not an outbound packet) starts registration again;
+- **the backoff schedule (§9.6).** The delay is a pure function of the count
+  of consecutive failures, and the worker's timer is driven by a test clock,
+  never by sleeping (§7 of the principles):
+  - consecutive failures give 2, 4, 8, 16, 32, 64, 128, 256, 300, 300 s;
+  - each kind of failure starts it: a network failure, a 5xx, a terminal
+    code, a second `409 stale_challenge`, a signed answer without
+    `session_token_encrypted`, and a failed challenge request; a challenge
+    `404` (legacy) and a first `409 stale_challenge` do not;
+  - while it lasts the interface is offline in Transport with the code as its
+    reason, and each failed attempt logs ERROR with the next delay;
+- **its resets:** a success puts the interface online and the next failure
+  waits 2 s again; a wake mid-wait registers at once and resets the delay; a
+  wake during an in-flight registration starts no second one; an outbound
+  packet starts nothing; in poll mode only a success resets it;
+- `409 session_superseded` on an exchange takes the interface offline with no
+  backoff: no timer fires, and a wake does not restart it;
+- a failed exchange is not retried and does not sleep (the 60 s exchange
+  back-off is gone);
 - a restart keeps the same `interface_id` (staging);
 - a fresh relay DB while the gateway runs heals through the 401
   (`staging.sh`'s fresh-DB guard, lines 308–318, comes out once this
   passes).
 
-Staging stage `stage_relay_takeover`: MUST fail on Reticulum-post 3281ad5 and
+Staging stage `stage_relay_takeover`: MUST fail on Reticulum-post bae739a and
 the current Retichat-js and gateway (the A1, A3 and A5 probes succeed), and
 pass on the fixed refs.
 
 ---
 
-## 16. Residual exposure, and decisions this revision needs
+## 16. Residual exposure, decisions, and questions for James
 
 ### 16.1 What stays open, and until when
 
@@ -1727,14 +1999,18 @@ pass on the fixed refs.
    destination before, the attacker gets the binding.
 2. **Legacy transit rows until `enforce_signed_transit`.** Anyone can still
    create a `none` `reticulum-php`, `rns-post-interface` or `reticulum-post`
-   row, which is a transit row (A4) and re-bindable by URL (A5). This is
-   today's exposure, unchanged until Phase 3c.
-3. **Peering setup can be flooded.** Junk registrations naming an
-   accept-listed URL fill its four pending slots (`503 peer_confirm_backlog`).
-   Junk `/v1/initialize` calls make a relay re-connect configured peers that
-   are not connected. Each costs one call to our own peer, and neither can
-   change a working peering. Closing this needs keys on PHP relays, which James
-   declined in favour of the nonce.
+   row, which is a transit row (it skips the identity guard, §8.2) and
+   re-bindable by URL (A5). This is today's exposure, unchanged until Phase
+   3c. A4 is no longer part of it: §8.5 holds on legacy rows from Phase 1.
+3. **Peering setup can be flooded.** With open peering, junk registrations
+   can name any `https` URL. They can hold every pending slot, four per URL
+   and 64 in all (`503 peer_confirm_backlog`), and each slot also holds one
+   detached confirm runner until the URL answers or curl's ceiling ends it.
+   A flood must keep sending to keep the slots full. While it does, new
+   peerings are refused; working ones are untouched, because nothing pending
+   changes a live row. Junk `/v1/initialize` calls make a relay re-connect
+   configured peers that are not connected. Closing this needs keys on PHP
+   relays, which James declined in favour of the nonce.
 4. **Existence oracle until `enforce_signed_registration`.** A legacy
    registration claiming `H` gets `403 identity_requires_signature` when `H`
    has a signed row here, and `200` otherwise. That tells anyone whether `H`
@@ -1747,7 +2023,7 @@ pass on the fixed refs.
    and shows "connected elsewhere" until it reloads.
 6. **The `/v1/wake` handler still exchanges inline** (`index.php:1804`), a
    synchronous outbound call in a request handler (§7 of the principles). It
-   only goes to a stored URL once §0.1 ships. Even so, an unauthenticated
+   goes only to a stored URL since d3a0eb5 (§0.1). Even so, an unauthenticated
    flood of wakes against both relays can hold every worker on each side
    waiting on the other until curl's 10 s ceiling. That is true today. The fix
    is to queue the wake and let the detached runner exchange, as wake dispatch
@@ -1756,32 +2032,92 @@ pass on the fixed refs.
    `rememberKnownDestination`, like RNS 1.5.2's `Identity.validate_announce`,
    stores the ratchet and `app_data` of any valid announce, replays included.
    §8.4 keeps foreign announces on endpoint rows from doing it, but a replay
-   through a transit row still can. Changing that would depart from the
-   reference, so it is left as it is.
-8. **A front end that rewrites `Host`** would stop signed registration on that
-   relay with `audience_mismatch`. The Phase 1 gate checks both hosts.
+   through a transit row still can, and with open peering anyone can hold a
+   transit row. Changing that would depart from the reference, so it is left
+   as it is.
+8. **A12, accepted (James, 2026-10-03).** A relay the user chose can forward
+   another relay's challenge and end up holding the identity's session there
+   (§3.2). It stays accepted while nobody can choose a relay other than
+   James's two: the web client's CSP, the gateways' configured node URL, and
+   PHP peers that never sign.
+9. **Open peering gives anyone a transit row.** A fresh key (a signed
+   gateway) or a relay at a URL one controls (a confirmed peer) is enough. A
+   transit row skips the identity guard (§8.2), so it can deliver a
+   destination's fresh announce here first and hold the path until that
+   destination's next announce reaches this relay first some other way. §8.5
+   stops it doing the same with a blob already seen, whatever hop count it
+   claims. This is the exposure of any open RNS transport interface: payloads
+   stay end-to-end encrypted, but delivery can be denied and link metadata
+   seen. James accepted open peering on 2026-10-03.
+10. **Wakes go to a gateway's unproven URL.** A signed `reticulum-php` row is
+    woken at its signed `peer_url` (`http` allowed), which nothing proves: the
+    relay never confirms a gateway's URL (§9.4). The wake is a fixed body,
+    `{"waker_url": "<own host_url>"}`, with no credentials, at most once per
+    `min_wake_interval_ms` per row, under `fireAndForgetWake`'s 2 s connect
+    ceiling. Revision 2 woke only listed identities. With open peering anyone
+    with a key can point this relay's wakes at any host and port, one stream
+    per row, with rows bounded by §12.4. Legacy `reticulum-php` rows already
+    allow this today, until `enforce_signed_transit`. A question in §16.2.
+11. **The table can fill with permanent rows.** Signed rows (a fresh key each)
+    and `confirmed` rows (a URL each; one server can answer for any number of
+    paths) are never reclaimed (§12.4, §12.5). Once the table is full, new
+    registrations get `503 registration_capacity`. Rows that exist keep
+    working. Revision 2 had this for signed rows; open peering adds confirmed
+    rows.
+12. **One-sided peerings.** Open peering lets a relay peer with ours without
+    ours configuring it. Two things then fall short, and neither applies
+    between James's two relays, which configure each other:
+    - a relay that configures ours, and whose URL sorts after ours, never
+      initiates (§10.3), so the peering does not form;
+    - when ours loses its DB, it does not wake that relay back (§10.9), and
+      that relay is never woken, so the peering stays down until its operator
+      rotates it (§10.10).
+13. **§8.5's cost.** The retichat↔selectiv direct-versus-gateway case that
+    `shorter_path_replaced` covered can come back: when the gateway copy of an
+    announce arrives first, the path stays on the gateway until a later
+    announce reaches this relay through the direct peer first.
 
-### 16.2 Decisions for James
+### 16.2 Decisions, and questions for James
 
-1. **§0.1 hotfix:** ship `exchangeWithPhpPeer` → stored URL now, ahead of
-   everything else?
-2. **Accept-lists:** `transit_identities` and `accepted_peer_urls`. This closes
-   open peering for v1, which the POST-Reticulum direction may want back later
-   as its own design. It also adds one config pin, the gateway's identity hash.
-   The gateway's *row* stays self-certifying, but anyone can make a key, so
-   transit treatment cannot be.
-3. **A second switch, `enforce_signed_transit`,** flipped after Phases 3 and 3b
-   rather than on the browser date.
-4. **The signed `audience`** (§3.2). Revision 1 dropped the first design's
-   config-based audience because of outage risk. This one comes from the
-   connection itself, not from config.
-5. **The wake-back** (§10.9), new protocol, now limited to configured relays.
-6. **Gateway after a 5xx** (§9.6): offline in Transport until the next wake or
-   a restart, instead of re-registering on every outbound packet.
-7. **`409 session_superseded`:** two holders of one identity no longer flap.
-   The older one stops and says "connected elsewhere".
-8. **`reticulum-post` (`[post_interface_peers]`)** has no path once
-   `enforce_signed_transit` is on. Does any relay configure it?
+James answered revision 2's questions on 2026-10-03:
+
+| Revision 2 asked | James decided | Revision 3 |
+|---|---|---|
+| 1. Ship the §0.1 hotfix first? | Shipped as d3a0eb5; bae739a gates the next peering rotation on it | §0.1 |
+| 2. Accept-lists (`transit_identities`, `accepted_peer_urls`), closing open peering for v1 | "Keep peering open" | No lists. Transit by proof (§8.1, §10.2); A4 closed on every row (§8.5) |
+| 3. A second switch, `enforce_signed_transit` | Yes: browsers on a date James sets, gateways and peers after their rollout | §11.1 |
+| 4. The signed `audience` | "Don't we have ssl to prevent spoofing?" Dropped | §3.2; A12 accepted (§0, §16.1.8) |
+| 5. The wake-back | Yes, only between configured relays | §10.9 |
+| 6. The gateway after a 5xx | Exponential backoff, 2 s doubling to 5 min, reset on success or a wake: his decided exception to §3 of the principles | §9.6 |
+| 7. `409 session_superseded` | Yes: the newest registration wins, the older session is told "connected elsewhere" | §6.1 |
+| 8. `reticulum-post` (`[post_interface_peers]`) has no path once `enforce_signed_transit` is on. Does any relay configure it? | Not yet answered | Still open (question 1 below) |
+
+Open questions:
+
+1. **`reticulum-post`**, as above. If a relay configures it, that link must
+   move to `[interfaces]` peering before Phase 3c.
+2. **One-sided peerings (§10.3, §16.1.12).** Should a third-party relay whose
+   URL sorts after ours be able to start a peering? A fix that needs no
+   config: every relay initiates toward every peer it configures, and the
+   receiver settles a pair that configures both ways. A relay that receives a
+   peer registration from a URL in its own `[interfaces]`, while its own
+   `host_url` sorts first, answers a new `409 peer_initiator_conflict` and
+   connects itself; the refused relay deletes its nonce record and changes
+   nothing else. Between relays that configure each other it would also make
+   the wake-back unnecessary, because a relay with no row would simply
+   connect. It does not close the one-sided receiver-reset gap, where the
+   relay that lost its row does not configure the other. It is new protocol,
+   and it would supersede the wake-back James just kept, so it is not in this
+   revision.
+3. **Wakes to a gateway's unproven URL (§16.1.10).** Accept it as above, or
+   prove the URL first: the gateway's wake server would answer a confirm
+   like a PHP peer's, which changes the gateway protocol.
+4. **§8.5's cost (§16.1.13).** If the direct-versus-gateway case shows up
+   after Phase 1, RNS 1.5.2's own remedy is interface `gravity`: an
+   operator-set preference that lets a copy of an announce already heard move
+   the path to a row of higher gravity, never on hop count. For the relay that
+   would be a per-row preference (configured peers above gateways, for
+   example). Add it then, or not?
 
 ---
 
@@ -1791,19 +2127,23 @@ Every finding was checked against the code at 3281ad5. All of them were
 confirmed in substance and adopted, apart from the parts listed as not
 adopted below.
 
+This is revision 2's record, kept as it was written: its section and step
+numbers are revision 2's. Rows marked *(rev 3)* were changed by James's
+decisions of 2026-10-03, and §18 says how.
+
 | Finding | Disposition |
 |---|---|
 | Critical: collation look-alike (live wake path; revision 1's confirm to the body URL; Ltok never rotated) | Confirmed in code. The collation was checked with ICU, not MySQL. §0.1 hotfix proposed; §10.1 ASCII canonical URLs and SHA-256 keys; §12.2 no free-text lookups; §10.2 calls only to configured URLs; the initiator's token rotates at every confirmed connect (§10.6). URL vectors added. |
-| High: transit by label | Confirmed (`isPhpPeerInterface`, `client` gates, `shorter_path_replaced`). §4.3.1 per-client policy (new codes and 5 negative vectors); §8.1 transit rows proven by `local`, accept-listed `confirmed` or listed `signed`; §0 A4 corrected. |
-| High: confirm tarpit, wake-back, nested deadlock; "`/v1/wake` already nests" was false (`fireAndForgetWake` does not wait) | Confirmed. Confirms and wake-backs go only to configured URLs; the receiver answers `202` and confirms from the detached runner; promotion on first use removes the ordering window; one initiator per pair (§10.3) stops two hand-offs from interleaving; the false claim is gone (§10.10). |
+| High: transit by label | Confirmed (`isPhpPeerInterface`, `client` gates, `shorter_path_replaced`). §4.3.1 per-client policy (new codes and 5 negative vectors); §8.1 transit rows proven by `local`, accept-listed `confirmed` or listed `signed`; §0 A4 corrected. *(rev 3: no lists, peering is open; transit by proof alone, and A4 closed on every row instead.)* |
+| High: confirm tarpit, wake-back, nested deadlock; "`/v1/wake` already nests" was false (`fireAndForgetWake` does not wait) | Confirmed. Confirms and wake-backs go only to configured URLs; the receiver answers `202` and confirms from the detached runner; promotion on first use removes the ordering window; one initiator per pair (§10.3) stops two hand-offs from interleaving; the false claim is gone (§10.10). *(rev 3: the confirm goes to the canonical URL the registration names, still from the detached runner; wake-backs still only to configured relays.)* |
 | Medium: A3/A6 open for identities with no signed row (natives) | Confirmed. §8.3 (seen and held) narrows it from Phase 1; the remaining race is stated in §16.1. |
 | Medium: seq activity oracle | Confirmed. The challenge is 48 bytes and opaque, and steps 5 and 6 of revision 1 merged into step 6; no seq in any response. Vectors regenerated. The legacy 403-vs-200 existence oracle is kept (§16.1.4). |
 | Medium: nonce not bound to the relay | Confirmed. `confirmer_url` is part of the consuming `DELETE` (§10.6). |
 | Medium: 401 cannot tell lost from superseded | Confirmed. `previous_session_token_hash`, `409 session_superseded`, peer compare-and-swap (§6.1). |
-| Medium: retries presented as events | Confirmed. Refused state with named events (§10.8); atomic throttle; nonce deletion by key and nonce; gateway offline in Transport (§9.6); the 900 s and 3600 s clocks removed from connect decisions. The wake-back's 2 s connect ceiling is kept and named (§10.9). |
+| Medium: retries presented as events | Confirmed. Refused state with named events (§10.8); atomic throttle; nonce deletion by key and nonce; gateway offline in Transport (§9.6); the 900 s and 3600 s clocks removed from connect decisions. The wake-back's 2 s connect ceiling is kept and named (§10.9). *(rev 3: the gateway registers again on a 2 s to 5 min backoff, James's decided exception to §3 of the principles.)* |
 | Medium: unbounded rows | Confirmed; pre-existing for legacy rows. §12.4 capacity with legacy reclaim; signed rows are never reclaimed. |
 | Low: seq restart | Confirmed. §12.5 invariant, `monitor.php` rules, README warning. |
-| Low: relay as challenge oracle | Confirmed. §3.2 audience from the connection's `Host`; §2.3 corrected. |
+| Low: relay as challenge oracle | Confirmed. §3.2 audience from the connection's `Host`; §2.3 corrected. *(rev 3: audience dropped; A12 is an accepted risk.)* |
 | Low: low-order X25519 | Confirmed (sodium throws; RNS raises). Token before bind, `400`, negative vector. |
 | Low: guard after `rememberKnownDestination` | Confirmed (`request_control_plane_trait.php:19-28`). §8.4 moves the guard. |
 | Low: rollout gaps | Confirmed. Phase 3 retires the legacy bridge row automatically (§4.5); Phase 3b/3c/4 gates read `/health`; `reticulum-post` listed in §1; backfill limited to `rns-js` and filled lazily (§12.3). |
@@ -1817,3 +2157,34 @@ adopted below.
   peering (§10.8).
 - Changing the collation or adding backend-specific DDL. Hex keys make that
   unnecessary (§12.2).
+
+---
+
+## 18. Revision 3: James's decisions of 2026-10-03
+
+| Decision | What changed |
+|---|---|
+| **No audience / Host binding.** James: "Don't we have ssl to prevent spoofing?" | `audience` removed from the signed bytes (§3: twelve fields), the worked example (§3.1), the request (§4.1: four `registration` keys) and verification (§4.3: old step 5 gone). §3.2 now says why there is none, and what TLS does and does not do. `403 audience_mismatch` removed (§6). A12 marked accepted (§0, §16.1.8). The gateway signs no relay address (§9 step 2). The Phase 1 `Host` gate is gone (§11.2). Vectors: no `host`, no `audience-mismatch`, no audience sections (§14). |
+| **Exponential backoff for the gateway's registration**, his decided exception to §3 of the principles | §9 step 6 rewritten: 2 s doubling to 5 min, reset on a success or a wake, one in flight, surfaced as ERROR and offline in Transport. `409 session_superseded` stays terminal, because it answers an exchange and re-registering would evict the newer process. The 60 s exchange back-off stays removed. §6's "stop, show" for the gateway, §13 (gateway logging) and §15 (schedule and reset tests) follow. |
+| **Keep peering open** | `accepted_peer_urls`, `transit_identities`, `403 peer_not_accepted` and `403 transit_identity_not_allowed` removed (§4.3 old step 8, §6, §9 step 3, §10.2, §10.4, §11.1, §11.2). Transit by proof alone (§1, §8.1). A4 closed on every row: a seen random blob never creates or replaces a path (§8.5, citing RNS 1.5.2 and 1.1.3). The URL retire in §4.5 is allowed to any signed gateway. The confirm goes to the canonical URL the registration names (§10.5). |
+| **Wake-back only between configured relays** | §10.2, §10.8 and §10.9 say a confirmed peer this relay does not configure gets no wake-back and no reconnect. §10.10 gains the one-sided receiver-reset row. Credentials go only to a row's stored canonical URL (§10.2), as d3a0eb5 does live (§0.1). |
+| **Newest registration wins** | Already in revision 2 (§6.1). Checked: the gateway's `409 session_superseded` stays terminal (§9.6), and nothing in revision 3 makes a superseded holder register again. |
+| **Two enforcement switches** | Already in revision 2. §11.1's config block loses the two lists; the transit switch ends unproven transit, not open peering. |
+
+Revision 3 also had to change these, because the decisions above required
+them. James did not decide them, and §16.2 or this list is where to object:
+
+- **Pending bounds (§10.4 step 3).** With any URL able to register, the
+  pending records are bounded in all (64), not only per URL (four), since
+  each one holds a detached confirm runner.
+- **Capacity for peer rows (§10.4 step 4, §12.4).** The accept-list used to
+  bound promotions. Now a peer registration that would create a row is
+  checked against `max_interface_rows` first.
+- **`peer_registration_pending.peer_url` (§12.1).** The confirm can no longer
+  take its URL from the config.
+- **The initiator rule (§10.3)** is stated so that a relay needs to know only
+  its own config. Revision 2's "the only configuring relay initiates" needed
+  knowledge a relay does not have. The gap this leaves for one-sided
+  peerings is question 2 in §16.2.
+- **The gateway's exchange** is not covered by the backoff: only its
+  registration is (§9.6).

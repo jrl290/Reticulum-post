@@ -1,6 +1,6 @@
 {
   "spec": "Reticulum-post/REGISTRATION.md",
-  "format_version": 2,
+  "format_version": 3,
   "generator": "Reticulum-post/tools/registration_vectors.py (RNS 1.5.2)",
   "note": "Every byte below is derived from fixed labels; regenerate with the generator, never by hand. Hex is lower-case throughout.",
   "constants": {
@@ -13,7 +13,6 @@
     "signed_field_order": [
       "domain",
       "challenge",
-      "audience",
       "public_key",
       "name",
       "bitrate",
@@ -44,17 +43,11 @@
   "relays": {
     "A": {
       "relay_secret_hex": "13cbff96ba649cb659c3701c60186ee0d7a8a3b435f0bbdd97f714d905c59169",
-      "host": "relay-a.example.org",
-      "transit_identities": [
-        "03f43750ef2ba1ad2d3c67c5f358349b"
-      ],
-      "description": "the relay every vector is presented to; it lists the gateway identity in [registration] transit_identities"
+      "description": "the relay every vector is presented to"
     },
     "B": {
       "relay_secret_hex": "daa4afbf9885e60926c506969073478ffbff46ccf094ddc79a21ad9704571ad5",
-      "host": "relay-b.example.org",
-      "transit_identities": [],
-      "description": "another relay; its challenges and its audience must be refused at A"
+      "description": "another relay; its challenges must be refused at A"
     }
   },
   "identities": {
@@ -217,23 +210,6 @@
       }
     },
     {
-      "id": "A/browser/seq0/audience-b",
-      "minted_by_relay": "A",
-      "for_identity": "browser",
-      "identity_hash_hex": "20bc2200ebcd73a552b6e6a7ff2a0ba8",
-      "registration_seq_bound": 0,
-      "nonce_hex": "695f6c3edfafc30f8384e4d69e672e0d",
-      "mac_input_hex": "7265746963756c756d2d706f73742f6368616c6c656e67652f763120bc2200ebcd73a552b6e6a7ff2a0ba80000000000000000695f6c3edfafc30f8384e4d69e672e0d",
-      "mac_hex": "24873580e4a6e2cd98f9915e90cd5403fa5deb0059a28042eb5994861842d184",
-      "challenge_hex": "695f6c3edfafc30f8384e4d69e672e0d24873580e4a6e2cd98f9915e90cd5403fa5deb0059a28042eb5994861842d184",
-      "challenge_response": {
-        "status": "challenge",
-        "version": 1,
-        "identity_hash": "20bc2200ebcd73a552b6e6a7ff2a0ba8",
-        "challenge": "695f6c3edfafc30f8384e4d69e672e0d24873580e4a6e2cd98f9915e90cd5403fa5deb0059a28042eb5994861842d184"
-      }
-    },
-    {
       "id": "A/browser/seq0/mode6",
       "minted_by_relay": "A",
       "for_identity": "browser",
@@ -319,23 +295,6 @@
       }
     },
     {
-      "id": "A/other/seq0/transit",
-      "minted_by_relay": "A",
-      "for_identity": "other",
-      "identity_hash_hex": "3720edf2045f09b4343f3a5f2f473877",
-      "registration_seq_bound": 0,
-      "nonce_hex": "305df31370e4301128a1485750e8ddef",
-      "mac_input_hex": "7265746963756c756d2d706f73742f6368616c6c656e67652f76313720edf2045f09b4343f3a5f2f4738770000000000000000305df31370e4301128a1485750e8ddef",
-      "mac_hex": "980efb9bbf9538ed3715b5f53172c9e2e6dc61726aac80536125f0b71d9184e7",
-      "challenge_hex": "305df31370e4301128a1485750e8ddef980efb9bbf9538ed3715b5f53172c9e2e6dc61726aac80536125f0b71d9184e7",
-      "challenge_response": {
-        "status": "challenge",
-        "version": 1,
-        "identity_hash": "3720edf2045f09b4343f3a5f2f473877",
-        "challenge": "305df31370e4301128a1485750e8ddef980efb9bbf9538ed3715b5f53172c9e2e6dc61726aac80536125f0b71d9184e7"
-      }
-    },
-    {
       "id": "A/other/seq0/capacity",
       "minted_by_relay": "A",
       "for_identity": "other",
@@ -396,10 +355,9 @@
         },
         "registration": {
           "version": 1,
-          "audience": "relay-a.example.org",
           "public_key": "bcf19510832328dbd8c358702009d38a9c3eeb0cc97448f70a34eb112f2cf25230a68d3a14f47435bafff78e0095fab4c5376195ce0b473b62c7b31a4b321596",
           "challenge": "5ab138262aa3ff7e40d3e0d18156b5b96bc78010ea1616eb57342eb81a75ee1610f5ba999763b15904037774de39808a",
-          "signature": "1aba8e1a843c00a8dea30f176f6671953bd4be3efde55d57aab542958a91f5379e13bd955e7f72e1e1c679e9efe6ed424889a4e136b44e22abcafe419f12610c"
+          "signature": "b1a0d662c1dbbb2c815bddf402f145e51a499085266f24daf539a671b31f6e1215e4ced2e52956751e5c0c602b8b66063ac7357fbd1313f2de6c61622a79b804"
         }
       },
       "signed_fields": [
@@ -412,11 +370,6 @@
           "name": "challenge",
           "value_hex": "5ab138262aa3ff7e40d3e0d18156b5b96bc78010ea1616eb57342eb81a75ee1610f5ba999763b15904037774de39808a",
           "lp_hex": "00305ab138262aa3ff7e40d3e0d18156b5b96bc78010ea1616eb57342eb81a75ee1610f5ba999763b15904037774de39808a"
-        },
-        {
-          "name": "audience",
-          "value_hex": "72656c61792d612e6578616d706c652e6f7267",
-          "lp_hex": "001372656c61792d612e6578616d706c652e6f7267"
         },
         {
           "name": "public_key",
@@ -469,8 +422,8 @@
           "lp_hex": "0000"
         }
       ],
-      "signed_bytes_hex": "001a7265746963756c756d2d706f73742f72656769737465722f763100305ab138262aa3ff7e40d3e0d18156b5b96bc78010ea1616eb57342eb81a75ee1610f5ba999763b15904037774de39808a001372656c61792d612e6578616d706c652e6f72670040bcf19510832328dbd8c358702009d38a9c3eeb0cc97448f70a34eb112f2cf25230a68d3a14f47435bafff78e0095fab4c5376195ce0b473b62c7b31a4b321596000c526574696368617420576562000800000000000f42400004000001f40006726e732d6a730001010000000000000000",
-      "signature_hex": "1aba8e1a843c00a8dea30f176f6671953bd4be3efde55d57aab542958a91f5379e13bd955e7f72e1e1c679e9efe6ed424889a4e136b44e22abcafe419f12610c",
+      "signed_bytes_hex": "001a7265746963756c756d2d706f73742f72656769737465722f763100305ab138262aa3ff7e40d3e0d18156b5b96bc78010ea1616eb57342eb81a75ee1610f5ba999763b15904037774de39808a0040bcf19510832328dbd8c358702009d38a9c3eeb0cc97448f70a34eb112f2cf25230a68d3a14f47435bafff78e0095fab4c5376195ce0b473b62c7b31a4b321596000c526574696368617420576562000800000000000f42400004000001f40006726e732d6a730001010000000000000000",
+      "signature_hex": "b1a0d662c1dbbb2c815bddf402f145e51a499085266f24daf539a671b31f6e1215e4ced2e52956751e5c0c602b8b66063ac7357fbd1313f2de6c61622a79b804",
       "expected": {
         "status": 200,
         "identity_hash": "20bc2200ebcd73a552b6e6a7ff2a0ba8",
@@ -526,10 +479,9 @@
         },
         "registration": {
           "version": 1,
-          "audience": "relay-a.example.org",
           "public_key": "bcf19510832328dbd8c358702009d38a9c3eeb0cc97448f70a34eb112f2cf25230a68d3a14f47435bafff78e0095fab4c5376195ce0b473b62c7b31a4b321596",
           "challenge": "3af6b90ea45d255af6865d210b9c3c5ac7335c83361d7d17b5e0480f16d717fdae14e10650a03e4c98798a1d214226a9",
-          "signature": "98512762b8095e8abbfa3767bd91c7a647a84b3b51b7fcf434410ca6d43ac017d8f96f6ff361f87c65e2e057cb936345530bcdec401975e7816f8ca13f7bec07"
+          "signature": "581fe497a9b11812a61a2972d96c2ed7d86a7bb402225cbb23b288d9170b158e6feaedc6470a84617e85530ef9b962b45d0a1b0b8e264a3740f95ab3cbfa0f07"
         }
       },
       "signed_fields": [
@@ -542,11 +494,6 @@
           "name": "challenge",
           "value_hex": "3af6b90ea45d255af6865d210b9c3c5ac7335c83361d7d17b5e0480f16d717fdae14e10650a03e4c98798a1d214226a9",
           "lp_hex": "00303af6b90ea45d255af6865d210b9c3c5ac7335c83361d7d17b5e0480f16d717fdae14e10650a03e4c98798a1d214226a9"
-        },
-        {
-          "name": "audience",
-          "value_hex": "72656c61792d612e6578616d706c652e6f7267",
-          "lp_hex": "001372656c61792d612e6578616d706c652e6f7267"
         },
         {
           "name": "public_key",
@@ -599,8 +546,8 @@
           "lp_hex": "0000"
         }
       ],
-      "signed_bytes_hex": "001a7265746963756c756d2d706f73742f72656769737465722f763100303af6b90ea45d255af6865d210b9c3c5ac7335c83361d7d17b5e0480f16d717fdae14e10650a03e4c98798a1d214226a9001372656c61792d612e6578616d706c652e6f72670040bcf19510832328dbd8c358702009d38a9c3eeb0cc97448f70a34eb112f2cf25230a68d3a14f47435bafff78e0095fab4c5376195ce0b473b62c7b31a4b321596001552657469636861742057656220e28094205a6fc3ab000800000000000f42400004000001f40006726e732d6a730001010000000000000000",
-      "signature_hex": "98512762b8095e8abbfa3767bd91c7a647a84b3b51b7fcf434410ca6d43ac017d8f96f6ff361f87c65e2e057cb936345530bcdec401975e7816f8ca13f7bec07",
+      "signed_bytes_hex": "001a7265746963756c756d2d706f73742f72656769737465722f763100303af6b90ea45d255af6865d210b9c3c5ac7335c83361d7d17b5e0480f16d717fdae14e10650a03e4c98798a1d214226a90040bcf19510832328dbd8c358702009d38a9c3eeb0cc97448f70a34eb112f2cf25230a68d3a14f47435bafff78e0095fab4c5376195ce0b473b62c7b31a4b321596001552657469636861742057656220e28094205a6fc3ab000800000000000f42400004000001f40006726e732d6a730001010000000000000000",
+      "signature_hex": "581fe497a9b11812a61a2972d96c2ed7d86a7bb402225cbb23b288d9170b158e6feaedc6470a84617e85530ef9b962b45d0a1b0b8e264a3740f95ab3cbfa0f07",
       "expected": {
         "status": 200,
         "identity_hash": "20bc2200ebcd73a552b6e6a7ff2a0ba8",
@@ -633,7 +580,7 @@
     },
     {
       "id": "gateway-wake",
-      "description": "Reticulum-rust gateway (or Python PostInterface) in wake mode, signing with its persistent transport identity, which relay A lists in transit_identities: client reticulum-php, mode 6, with peer_url / peer_interface_id / peer_session_token covered by the signature. Its row is at seq 5.",
+      "description": "Reticulum-rust gateway (or Python PostInterface) in wake mode, signing with its persistent transport identity (no relay lists it: peering is open): client reticulum-php, mode 6, with peer_url / peer_interface_id / peer_session_token covered by the signature. Its row is at seq 5.",
       "relay": "A",
       "identity": "gateway",
       "relay_state_before": {
@@ -659,10 +606,9 @@
         },
         "registration": {
           "version": 1,
-          "audience": "relay-a.example.org",
           "public_key": "e99dd31ae1903bdb7d23f06bdc634cd8d638963f084d45e0e152d2c86c35dc3b511b1df9eba5bdce0c386ecbc8af32598d878000bf56e9fc8c1c8d299e988d1f",
           "challenge": "fee31215af1b72d45defe75e11bfbe31466e8814e5362a53a0eac93cb7d73b218b199682ebdeb9c4d05340f00d08d06a",
-          "signature": "32d3439b2e665b2f95f999d94efaf17b9d87e021762bbeb98e071e88367a757ca2fa88c9a22701c8767039271bed0edc99049e62af109a392386ae6350f9680a"
+          "signature": "8b8811c932a3f8eb4f9378f7f366960973226e283dbe4b60b7623f0dd380a3fd8052b116790b59199a8dc845d60b1976d73aead20e09bf245cdfbf5d1ec2af0a"
         }
       },
       "signed_fields": [
@@ -675,11 +621,6 @@
           "name": "challenge",
           "value_hex": "fee31215af1b72d45defe75e11bfbe31466e8814e5362a53a0eac93cb7d73b218b199682ebdeb9c4d05340f00d08d06a",
           "lp_hex": "0030fee31215af1b72d45defe75e11bfbe31466e8814e5362a53a0eac93cb7d73b218b199682ebdeb9c4d05340f00d08d06a"
-        },
-        {
-          "name": "audience",
-          "value_hex": "72656c61792d612e6578616d706c652e6f7267",
-          "lp_hex": "001372656c61792d612e6578616d706c652e6f7267"
         },
         {
           "name": "public_key",
@@ -732,8 +673,8 @@
           "lp_hex": "004039626239333361313933336531646166643832376531366230623133393337303039373830613961663563353037663639643437663238616564376137646430"
         }
       ],
-      "signed_bytes_hex": "001a7265746963756c756d2d706f73742f72656769737465722f76310030fee31215af1b72d45defe75e11bfbe31466e8814e5362a53a0eac93cb7d73b218b199682ebdeb9c4d05340f00d08d06a001372656c61792d612e6578616d706c652e6f72670040e99dd31ae1903bdb7d23f06bdc634cd8d638963f084d45e0e152d2c86c35dc3b511b1df9eba5bdce0c386ecbc8af32598d878000bf56e9fc8c1c8d299e988d1f0023524e5320506f7374496e74657266616365202852657469636861742042726964676529000800000000009896800004000001f4000d7265746963756c756d2d7068700001060000001f687474703a2f2f676174657761792e6578616d706c652e6e65743a3433373100203732313463616634333362653463646232343964636231376166366233626236004039626239333361313933336531646166643832376531366230623133393337303039373830613961663563353037663639643437663238616564376137646430",
-      "signature_hex": "32d3439b2e665b2f95f999d94efaf17b9d87e021762bbeb98e071e88367a757ca2fa88c9a22701c8767039271bed0edc99049e62af109a392386ae6350f9680a",
+      "signed_bytes_hex": "001a7265746963756c756d2d706f73742f72656769737465722f76310030fee31215af1b72d45defe75e11bfbe31466e8814e5362a53a0eac93cb7d73b218b199682ebdeb9c4d05340f00d08d06a0040e99dd31ae1903bdb7d23f06bdc634cd8d638963f084d45e0e152d2c86c35dc3b511b1df9eba5bdce0c386ecbc8af32598d878000bf56e9fc8c1c8d299e988d1f0023524e5320506f7374496e74657266616365202852657469636861742042726964676529000800000000009896800004000001f4000d7265746963756c756d2d7068700001060000001f687474703a2f2f676174657761792e6578616d706c652e6e65743a3433373100203732313463616634333362653463646232343964636231376166366233626236004039626239333361313933336531646166643832376531366230623133393337303039373830613961663563353037663639643437663238616564376137646430",
+      "signature_hex": "8b8811c932a3f8eb4f9378f7f366960973226e283dbe4b60b7623f0dd380a3fd8052b116790b59199a8dc845d60b1976d73aead20e09bf245cdfbf5d1ec2af0a",
       "expected": {
         "status": 200,
         "identity_hash": "03f43750ef2ba1ad2d3c67c5f358349b",
@@ -790,10 +731,9 @@
         },
         "registration": {
           "version": 1,
-          "audience": "relay-a.example.org",
           "public_key": "e99dd31ae1903bdb7d23f06bdc634cd8d638963f084d45e0e152d2c86c35dc3b511b1df9eba5bdce0c386ecbc8af32598d878000bf56e9fc8c1c8d299e988d1f",
           "challenge": "20e518b5a9c617d668c944973bee6ff1abbd7317a9f507118ff7496e5cf404aa425cd1cc725fef9705d9508f32bb638a",
-          "signature": "0c4ea57f3fd5f9ca3845387b6cd856f2dc1ced69831d4128bba06a1a65a6b2a3adc46e06fd86332306cf4c3d847eb2fb2c6bb4276089052471dc9130ba6d8409"
+          "signature": "4f8ceb1ae21c87731d91248486789a43f0d256e3959d1bd655bfb504233998877446689bc1162e919ea58d2ed1d780b8e74031de92c71142df6bef5b3e9d760c"
         }
       },
       "signed_fields": [
@@ -806,11 +746,6 @@
           "name": "challenge",
           "value_hex": "20e518b5a9c617d668c944973bee6ff1abbd7317a9f507118ff7496e5cf404aa425cd1cc725fef9705d9508f32bb638a",
           "lp_hex": "003020e518b5a9c617d668c944973bee6ff1abbd7317a9f507118ff7496e5cf404aa425cd1cc725fef9705d9508f32bb638a"
-        },
-        {
-          "name": "audience",
-          "value_hex": "72656c61792d612e6578616d706c652e6f7267",
-          "lp_hex": "001372656c61792d612e6578616d706c652e6f7267"
         },
         {
           "name": "public_key",
@@ -863,8 +798,8 @@
           "lp_hex": "0000"
         }
       ],
-      "signed_bytes_hex": "001a7265746963756c756d2d706f73742f72656769737465722f7631003020e518b5a9c617d668c944973bee6ff1abbd7317a9f507118ff7496e5cf404aa425cd1cc725fef9705d9508f32bb638a001372656c61792d612e6578616d706c652e6f72670040e99dd31ae1903bdb7d23f06bdc634cd8d638963f084d45e0e152d2c86c35dc3b511b1df9eba5bdce0c386ecbc8af32598d878000bf56e9fc8c1c8d299e988d1f0023524e5320506f7374496e74657266616365202852657469636861742042726964676529000800000000009896800004000001f40012726e732d706f73742d696e7465726661636500010600147463702d6261636b626f6e652d67617465776179000000000000",
-      "signature_hex": "0c4ea57f3fd5f9ca3845387b6cd856f2dc1ced69831d4128bba06a1a65a6b2a3adc46e06fd86332306cf4c3d847eb2fb2c6bb4276089052471dc9130ba6d8409",
+      "signed_bytes_hex": "001a7265746963756c756d2d706f73742f72656769737465722f7631003020e518b5a9c617d668c944973bee6ff1abbd7317a9f507118ff7496e5cf404aa425cd1cc725fef9705d9508f32bb638a0040e99dd31ae1903bdb7d23f06bdc634cd8d638963f084d45e0e152d2c86c35dc3b511b1df9eba5bdce0c386ecbc8af32598d878000bf56e9fc8c1c8d299e988d1f0023524e5320506f7374496e74657266616365202852657469636861742042726964676529000800000000009896800004000001f40012726e732d706f73742d696e7465726661636500010600147463702d6261636b626f6e652d67617465776179000000000000",
+      "signature_hex": "4f8ceb1ae21c87731d91248486789a43f0d256e3959d1bd655bfb504233998877446689bc1162e919ea58d2ed1d780b8e74031de92c71142df6bef5b3e9d760c",
       "expected": {
         "status": 200,
         "identity_hash": "03f43750ef2ba1ad2d3c67c5f358349b",
@@ -917,10 +852,9 @@
         },
         "registration": {
           "version": 1,
-          "audience": "relay-a.example.org",
           "public_key": "bcf19510832328dbd8c358702009d38a9c3eeb0cc97448f70a34eb112f2cf25230a68d3a14f47435bafff78e0095fab4c5376195ce0b473b62c7b31a4b321596",
           "challenge": "5ab138262aa3ff7e40d3e0d18156b5b96bc78010ea1616eb57342eb81a75ee1610f5ba999763b15904037774de39808a",
-          "signature": "1aba8e1a843c00a8dea30f176f6671953bd4be3efde55d57aab542958a91f5379e13bd955e7f72e1e1c679e9efe6ed424889a4e136b44e22abcafe419f12610c"
+          "signature": "b1a0d662c1dbbb2c815bddf402f145e51a499085266f24daf539a671b31f6e1215e4ced2e52956751e5c0c602b8b66063ac7357fbd1313f2de6c61622a79b804"
         }
       },
       "fails_check": "signature",
@@ -949,10 +883,9 @@
         },
         "registration": {
           "version": 1,
-          "audience": "relay-a.example.org",
           "public_key": "bcf19510832328dbd8c358702009d38a9c3eeb0cc97448f70a34eb112f2cf25230a68d3a14f47435bafff78e0095fab4c5376195ce0b473b62c7b31a4b321596",
           "challenge": "5ab138262aa3ff7e40d3e0d18156b5b96bc78010ea1616eb57342eb81a75ee1610f5ba999763b15904037774de39808a",
-          "signature": "1aba8e1a843c00a8dea30f176f6671953bd4be3efde55d57aab542958a91f5379e13bd955e7f72e1e1c679e9efe6ed424889a4e136b44e22abcafe419f12610c"
+          "signature": "b1a0d662c1dbbb2c815bddf402f145e51a499085266f24daf539a671b31f6e1215e4ced2e52956751e5c0c602b8b66063ac7357fbd1313f2de6c61622a79b804"
         }
       },
       "fails_check": "signature",
@@ -984,10 +917,9 @@
         },
         "registration": {
           "version": 1,
-          "audience": "relay-a.example.org",
           "public_key": "e99dd31ae1903bdb7d23f06bdc634cd8d638963f084d45e0e152d2c86c35dc3b511b1df9eba5bdce0c386ecbc8af32598d878000bf56e9fc8c1c8d299e988d1f",
           "challenge": "fee31215af1b72d45defe75e11bfbe31466e8814e5362a53a0eac93cb7d73b218b199682ebdeb9c4d05340f00d08d06a",
-          "signature": "32d3439b2e665b2f95f999d94efaf17b9d87e021762bbeb98e071e88367a757ca2fa88c9a22701c8767039271bed0edc99049e62af109a392386ae6350f9680a"
+          "signature": "8b8811c932a3f8eb4f9378f7f366960973226e283dbe4b60b7623f0dd380a3fd8052b116790b59199a8dc845d60b1976d73aead20e09bf245cdfbf5d1ec2af0a"
         }
       },
       "fails_check": "signature",
@@ -1019,10 +951,9 @@
         },
         "registration": {
           "version": 1,
-          "audience": "relay-a.example.org",
           "public_key": "e99dd31ae1903bdb7d23f06bdc634cd8d638963f084d45e0e152d2c86c35dc3b511b1df9eba5bdce0c386ecbc8af32598d878000bf56e9fc8c1c8d299e988d1f",
           "challenge": "fee31215af1b72d45defe75e11bfbe31466e8814e5362a53a0eac93cb7d73b218b199682ebdeb9c4d05340f00d08d06a",
-          "signature": "32d3439b2e665b2f95f999d94efaf17b9d87e021762bbeb98e071e88367a757ca2fa88c9a22701c8767039271bed0edc99049e62af109a392386ae6350f9680a"
+          "signature": "8b8811c932a3f8eb4f9378f7f366960973226e283dbe4b60b7623f0dd380a3fd8052b116790b59199a8dc845d60b1976d73aead20e09bf245cdfbf5d1ec2af0a"
         }
       },
       "fails_check": "signature",
@@ -1051,10 +982,9 @@
         },
         "registration": {
           "version": 1,
-          "audience": "relay-a.example.org",
           "public_key": "bcf19510832328dbd8c358702009d38a9c3eeb0cc97448f70a34eb112f2cf25230a68d3a14f47435bafff78e0095fab4c5376195ce0b473b62c7b31a4b321596",
           "challenge": "5ab138262aa3ff7e40d3e0d18156b5b96bc78010ea1616eb57342eb81a75ee1610f5ba999763b15904037774de39808a",
-          "signature": "d4f7e07793885f442f454378e75dbdf58040cb8b9cb9655b9c00660b70b9e98b816fed6ebca98b5817c5188cb8fb2cd184d6e612b55f5313e98398a68507480c"
+          "signature": "effcd397b0f967a56ed90038c0c825592bff62d6c4298905115e033d97067da0cf938671694bfbfe95b392393123232ce9785045bebeeab10c19250203f5ec0f"
         }
       },
       "fails_check": "signature",
@@ -1083,10 +1013,9 @@
         },
         "registration": {
           "version": 1,
-          "audience": "relay-a.example.org",
           "public_key": "bcf19510832328dbd8c358702009d38a9c3eeb0cc97448f70a34eb112f2cf25230a68d3a14f47435bafff78e0095fab4c5376195ce0b473b62c7b31a4b321596",
           "challenge": "5ab138262aa3ff7e40d3e0d18156b5b96bc78010ea1616eb57342eb81a75ee1610f5ba999763b15904037774de39808a",
-          "signature": "1aba8e1a843c00a8dea30f176f6671953bd4be3efde55d57aab542958a91f5379e13bd955e7f72e1e1c679e9efe6ed424889a4e136b44e22abcafe419f12610c"
+          "signature": "b1a0d662c1dbbb2c815bddf402f145e51a499085266f24daf539a671b31f6e1215e4ced2e52956751e5c0c602b8b66063ac7357fbd1313f2de6c61622a79b804"
         }
       },
       "fails_check": "challenge",
@@ -1118,10 +1047,9 @@
         },
         "registration": {
           "version": 1,
-          "audience": "relay-a.example.org",
           "public_key": "e99dd31ae1903bdb7d23f06bdc634cd8d638963f084d45e0e152d2c86c35dc3b511b1df9eba5bdce0c386ecbc8af32598d878000bf56e9fc8c1c8d299e988d1f",
           "challenge": "1c4f5bb95ae980b7b4ee086555d27da56b95c2975e7fd9ac39eb9e4e8f91f5459eeb277a4f5cd9f2426655d8b8d28b04",
-          "signature": "4c6e6108b470b8691df2bcd958ed45d611879531e1cacab5861f62a75911fbbe3f14ce4aaefe8434af295ecf0c687d63dda5e9107751cf14258339b9462b7d02"
+          "signature": "02819c3877214b1cb4d1c1c13f23a4e187d27b6a46600bc48550e702f22f143c5f2f7e4bd2cdd12d0040d189964bc01feb54b5b8df87c0462c4716b1c7249601"
         }
       },
       "fails_check": "challenge",
@@ -1150,10 +1078,9 @@
         },
         "registration": {
           "version": 1,
-          "audience": "relay-a.example.org",
           "public_key": "bcf19510832328dbd8c358702009d38a9c3eeb0cc97448f70a34eb112f2cf25230a68d3a14f47435bafff78e0095fab4c5376195ce0b473b62c7b31a4b321596",
           "challenge": "d42a8c8a9bd3a52194348ba49f550dbfbfccc5ef73896cd76bd36f3547750e17d21de8aaba5c462da8b413da2f792492",
-          "signature": "e1e4e45ba0b61337bc49e8c43133d7cea977138e3546da28341c1eb1e22d2076f42c768f2d7ec73f6e220b2fcdcdf5c507f6c7ebe6a9f9c1d035c85db8b1470d"
+          "signature": "c4e53c6c6082cd5fb76cd17f9dae432bfeff8238b31f477e387147ebb5a8283138768c52b984998a20714224be02da29162cf9af23dcd0d48997c9449f7b180c"
         }
       },
       "fails_check": "challenge",
@@ -1182,10 +1109,9 @@
         },
         "registration": {
           "version": 1,
-          "audience": "relay-a.example.org",
           "public_key": "bcf19510832328dbd8c358702009d38a9c3eeb0cc97448f70a34eb112f2cf25230a68d3a14f47435bafff78e0095fab4c5376195ce0b473b62c7b31a4b321596",
           "challenge": "6198cec6b10e8c94b73b371ae393d8a30a917e4bb6f9a25d5b09a3b0f7d64fda97eaedc88ab3193a8bed516e05e041d6",
-          "signature": "9e4932932a9690b9ac0a46187e50703e6bd8bafcd8edc8df3fc536ec05f2b322d8b8498a62ccbb95ceeba80e0653a30e51597326fcc0d0d926edc54bc81d7d0a"
+          "signature": "25c0f2e77933d907bd3f0b43f98e238d9ef928c96bb6e46945e5bc8e5da164bea8f056d3bbc2947331eefcdd93ce9b5718c0edaa78728f1ec191fa3096f9a304"
         }
       },
       "fails_check": "challenge",
@@ -1214,48 +1140,15 @@
         },
         "registration": {
           "version": 1,
-          "audience": "relay-a.example.org",
           "public_key": "bcf19510832328dbd8c358702009d38a9c3eeb0cc97448f70a34eb112f2cf25230a68d3a14f47435bafff78e0095fab4c5376195ce0b473b62c7b31a4b321596",
           "challenge": "5bb138262aa3ff7e40d3e0d18156b5b96bc78010ea1616eb57342eb81a75ee1610f5ba999763b15904037774de39808a",
-          "signature": "47c33579d6c05282cc7f455dae8c9128d7143307515771264ef87e71cdfa2d2e7956fb9440d146c59dabb4565445b65bd499a19434ffdea6ce81642970f94e06"
+          "signature": "7c849b29088b128deba2eec7834bf8e5b61cc6f90fbc0b6860de26a361d035a9a6a6dd15024971a1fce738dc70777d6bbcbe639af6487dbb89755ba516fabe01"
         }
       },
       "fails_check": "challenge",
       "expected": {
         "status": 409,
         "error": "stale_challenge"
-      }
-    },
-    {
-      "id": "audience-mismatch",
-      "description": "A correctly signed browser registration over a real relay-A challenge, but the browser connected to relay B (audience relay-b.example.org) and relay B forwarded the body to A: the relay-oracle attack. A refuses an audience that is not its own host.",
-      "relay": "A",
-      "relay_state_before": {
-        "signed_row_exists": false,
-        "row_registration_seq": 0,
-        "at_capacity": false
-      },
-      "request_body": {
-        "name": "Retichat Web",
-        "bitrate": 1000000,
-        "mtu": 500,
-        "metadata": {
-          "client": "rns-js",
-          "implementation": "PostInterface",
-          "mode": 1
-        },
-        "registration": {
-          "version": 1,
-          "audience": "relay-b.example.org",
-          "public_key": "bcf19510832328dbd8c358702009d38a9c3eeb0cc97448f70a34eb112f2cf25230a68d3a14f47435bafff78e0095fab4c5376195ce0b473b62c7b31a4b321596",
-          "challenge": "695f6c3edfafc30f8384e4d69e672e0d24873580e4a6e2cd98f9915e90cd5403fa5deb0059a28042eb5994861842d184",
-          "signature": "92f72e42a14a83713ac3d152dc7f6a07a949b69aa7875c0c04b0819b29c4493b848da047d9f48dcb44e23403f382ab8a40883e02927f4775b6ebdb707102d706"
-        }
-      },
-      "fails_check": "audience",
-      "expected": {
-        "status": 403,
-        "error": "audience_mismatch"
       }
     },
     {
@@ -1279,10 +1172,9 @@
         },
         "registration": {
           "version": 1,
-          "audience": "relay-a.example.org",
           "public_key": "bcf19510832328dbd8c358702009d38a9c3eeb0cc97448f70a34eb112f2cf25230a68d3a14f47435bafff78e0095fab4c5376195ce0b473b62c7b31a4b321596",
           "challenge": "5ab138262aa3ff7e40d3e0d18156b5b96bc78010ea1616eb57342eb81a75ee1610f5ba999763b15904037774de39808a",
-          "signature": "1aba8e1a843c00a8dea30f176f6671953bd4be3efde55d57aab542958a91f5379e13bd955e7f72e1e1c679e9efe6ed424889a4e136b44e22abcafe419f12610c"
+          "signature": "b1a0d662c1dbbb2c815bddf402f145e51a499085266f24daf539a671b31f6e1215e4ced2e52956751e5c0c602b8b66063ac7357fbd1313f2de6c61622a79b804"
         }
       },
       "fails_check": "metadata_identity_hash",
@@ -1312,10 +1204,9 @@
         },
         "registration": {
           "version": 1,
-          "audience": "relay-a.example.org",
           "public_key": "bcf19510832328dbd8c358702009d38a9c3eeb0cc97448f70a34eb112f2cf25230a68d3a14f47435bafff78e0095fab4c5376195ce0b473b62c7b31a4b321596",
           "challenge": "5ab138262aa3ff7e40d3e0d18156b5b96bc78010ea1616eb57342eb81a75ee1610f5ba999763b15904037774de39808a",
-          "signature": "1aba8e1a843c00a8dea30f176f6671953bd4be3efde55d57aab542958a91f5379e13bd955e7f72e1e1c679e9efe6ed424889a4e136b44e22abcafe419f12610c"
+          "signature": "b1a0d662c1dbbb2c815bddf402f145e51a499085266f24daf539a671b31f6e1215e4ced2e52956751e5c0c602b8b66063ac7357fbd1313f2de6c61622a79b804"
         }
       },
       "fails_check": "metadata_keys",
@@ -1344,10 +1235,9 @@
         },
         "registration": {
           "version": 1,
-          "audience": "relay-a.example.org",
           "public_key": "BCF19510832328DBD8C358702009D38A9C3EEB0CC97448F70A34EB112F2CF25230A68D3A14F47435BAFFF78E0095FAB4C5376195CE0B473B62C7B31A4B321596",
           "challenge": "5ab138262aa3ff7e40d3e0d18156b5b96bc78010ea1616eb57342eb81a75ee1610f5ba999763b15904037774de39808a",
-          "signature": "1aba8e1a843c00a8dea30f176f6671953bd4be3efde55d57aab542958a91f5379e13bd955e7f72e1e1c679e9efe6ed424889a4e136b44e22abcafe419f12610c"
+          "signature": "b1a0d662c1dbbb2c815bddf402f145e51a499085266f24daf539a671b31f6e1215e4ced2e52956751e5c0c602b8b66063ac7357fbd1313f2de6c61622a79b804"
         }
       },
       "fails_check": "shape",
@@ -1376,10 +1266,9 @@
         },
         "registration": {
           "version": 1,
-          "audience": "relay-a.example.org",
           "public_key": "bcf19510832328dbd8c358702009d38a9c3eeb0cc97448f70a34eb112f2cf25230a68d3a14f47435bafff78e0095fab4c5376195ce0b473b62c7b31a4b321596",
           "challenge": "134279e040618187e75c5cb2efe83f6fc5863de85a69b094ba0b392673d3c81a905b1e62ddabaeb333d0125a649f6e10",
-          "signature": "64cf63f4217bcf4257c2164f7522ba3c396afb8242bb34bd07a50e02c4698a5d0560d5bcc2392eb2c78caab7ff43202931a0a7cbb6821545fb5495b236703306"
+          "signature": "1d01c9f369d113860b61f96c17ad65793e71ede057c77c22272219231e93c495587939779215fafd04d7d6069f398ce90c008a8ab813e09386de358eb932f907"
         }
       },
       "fails_check": "client_policy",
@@ -1409,10 +1298,9 @@
         },
         "registration": {
           "version": 1,
-          "audience": "relay-a.example.org",
           "public_key": "bcf19510832328dbd8c358702009d38a9c3eeb0cc97448f70a34eb112f2cf25230a68d3a14f47435bafff78e0095fab4c5376195ce0b473b62c7b31a4b321596",
           "challenge": "55008110922cfbdc945224109b1f2fd585e55657bf4df3491d6d7bf1f741c06f7b63d13f0b3ce355181e0952fbf3d2ac",
-          "signature": "3edd1dd586a6fa16cfc9ffab7a1209c192fb73b10d179cbca36cd64c8c593a699827cdb8bf6914f1607ca43a7b214ebc7b9f4f5625b528dfc3ecc6388a88350b"
+          "signature": "b04366465f54a8e4df12cb3c0f0305a48f8617a6b128e7a47e7d2da5ba918573874e6847617eddc9882f748c57e98c784341391292898867ae11bb5f21867407"
         }
       },
       "fails_check": "client_policy",
@@ -1441,10 +1329,9 @@
         },
         "registration": {
           "version": 1,
-          "audience": "relay-a.example.org",
           "public_key": "677897654e0003e3606997a89db859c3ce85221768eee56d33a4f51e51e40b558427d0151e465304f1fb00c048d06385935c406d26d78a4cc56fddedbdc8b80b",
           "challenge": "a9b1e38c7adb609ee0ae9575267c0ff8a70192de151b37b8e7213b9c08eab6eae18ad41102ec5c5344c007f0789f795a",
-          "signature": "3d240365b8bce3b788bb8c98cbaba7a8ece19465164ad10bfe1629f3979e728fa7fd790c573bbfc17f68c83862ef0390d3b766c46db7fb88f2a864223198090e"
+          "signature": "5d627ec61031a5ed6634529dc494c759d456b7ca08a98dff9fb647c0500cbab0072dec4807be8ae2de520cd5edc8d2b8a9fbc56f8b3b4608b24fc7fcacc3ff01"
         }
       },
       "fails_check": "client_policy",
@@ -1455,7 +1342,7 @@
     },
     {
       "id": "wake-gateway-without-peer-fields",
-      "description": "The listed gateway, correctly signed, client reticulum-php with no peer fields. A wake-mode gateway must name where it is woken.",
+      "description": "The gateway, correctly signed, client reticulum-php with no peer fields. A wake-mode gateway must name where it is woken.",
       "relay": "A",
       "relay_state_before": {
         "signed_row_exists": true,
@@ -1473,10 +1360,9 @@
         },
         "registration": {
           "version": 1,
-          "audience": "relay-a.example.org",
           "public_key": "e99dd31ae1903bdb7d23f06bdc634cd8d638963f084d45e0e152d2c86c35dc3b511b1df9eba5bdce0c386ecbc8af32598d878000bf56e9fc8c1c8d299e988d1f",
           "challenge": "54b3c8b80e573988b3ad64345a29825aaa2a69bd76e46d002218a0ed936c035b3e83da2bad98443226918f330328129e",
-          "signature": "c467114bdea15f694db924b79b3ef48d892f49c6671b00ad243fe4f01fee294b5117c82d07244f966670008a70121da958f81537bc0e0312857fd6538f60d700"
+          "signature": "345b987f8908e66fb7ec6fd5c60b0e7309449e03363d11207a3702ad43ac1749766374f7c9b696d582b220cadd8300b676d493c2ef729bffbe73fd11d1b9a700"
         }
       },
       "fails_check": "client_policy",
@@ -1487,7 +1373,7 @@
     },
     {
       "id": "poll-gateway-with-peer-url",
-      "description": "The listed gateway, correctly signed, client rns-post-interface carrying a peer_url. A poll-mode gateway is never woken, so it may not name a URL.",
+      "description": "The gateway, correctly signed, client rns-post-interface carrying a peer_url. A poll-mode gateway is never woken, so it may not name a URL.",
       "relay": "A",
       "relay_state_before": {
         "signed_row_exists": true,
@@ -1507,51 +1393,15 @@
         },
         "registration": {
           "version": 1,
-          "audience": "relay-a.example.org",
           "public_key": "e99dd31ae1903bdb7d23f06bdc634cd8d638963f084d45e0e152d2c86c35dc3b511b1df9eba5bdce0c386ecbc8af32598d878000bf56e9fc8c1c8d299e988d1f",
           "challenge": "2df8570b517ea7fb7ccb57d81450a7636ba2658b4f15ab7fe102671567175985edc8e664ce945bfa3836ba2af6ef114e",
-          "signature": "87f6f10db4292f8138c74c59447aaff5421825bff9f138a72c546130e992ae0e2fc4e31c75f24da4a483565080c2bb29478f9278c78b52ea274a585934684d0b"
+          "signature": "377beefee9e1a780f22087b5199c4e1cdf0318b6fddd0fc2e3ba254175eb883d48f73c2ed60d5861568a6add4d19c34b45f531034a399435ef75d0a886adcd0a"
         }
       },
       "fails_check": "client_policy",
       "expected": {
         "status": 400,
         "error": "metadata_not_allowed"
-      }
-    },
-    {
-      "id": "transit-identity-not-listed",
-      "description": "A correctly signed wake-mode gateway registration by an identity relay A does not list in transit_identities. Anyone can make a key; only listed identities get a transit row.",
-      "relay": "A",
-      "relay_state_before": {
-        "signed_row_exists": false,
-        "row_registration_seq": 0,
-        "at_capacity": false
-      },
-      "request_body": {
-        "name": "RNS PostInterface (Not Listed)",
-        "bitrate": 10000000,
-        "mtu": 500,
-        "metadata": {
-          "client": "reticulum-php",
-          "implementation": "PostInterface",
-          "mode": 6,
-          "peer_url": "https://transit.example.net",
-          "peer_interface_id": "7214caf433be4cdb249dcb17af6b3bb6",
-          "peer_session_token": "9bb933a1933e1dafd827e16b0b13937009780a9af5c507f69d47f28aed7a7dd0"
-        },
-        "registration": {
-          "version": 1,
-          "audience": "relay-a.example.org",
-          "public_key": "677897654e0003e3606997a89db859c3ce85221768eee56d33a4f51e51e40b558427d0151e465304f1fb00c048d06385935c406d26d78a4cc56fddedbdc8b80b",
-          "challenge": "305df31370e4301128a1485750e8ddef980efb9bbf9538ed3715b5f53172c9e2e6dc61726aac80536125f0b71d9184e7",
-          "signature": "7c8854ee18d6c550fffe24aaf957a530f62954d58d4424cc05613c4a2d9bf90810f5ecc8ab5cf6a8f5fdae97d38b6155c949d1fa90992646898d1c07adb14f02"
-        }
-      },
-      "fails_check": "transit_identity",
-      "expected": {
-        "status": 403,
-        "error": "transit_identity_not_allowed"
       }
     },
     {
@@ -1574,10 +1424,9 @@
         },
         "registration": {
           "version": 1,
-          "audience": "relay-a.example.org",
           "public_key": "677897654e0003e3606997a89db859c3ce85221768eee56d33a4f51e51e40b558427d0151e465304f1fb00c048d06385935c406d26d78a4cc56fddedbdc8b80b",
           "challenge": "d627509aee07f2c39b64944d7f9d091ee0b7d5c9adfbd2736325076c5ef0a564c14fcba5c5cee801464bb704753a9103",
-          "signature": "9634e986ccad08fbe8e5dedfe99fe9fec6c3547058891a47146a713811b38d9596ba154d4d7a293a8d4298bcae10137e66b4c8a2a57900798961cb484f134605"
+          "signature": "e642a357eebd61a77b9cc195d2b68d4816d47c484188c27a22008b425468503f2460ceb862df510704327baa555a38f485b1c28843f5617111206d1b14b63d07"
         }
       },
       "fails_check": "capacity",
@@ -1606,10 +1455,9 @@
         },
         "registration": {
           "version": 1,
-          "audience": "relay-a.example.org",
           "public_key": "00000000000000000000000000000000000000000000000000000000000000004abe202cea8f51835a678afe3509c46df531c568d0abf0633ad633116067cc7a",
           "challenge": "4f4bb20133e73657b033a42adeee97043f00b4b5cee659b6d022c15ede057d7fe383b855a0ca4601a6bc59870e84d96c",
-          "signature": "70c0128e64483aceded02c748b7833bddd27fe65c37856b39dffbf13b223d825c299417972b911df171a8fb72ebca8dbb6230c333c633527befb4d18fcdc1d03"
+          "signature": "a6b1d7d56b14dc347e7efbf761018f30d9dbe197cf1a6f95c81127cf6a010aafcf20c1dc8b1092a6caa30111578e14e4c83c931fbd698e5dbbf66909f1a8c90f"
         }
       },
       "fails_check": "token_encryption",
@@ -1768,55 +1616,6 @@
       "canonical": null,
       "peer_url_key": null,
       "refused": "port"
-    }
-  ],
-  "audience_client": [
-    {
-      "client_base_url": "https://relay-a.example.org/reticulum",
-      "audience": "relay-a.example.org"
-    },
-    {
-      "client_base_url": "https://Relay-A.Example.ORG:443/reticulum/",
-      "audience": "relay-a.example.org"
-    },
-    {
-      "client_base_url": "http://127.0.0.1:4370",
-      "audience": "127.0.0.1:4370"
-    },
-    {
-      "client_base_url": "http://localhost:80/reticulum",
-      "audience": "localhost"
-    },
-    {
-      "client_base_url": "https://[::1]:8443/reticulum",
-      "audience": "[::1]:8443"
-    }
-  ],
-  "audience_relay": [
-    {
-      "host_header": "relay-a.example.org",
-      "scheme": "https",
-      "audience": "relay-a.example.org"
-    },
-    {
-      "host_header": "Relay-A.example.org:443",
-      "scheme": "https",
-      "audience": "relay-a.example.org"
-    },
-    {
-      "host_header": "127.0.0.1:4370",
-      "scheme": "http",
-      "audience": "127.0.0.1:4370"
-    },
-    {
-      "host_header": "relay-a.example.org:80",
-      "scheme": "https",
-      "audience": "relay-a.example.org:80"
-    },
-    {
-      "host_header": "[::1]:443",
-      "scheme": "https",
-      "audience": "[::1]"
     }
   ]
 }
