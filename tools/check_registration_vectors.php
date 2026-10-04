@@ -11,7 +11,9 @@
  * and encrypted session token from the vector inputs, verifies every
  * signature, re-derives every canonical peer URL, checks the gateway
  * wake-URL confirm (section 9.8) with its own gateway handler and relay
- * answer verifier, and runs a
+ * answer verifier, checks the PHP relay peer (section 10: identity file,
+ * token decryption as the PHP client does it, confirm handler, link order),
+ * and runs a
  * REFERENCE verifier (REGISTRATION.md section 4.3, in its normative order)
  * over every positive and negative vector, comparing the HTTP status, the
  * error code and the step that fails. The reference verifier is deliberately
@@ -300,12 +302,41 @@ function boundedUtf8(mixed $v, int $maxBytes): bool
 }
 
 /**
- * Section 9.8, the gateway's handler, its checks in their normative order.
+ * Section 9.8, the gateway's handler.
  *
  * @param array{node_url:string, wake_url:string} $cfg the gateway's config as written
  * @return array{status:int, error?:string, signature?:string}
  */
 function gatewayHandleConfirm(mixed $body, string $ownHash, string $edSecretKey, array $cfg): array
+{
+    return handleConfirm($body, $ownHash, $edSecretKey, [canonicalPeerUrl($cfg['node_url'])[0]], canonicalPeerUrl($cfg['wake_url'])[0]);
+}
+
+/**
+ * Section 10, a PHP relay's handler: it registers at every relay in its [interfaces].
+ *
+ * @param array{host_url:string, interfaces_node_urls:list<string>} $cfg
+ * @return array{status:int, error?:string, signature?:string}
+ */
+function phpRelayHandleConfirm(mixed $body, string $ownHash, string $edSecretKey, array $cfg): array
+{
+    $relays = [];
+    foreach ($cfg['interfaces_node_urls'] as $u) {
+        [$c] = canonicalPeerUrl($u);
+        if ($c !== null) {
+            $relays[] = $c;
+        }
+    }
+    return handleConfirm($body, $ownHash, $edSecretKey, $relays, canonicalPeerUrl($cfg['host_url'])[0]);
+}
+
+/**
+ * Section 9.8's checks, in their normative order.
+ *
+ * @param list<string> $relayUrls canonical URLs of the relays this node registers at
+ * @return array{status:int, error?:string, signature?:string}
+ */
+function handleConfirm(mixed $body, string $ownHash, string $edSecretKey, array $relayUrls, ?string $ownUrl): array
 {
     if (!is_array($body)) {
         return ['status' => 400, 'error' => 'bad_confirm_request'];
@@ -327,11 +358,11 @@ function gatewayHandleConfirm(mixed $body, string $ownHash, string $edSecretKey,
         return ['status' => 403, 'error' => 'not_my_identity'];
     }
     [$relay] = canonicalPeerUrl($body['relay_url']);
-    if ($relay === null || $relay !== canonicalPeerUrl($cfg['node_url'])[0]) {
+    if ($relay === null || !in_array($relay, $relayUrls, true)) {
         return ['status' => 403, 'error' => 'unknown_relay'];
     }
     [$peer] = canonicalPeerUrl($body['peer_url']);
-    if ($peer === null || $peer !== canonicalPeerUrl($cfg['wake_url'])[0]) {
+    if ($peer === null || $ownUrl === null || $peer !== $ownUrl) {
         return ['status' => 403, 'error' => 'not_my_wake_url'];
     }
     return ['status' => 200, 'signature' => bin2hex(sodium_crypto_sign_detached(gatewayConfirmBytes($body), $edSecretKey))];
@@ -354,6 +385,43 @@ function relayVerifyConfirmAnswer(array $sent, int $status, mixed $answer, strin
         return ['result' => 'bad_signature'];
     }
     return ['result' => 'confirmed'];
+}
+
+/**
+ * Section 10.4: the PHP client's decrypt of session_token_encrypted, with the
+ * reason it refuses. sodium X25519 (an all-zero result throws), hash_hkdf,
+ * HMAC-SHA256 checked with hash_equals before decrypting, openssl AES-256-CBC.
+ *
+ * @return array{result:string, session_token?:string}
+ */
+function clientDecrypt(string $blob, string $x25519Private, string $identityHash): array
+{
+    $ctLen = strlen($blob) - 32 - 16 - 32;
+    if ($ctLen < 16 || $ctLen % 16 !== 0) {
+        return ['result' => 'malformed'];
+    }
+    try {
+        $shared = sodium_crypto_scalarmult($x25519Private, substr($blob, 0, 32));
+    } catch (\SodiumException) {
+        return ['result' => 'zero_shared_secret'];
+    }
+    if (hash_equals(str_repeat("\0", 32), $shared)) {
+        return ['result' => 'zero_shared_secret'];
+    }
+    $derived = hash_hkdf('sha256', $shared, 64, '', $identityHash);
+    $iv = substr($blob, 32, 16);
+    $ct = substr($blob, 48, $ctLen);
+    if (!hash_equals(hash_hmac('sha256', $iv . $ct, substr($derived, 0, 32), true), substr($blob, -32))) {
+        return ['result' => 'hmac'];
+    }
+    $pt = openssl_decrypt($ct, 'aes-256-cbc', substr($derived, 32, 32), OPENSSL_RAW_DATA, $iv);
+    if (!is_string($pt)) {
+        return ['result' => 'padding'];
+    }
+    if (preg_match('/\A[0-9a-f]{64}\z/', $pt) !== 1) {
+        return ['result' => 'not_a_token'];
+    }
+    return ['result' => 'ok', 'session_token' => $pt];
 }
 
 /** RNS Identity.encrypt with a pinned ephemeral key and IV (request_lxmf_handoff_trait.php's derivation). */
@@ -388,7 +456,7 @@ function decryptToken(string $blob, string $x25519Private, string $identityHash)
 $expect($doc['constants']['register_domain'] === REGISTER_DOMAIN, 'register domain');
 $expect($doc['constants']['challenge_domain'] === CHALLENGE_DOMAIN, 'challenge domain');
 $expect($doc['constants']['challenge_length'] === CHALLENGE_BYTES, 'challenge length');
-$expect($doc['format_version'] === 4, 'format 4 (revision 3: no audience; revision 4: the gateway confirm)');
+$expect($doc['format_version'] === 5, 'format 5 (revision 3: no audience; revision 4: the gateway confirm; revision 6: the PHP relay peer)');
 $expect($doc['constants']['signed_field_order'] === ['domain', 'challenge', 'public_key', 'name', 'bitrate', 'mtu', 'client', 'mode', 'transport', 'peer_url', 'peer_interface_id', 'peer_session_token'], 'the twelve signed fields, in order');
 foreach ($doc['lp_examples'] as $ex) {
     $in = isset($ex['input_utf8']) ? $ex['input_utf8'] : (string) hex2bin($ex['input_hex']);
@@ -556,6 +624,75 @@ if (is_array($gc)) {
     }
 }
 
+// ── The PHP relay peer (section 10) ────────────────────────────────────────
+$pr = $doc['php_relay_peer'] ?? null;
+$expect(is_array($pr), 'php relay peer: section present');
+if (is_array($pr)) {
+    $rbName = $pr['identity'];
+    $file = (string) hex2bin($pr['identity_file_hex']);
+    $expect(strlen($file) === 64, 'php relay peer: the identity file is 64 bytes');
+    $rbXPrv = substr($file, 0, 32);
+    $rbKeypair = sodium_crypto_sign_seed_keypair(substr($file, 32, 32));
+    $rbPub = sodium_crypto_scalarmult_base($rbXPrv) . sodium_crypto_sign_publickey($rbKeypair);
+    $rbHash = substr(hash('sha256', $rbPub, true), 0, 16);
+    $expect(bin2hex($rbHash) === $pr['identity_hash_hex'] && $doc['identities'][$rbName]['public_key_hex'] === bin2hex($rbPub), 'php relay peer: identity file -> public key -> identity hash');
+    $rbReg = null;
+    foreach ($doc['registrations'] as $v) {
+        if ($v['id'] === $pr['registration_id']) {
+            $rbReg = $v;
+        }
+    }
+    $expect(is_array($rbReg) && $rbReg['identity'] === $rbName, 'php relay peer: its registration vector exists');
+    if (is_array($rbReg)) {
+        $md = $rbReg['request_body']['metadata'];
+        [$hostCanon] = canonicalPeerUrl($pr['config']['host_url']);
+        $expect($md['client'] === 'reticulum-php' && $md['mode'] === 1 && $md['peer_url'] === $hostCanon, 'php relay peer: registers as reticulum-php, mode 1, peer_url = its canonical host_url');
+        $expect(($rbReg['request_body']['registration']['public_key'] ?? '') === bin2hex($rbPub), 'php relay peer: signs with the identity file\'s key');
+    }
+    $dw = $pr['decrypt'];
+    $blob = (string) hex2bin($dw['session_token_encrypted_hex']);
+    $expect(bin2hex(substr($blob, 0, 32)) === $dw['ephemeral_public_hex'] && bin2hex(substr($blob, 32, 16)) === $dw['iv_hex']
+        && bin2hex(substr($blob, 48, -32)) === $dw['ciphertext_hex'] && bin2hex(substr($blob, -32)) === $dw['hmac_hex'], 'php relay peer: blob layout');
+    $shared = sodium_crypto_scalarmult($rbXPrv, substr($blob, 0, 32));
+    $derived = hash_hkdf('sha256', $shared, 64, '', $rbHash);
+    $expect(bin2hex($shared) === $dw['shared_key_hex'] && bin2hex($derived) === $dw['derived_key_hex']
+        && bin2hex(substr($derived, 0, 32)) === $dw['hmac_key_hex'] && bin2hex(substr($derived, 32)) === $dw['aes_key_hex']
+        && $dw['hkdf_salt_hex'] === bin2hex($rbHash), 'php relay peer: shared, derived, HMAC and AES keys');
+    $expect(clientDecrypt($blob, $rbXPrv, $rbHash) === $dw['expected'], 'php relay peer: the PHP client decrypts its token');
+    foreach ($pr['decrypt_negative'] as $d) {
+        $got = clientDecrypt((string) hex2bin($d['session_token_encrypted_hex']), $rbXPrv, $rbHash);
+        $expect($got === $d['expected'], "php relay decrypt {$d['id']}: expected " . json_encode($d['expected']) . ', got ' . json_encode($got));
+    }
+    $c = $pr['confirm'];
+    $expect($c['request_url'] === $hostCanon . GATEWAY_CONFIRM_PATH && $c['request_body']['peer_url'] === $hostCanon, 'php relay confirm: sent only to its canonical host_url');
+    $cmsg = gatewayConfirmBytes($c['request_body']);
+    $expect(bin2hex($cmsg) === $c['signed_bytes_hex'], 'php relay confirm: signed bytes');
+    $joined = '';
+    foreach ($c['signed_fields'] as $f) {
+        $joined .= (string) hex2bin($f['lp_hex']);
+    }
+    $expect($joined === $cmsg, 'php relay confirm: signed_fields concatenate to the signed bytes');
+    $rbSk = sodium_crypto_sign_secretkey($rbKeypair);
+    $expect(phpRelayHandleConfirm($c['request_body'], $rbHash, $rbSk, $pr['config']) === ['status' => 200, 'signature' => $c['signature_hex']], 'php relay confirm: its handler signs it');
+    $expect(relayVerifyConfirmAnswer($c['request_body'], 200, $c['response_body'], $rbPub) === $c['expected_relay'], 'php relay confirm: the relay accepts the answer');
+    foreach ($pr['confirm_refusals'] as $r) {
+        $got = phpRelayHandleConfirm($r['request_body'], $rbHash, $rbSk, $pr['config']);
+        $expect($got === $r['expected'], "php relay refusal {$r['id']}: expected " . json_encode($r['expected']) . ', got ' . json_encode($got));
+    }
+    foreach ($pr['confirm_answer_negative'] as $a) {
+        $got = relayVerifyConfirmAnswer($c['request_body'], $a['answer_status'], $a['answer_body'], $rbPub);
+        $expect($got === $a['expected'], "php relay answer {$a['id']}: expected " . json_encode($a['expected']) . ', got ' . json_encode($got));
+    }
+    foreach ($pr['link_order'] as $l) {
+        [$c1] = canonicalPeerUrl($l['relay_1']);
+        [$c2] = canonicalPeerUrl($l['relay_2']);
+        $first = strcmp((string) $c1, (string) $c2) < 0 ? $c1 : $c2;
+        $second = $first === $c1 ? $c2 : $c1;
+        $expect($c1 === $l['canonical_1'] && $c2 === $l['canonical_2'] && $l['link_is_registration_of'] === $first && $l['stands_down'] === $second,
+            'php relay link order: ' . $l['note']);
+    }
+}
+
 // Revision 3: nothing in the file carries an audience.
 $expect(!str_contains((string) file_get_contents($path), 'audience'), 'no vector carries an audience');
 
@@ -567,7 +704,8 @@ if ($failures !== []) {
     exit(1);
 }
 
-printf("PASS: %d checks (%d registrations, %d negative, %d token negatives, %d URLs, gateway confirm: 1 positive, %d refusals, %d answer negatives) with PHP %s sodium/openssl\n",
+printf("PASS: %d checks (%d registrations, %d negative, %d token negatives, %d URLs, gateway confirm: 1 positive, %d refusals, %d answer negatives; php relay peer: %d decrypt negatives, %d confirm refusals, %d link orders) with PHP %s sodium/openssl\n",
     $checks, count($doc['registrations']), count($doc['negative']), count($doc['tokens_negative']),
-    count($doc['url_canonical']), count($gc['gateway_refusals'] ?? []), count($gc['answer_negative'] ?? []), PHP_VERSION);
+    count($doc['url_canonical']), count($gc['gateway_refusals'] ?? []), count($gc['answer_negative'] ?? []),
+    count($pr['decrypt_negative'] ?? []), count($pr['confirm_refusals'] ?? []), count($pr['link_order'] ?? []), PHP_VERSION);
 exit(0);

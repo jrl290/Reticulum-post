@@ -26,7 +26,11 @@ Every vector is verified before it is written:
 - the gateway wake-URL confirm (REGISTRATION.md section 9.8): the positive
   signature with RNS Identity.validate, every gateway refusal with this
   script's reference gateway handler, and every relay-side answer with its
-  reference answer verifier.
+  reference answer verifier;
+- the PHP relay peer (section 10): its registration as an ordinary positive
+  vector, its identity file, its token decryption and every decryption it
+  must refuse with this script's reference decrypt, its confirm handler and
+  the link-order examples.
 
 --check additionally regenerates the file in memory and compares it byte for
 byte with the committed copy.
@@ -437,9 +441,21 @@ def gateway_confirm_bytes(body):
 
 
 def gateway_handle_confirm(body, ident, cfg):
-    """The gateway's handler, its checks in their normative order.
+    """The gateway's handler. cfg: {node_url, wake_url} as its config writes them."""
+    return handle_confirm(body, ident, {canonical_url(cfg["node_url"])[0]}, canonical_url(cfg["wake_url"])[0])
 
-    cfg: {node_url, wake_url} exactly as the gateway's config writes them."""
+
+def php_relay_handle_confirm(body, ident, cfg):
+    """A PHP relay's handler (section 10). cfg: {host_url, interfaces_node_urls}."""
+    relays = {canonical_url(u)[0] for u in cfg["interfaces_node_urls"]} - {None}
+    return handle_confirm(body, ident, relays, canonical_url(cfg["host_url"])[0])
+
+
+def handle_confirm(body, ident, relay_urls, own_url):
+    """Section 9.8's handler checks, in their normative order.
+
+    relay_urls: the canonical URLs of the relays this node registers at;
+    own_url: the canonical URL it signs as its peer_url."""
     def bad(status, error):
         return {"status": status, "error": error}
 
@@ -455,10 +471,10 @@ def gateway_handle_confirm(body, ident, cfg):
     if not hmac.compare_digest(body["identity_hash"], ident.hash.hex()):
         return bad(403, "not_my_identity")
     relay, _ = canonical_url(body["relay_url"])
-    if relay is None or relay != canonical_url(cfg["node_url"])[0]:
+    if relay is None or relay not in relay_urls:
         return bad(403, "unknown_relay")
     peer, _ = canonical_url(body["peer_url"])
-    if peer is None or peer != canonical_url(cfg["wake_url"])[0]:
+    if peer is None or peer != own_url:
         return bad(403, "not_my_wake_url")
     msg, _ = gateway_confirm_bytes(body)
     return {"status": 200, "body": {"signature": ident.sign(msg).hex()}}
@@ -477,6 +493,35 @@ def relay_verify_confirm_answer(sent_body, status, answer, public_key):
     except Exception:
         return {"result": "bad_signature"}
     return {"result": "confirmed"}
+
+
+def reference_decrypt(blob, x_prv, identity_hash):
+    """A registrant's decrypt of session_token_encrypted (sections 5 and 10.4).
+
+    Returns {"result": "ok", "session_token": ...} or {"result": <reason>}."""
+    if len(blob) < 32 + 16 + 16 + 32 or (len(blob) - 32 - 16 - 32) % 16 != 0:
+        return {"result": "malformed"}
+    eph_pub, iv, ct, tag = blob[:32], blob[32:48], blob[48:-32], blob[-32:]
+    try:
+        shared = X25519PrivateKey.from_private_bytes(x_prv).exchange(X25519PublicKey.from_public_bytes(eph_pub))
+    except Exception:
+        return {"result": "zero_shared_secret"}
+    if shared == bytes(32):
+        return {"result": "zero_shared_secret"}
+    derived = hkdf(length=64, derive_from=shared, salt=identity_hash, context=None)
+    if not hmac.compare_digest(HMAC.new(derived[:32], iv + ct).digest(), tag):
+        return {"result": "hmac"}
+    try:
+        pt = PKCS7.unpad(AES_256_CBC.decrypt(ciphertext=ct, key=derived[32:], iv=iv))
+    except Exception:
+        return {"result": "padding"}
+    try:
+        token = pt.decode("ascii")
+    except UnicodeDecodeError:
+        return {"result": "not_a_token"}
+    if not is_lower_hex(token, 64):
+        return {"result": "not_a_token"}
+    return {"result": "ok", "session_token": token}
 
 
 # ---------------------------------------------------------------------------
@@ -521,7 +566,7 @@ def encrypt_token_deterministic(ident, plaintext, eph_prv, iv):
 def build():
     idents = {}
     identity_json = {}
-    for name in ("browser", "gateway", "other"):
+    for name in ("browser", "gateway", "other", "relay_b"):
         idents[name], identity_json[name] = make_identity(name)
     idents["lowx"] = LowOrderIdentity("lowx")
     identity_json["lowx"] = idents["lowx"].describe()
@@ -693,6 +738,23 @@ def build():
                  {"client": "rns-post-interface", "implementation": "PostInterface", "mode": 6,
                   "transport": "tcp-backbone-gateway"}),
         "gateway-poll", "gateway-poll", "gateway-poll",
+    )
+
+    # --- Positive 5: a PHP relay registering at a peer relay (section 10) ---
+    relay_b_md = {"client": "reticulum-php", "implementation": "Reticulum-post", "mode": 1,
+                  "peer_url": "https://relay-b.example.org/reticulum",
+                  "peer_interface_id": label_bytes("relay_b/peer_interface_id", 16).hex(),
+                  "peer_session_token": label_bytes("relay_b/peer_session_token", 32).hex()}
+    ch = challenge("A/relay_b/seq0", "A", "relay_b", 0)
+    php_relay_body = positive(
+        "php-relay-peer",
+        "PHP relay B registering at relay A exactly as a gateway does (section 10): "
+        "signed with B's persistent relay identity (the identity file), client "
+        "reticulum-php, mode 1, peer_url = B's canonical host_url, the peer fields "
+        "random per registration. First registration, seq 0.",
+        "A", "relay_b", 0, "A/relay_b/seq0",
+        body_for("relay_b", ch, "relay-b.example.org", 1000000, 500, dict(relay_b_md)),
+        "php-relay-peer", "php-relay-peer", "php-relay-peer",
     )
 
     # -----------------------------------------------------------------------
@@ -1007,6 +1069,133 @@ def build():
     answer("answer-404", "A server without the handler (an older gateway binary) answers 404.",
            404, None, {"result": "bad_answer", "reason": "status"})
 
+    # --- The PHP relay peer (section 10) ------------------------------------
+    rb = idents["relay_b"]
+    rb_cfg = {"host_url": "https://relay-b.example.org/reticulum",
+              "interfaces_node_urls": ["https://relay-a.example.org/reticulum/",
+                                       "https://relay-c.example.org/reticulum"]}
+    rb_reg = [r for r in registrations if r["id"] == "php-relay-peer"][0]
+    rb_tok = rb_reg["encrypted_token"]
+    rb_blob = bytes.fromhex(rb_tok["session_token_encrypted_hex"])
+    rb_xprv = bytes.fromhex(identity_json["relay_b"]["x25519_private_hex"])
+    got = reference_decrypt(rb_blob, rb_xprv, rb.hash)
+    assert got == {"result": "ok", "session_token": rb_tok["plaintext_utf8"]}, got
+    decrypt_walk = {
+        "registration_id": "php-relay-peer",
+        "session_token_encrypted_hex": rb_blob.hex(),
+        "ephemeral_public_hex": rb_blob[:32].hex(),
+        "iv_hex": rb_blob[32:48].hex(),
+        "ciphertext_hex": rb_blob[48:-32].hex(),
+        "hmac_hex": rb_blob[-32:].hex(),
+        "shared_key_hex": rb_tok["shared_key_hex"],
+        "hkdf_salt_hex": rb.hash.hex(),
+        "derived_key_hex": rb_tok["derived_key_hex"],
+        "hmac_key_hex": rb_tok["hmac_key_hex"],
+        "aes_key_hex": rb_tok["aes_key_hex"],
+        "expected": got,
+    }
+    decrypt_negative = []
+
+    def dneg(did, description, blob, expected):
+        r = reference_decrypt(blob, rb_xprv, rb.hash)
+        assert r == {"result": expected}, did + ": " + json.dumps(r)
+        decrypt_negative.append({"id": did, "description": description,
+                                 "session_token_encrypted_hex": blob.hex(),
+                                 "expected": {"result": expected}})
+
+    dneg("zero-ephemeral-key", "The good blob with its ephemeral public key replaced by 32 zero "
+         "bytes: the X25519 result is all zero, so it is refused before any key is derived.",
+         bytes(32) + rb_blob[32:], "zero_shared_secret")
+    flipped = bytearray(rb_blob)
+    flipped[-1] ^= 0x01
+    dneg("hmac-flipped", "The good blob with one bit of its HMAC flipped.", bytes(flipped), "hmac")
+    dneg("other-identity", "The gateway-wake vector's token, encrypted to the gateway: the "
+         "HMAC fails under relay B's keys.",
+         bytes.fromhex(registrations[2]["encrypted_token"]["session_token_encrypted_hex"]), "hmac")
+    not_token = encrypt_token_deterministic(rb, b"not a session token",
+                                            label_bytes("ephemeral/php-relay-not-token", 32),
+                                            label_bytes("iv/php-relay-not-token", 16))
+    dneg("not-a-session-token", "A correctly encrypted blob whose plaintext is not 64 lower-case "
+         "hex: it decrypts, and is refused as a protocol error.",
+         bytes.fromhex(not_token["session_token_encrypted_hex"]), "not_a_token")
+
+    rb_nonce = label_bytes("php-relay-confirm/nonce", 16)
+    rb_confirm_body = {"version": 1, "nonce": rb_nonce.hex(), "identity_hash": rb.hash.hex(),
+                       "relay_url": relay_a_url, "peer_url": rb_cfg["host_url"]}
+    rb_msg, rb_fields = gateway_confirm_bytes(rb_confirm_body)
+    rb_handled = php_relay_handle_confirm(rb_confirm_body, rb, rb_cfg)
+    assert rb_handled["status"] == 200, rb_handled
+    rb_sig = bytes.fromhex(rb_handled["body"]["signature"])
+    assert rb.validate(rb_sig, rb_msg)
+    rb_pub = rb.get_public_key()
+    assert relay_verify_confirm_answer(rb_confirm_body, 200, rb_handled["body"], rb_pub)["result"] == "confirmed"
+    rb_refusals = []
+
+    def rbref(rid, description, body, status, error):
+        r = php_relay_handle_confirm(body, rb, rb_cfg)
+        assert r == {"status": status, "error": error}, rid + ": " + json.dumps(r)
+        rb_refusals.append({"id": rid, "description": description, "request_body": body,
+                            "expected": {"status": status, "error": error}})
+
+    rbref("not-my-identity", "A confirm for the gateway's identity, sent to relay B.",
+          dict(rb_confirm_body, identity_hash=gw.hash.hex()), 403, "not_my_identity")
+    rbref("unknown-relay", "A confirm from a relay that is not in relay B's [interfaces].",
+          dict(rb_confirm_body, relay_url="https://relay-d.example.org/reticulum"), 403, "unknown_relay")
+    rbref("not-my-wake-url", "A confirm naming relay A's URL as relay B's wake URL.",
+          dict(rb_confirm_body, peer_url=relay_a_url), 403, "not_my_wake_url")
+    rb_answer_negative = []
+    r = relay_verify_confirm_answer(rb_confirm_body, 200, {"signature": gw.sign(rb_msg).hex()}, rb_pub)
+    assert r == {"result": "bad_signature"}
+    rb_answer_negative.append({"id": "answer-gateway-key",
+                               "description": "The right bytes signed by the gateway's key, not relay B's.",
+                               "answer_status": 200, "answer_body": {"signature": gw.sign(rb_msg).hex()},
+                               "expected": r})
+
+    def link_registrant(a, b):
+        ca, cb = canonical_url(a)[0], canonical_url(b)[0]
+        return (a, b) if ca.encode("ascii") < cb.encode("ascii") else (b, a)
+
+    link_order = []
+    for a, b, note in [
+        ("https://relay-a.example.org/reticulum", "https://relay-b.example.org/reticulum", "the vectors' two relays"),
+        ("https://selectivesubconscious.com/reticulum", "https://retichat.com/reticulum", "the live pair"),
+        ("https://relay-a.example.org:8443/reticulum", "https://relay-a.example.org/reticulum", "'/' (0x2f) sorts before ':' (0x3a)"),
+        ("https://Relay-B.example.org/reticulum/", "https://relay-a.example.org/reticulum", "compared in canonical form"),
+    ]:
+        keep, down = link_registrant(a, b)
+        link_order.append({"relay_1": a, "relay_2": b, "note": note,
+                           "canonical_1": canonical_url(a)[0], "canonical_2": canonical_url(b)[0],
+                           "link_is_registration_of": canonical_url(keep)[0],
+                           "stands_down": canonical_url(down)[0]})
+    assert link_order[1]["link_is_registration_of"] == "https://retichat.com/reticulum"
+
+    php_relay_peer = {
+        "identity": "relay_b",
+        "identity_file_hex": identity_json["relay_b"]["private_key_hex"],
+        "identity_file_layout": "x25519_private(32) || ed25519_seed(32): the 64 bytes RNS Identity.to_file writes",
+        "identity_hash_hex": rb.hash.hex(),
+        "config": rb_cfg,
+        "registration_id": "php-relay-peer",
+        "decrypt": decrypt_walk,
+        "decrypt_negative": decrypt_negative,
+        "confirm": {
+            "id": "php-relay-confirm",
+            "description": "Relay A confirms relay B's wake URL (its canonical host_url) after B's "
+                           "registration, before it ever wakes B. B's [interfaces] writes relay A's "
+                           "node_url with a trailing slash: it compares canonical forms.",
+            "request_url": rb_cfg["host_url"] + GATEWAY_CONFIRM_PATH,
+            "request_body": rb_confirm_body,
+            "signed_fields": [{"name": n, "value_hex": v.hex(), "lp_hex": lp(v).hex()} for n, v in rb_fields],
+            "signed_bytes_hex": rb_msg.hex(),
+            "signature_hex": rb_sig.hex(),
+            "response_body": {"signature": rb_sig.hex()},
+            "expected_relay": {"result": "confirmed"},
+        },
+        "confirm_refusals": rb_refusals,
+        "confirm_answer_negative": rb_answer_negative,
+        "link_order": link_order,
+    }
+
     gateway_confirm = {
         "domain": GATEWAY_CONFIRM_DOMAIN.decode(),
         "domain_hex": GATEWAY_CONFIRM_DOMAIN.hex(),
@@ -1040,7 +1229,7 @@ def build():
 
     return {
         "spec": "Reticulum-post/REGISTRATION.md",
-        "format_version": 4,
+        "format_version": 5,
         "generator": "Reticulum-post/tools/registration_vectors.py (RNS " + RNS.__version__ + ")",
         "note": "Every byte below is derived from fixed labels; regenerate with the "
                 "generator, never by hand. Hex is lower-case throughout.",
@@ -1063,6 +1252,7 @@ def build():
         "tokens_negative": tokens_negative,
         "url_canonical": url_canonical,
         "gateway_confirm": gateway_confirm,
+        "php_relay_peer": php_relay_peer,
     }
 
 
