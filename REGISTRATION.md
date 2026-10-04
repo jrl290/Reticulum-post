@@ -4,10 +4,18 @@
 > below follows it: events, not timers; no retries; no timeouts as a fix;
 > strict ordering; §1's 5 seconds.
 
-**Status:** specification, revision 4, 2026-10-03. Not implemented.
+**Status:** specification, revision 5, 2026-10-03. Not implemented.
 
-Revision 4 applies James's answers of the same day to revision 3's questions
-(§16.2):
+Revision 5 applies James's answer to revision 4's one question, "Re-confirm
+every time" (§16.2). Every signed gateway registration starts a new wake-URL
+confirm, even with the URL unchanged. The bind clears the row's confirmation,
+and the row is not woken until the new confirm succeeds (§4.4, §9.8). §9.8
+now also says what ends wakes to a gateway that stops altogether: nothing in
+the row's lifetime does, so a signed gateway row gets at most one wake
+between two of its own exchanges.
+
+Revision 4 (8272c09), earlier the same day, applied James's answers to
+revision 3's questions:
 
 - **Confirm a gateway's wake URL first.** James: "Confirm it first." Before a
   relay wakes a signed gateway row, the gateway's own wake server answers a
@@ -22,8 +30,7 @@ Revision 4 applies James's answers of the same day to revision 3's questions
   Phase 3c (§11.2, §16.2).
 
 Revision 3 (62f5369), earlier the same day, applied James's answers to
-revision 2's questions. §18 maps every decision of both revisions to the
-sections it changed.
+revision 2's questions:
 
 - **No audience.** James: "Don't we have ssl to prevent spoofing?" The relay's
   host is no longer signed, the signed bytes are twelve fields again, and
@@ -42,9 +49,10 @@ sections it changed.
 - The newest registration still wins (`409 session_superseded`, §6.1), and
   the two enforcement switches stand (§11.1).
 
-Revision 2 (a5abab7) answered the adversarial review of revision 1 (26a8fef).
-§17 records that. Reticulum-post `main` is at bae739a. The §0.1 hotfix shipped
-as d3a0eb5 and is deployed.
+§18 maps every decision of revisions 3 to 5 to the sections it changed.
+Revision 2 (a5abab7) answered the adversarial review of revision 1 (26a8fef),
+and §17 records that. Reticulum-post's code is at bae739a; the spec commits
+since then change no code. The §0.1 hotfix shipped as d3a0eb5 and is deployed.
 
 **Normative for:**
 
@@ -521,8 +529,7 @@ the collation cannot fold two values together (§12.2).
          name = :name, bitrate = :bitrate, mtu = :mtu,
          status = :online, metadata_json = :metadata_json, last_seen_at = :now,
          updated_at = :now, registration_seq = :next_seq,
-         wake_url_confirmed_key = CASE WHEN peer_url_key = :peer_url_key_was
-                                       THEN wake_url_confirmed_key ELSE NULL END,
+         wake_url_confirmed_key = NULL, wake_outstanding = 0,
          peer_url = :peer_url, peer_url_key = :peer_url_key,
          peer_interface_id = :peer_interface_id,
          peer_session_token = :peer_session_token
@@ -535,18 +542,16 @@ the collation cannot fold two values together (§12.2).
   so MySQL's "affected rows" equals "matched rows". No
   `PDO::MYSQL_ATTR_FOUND_ROWS` is needed.
 
-  `:peer_url_key_was` binds the same value as `:peer_url_key` (a named
-  placeholder appears once per statement, `unique_named_placeholders_test.php`).
-  The `CASE` keeps a gateway's wake-URL confirmation (§9.8) only when the URL
-  is unchanged. It is assigned **before** `peer_url_key`: MySQL and MariaDB
-  evaluate single-table `SET` assignments left to right, so a later assignment
-  sees an earlier one's new value, while SQLite always sees the old values. In
-  this order both engines compare with the old key. The INSERT (seq 0) leaves
-  `wake_url_confirmed_key` NULL.
+  Every signed re-bind clears the gateway's wake-URL confirmation and its
+  outstanding wake (§9.8), whether or not the URL changed (James,
+  2026-10-03: "Re-confirm every time"). For a browser row both are already
+  NULL and 0. Both are plain constants, so the order of `SET` assignments does
+  not matter. Revision 4's `CASE`, which read `peer_url_key` and so had to come
+  before its assignment (MySQL and MariaDB evaluate single-table `SET` left to
+  right, SQLite does not), is gone. The INSERT (seq 0) leaves them NULL and 0.
 
-  After the bind commits, a signed `reticulum-php` row whose
-  `wake_url_confirmed_key` is not its `peer_url_key` starts the wake-URL
-  confirm (§9.8). The registration's answer does not wait for it.
+  After the bind commits, every signed `reticulum-php` row starts the
+  wake-URL confirm (§9.8). The registration's answer does not wait for it.
 
 The interface keeps its `interface_id` across re-registrations, so its queue,
 paths and links survive a re-registration and, for the gateway, a restart.
@@ -605,7 +610,7 @@ adoption the critique ruled out (A7).
   - the signed `peer_*` fields in their existing columns, with `peer_url`
     stored in canonical form (§10.1) and its `peer_url_key`;
   - `wake_url_confirmed_key`, written only by the §9.8 confirm and cleared by
-    §4.4 when the URL changes;
+    every signed re-bind (§4.4), and `wake_outstanding` (§9.8's wake rule);
   - `name`, `bitrate` and `mtu`.
 - **`metadata_json`:** only `client`, `implementation`, `mode` and
   `transport`.
@@ -888,8 +893,8 @@ Transit rows, and only transit rows:
 - skip the identity guard (§8.2), because they carry other identities'
   announces;
 - count as always active, and are woken at their stored `peer_url`, when they
-  have one and, for a signed gateway row, only once that URL is confirmed
-  (§9.8). This replaces `isPhpPeerInterface()`, which keyed on non-null
+  have one and, for a signed gateway row, only under §9.8's wake rule (its
+  URL confirmed since its last registration, and no wake outstanding). This replaces `isPhpPeerInterface()`, which keyed on non-null
   `peer_url` and `peer_interface_id` columns that any registrant could fill;
 - never create local bindings, as today.
 
@@ -1194,15 +1199,18 @@ signature  2085e0334b54b74f152457865c7e4ac4d18059d0c67eef051fa5902bac469a8f
 
 **The relay.**
 
-1. **When.** After a signed bind of a `reticulum-php` row commits (§4.4),
-   when the row's `wake_url_confirmed_key` is not its `peer_url_key`. A
-   re-registration that keeps a confirmed URL (a gateway restart) starts
-   nothing.
+1. **When: every signed registration.** After every signed bind of a
+   `reticulum-php` row commits (§4.4), even with the URL unchanged (James,
+   2026-10-03: "Re-confirm every time"). The bind has already cleared the
+   row's confirmation, so from that commit the row is not woken until this
+   confirm succeeds. Anything queued for it in the gap goes out in the one
+   wake sent at confirm time (step 5).
 2. **Pending record.** Upsert `gateway_wake_confirms` for the row's
    `interface_id`, one record per row: the canonical `peer_url` and
-   `peer_url_key` just stored, `nonce_hex` = 16 random bytes in hex, and
-   `created_at`. A newer registration replaces the record, and the older
-   runner's result is then discarded (step 5). At most **64** records exist
+   `peer_url_key` just stored, the `registration_seq` the bind set,
+   `nonce_hex` = 16 random bytes in hex, and `created_at`. A newer
+   registration replaces the record, and the older runner's result is then
+   discarded (step 5). At most **64** records exist
    in all. When 64 records of other rows already exist, no record is made,
    the row stays unconfirmed, and the relay logs
    `[GW-WAKE-CONFIRM-BACKLOG] identity=<H>`. The registration still
@@ -1230,12 +1238,16 @@ signature  2085e0334b54b74f152457865c7e4ac4d18059d0c67eef051fa5902bac469a8f
    `DELETE FROM gateway_wake_confirms WHERE interface_id = :id AND nonce_hex = :n`,
    requiring `rowCount() = 1` (otherwise a newer record replaced this one:
    log `[GW-WAKE-CONFIRM-STALE]` and stop), then
-   `UPDATE interfaces SET wake_url_confirmed_key = :k WHERE interface_id = :id AND peer_url_key = :k2 AND registration_proof = 'signed'`
-   (`:k2` binds the record's key again). `rowCount() = 0` means the URL changed
-   after the confirm was sent: log `[GW-WAKE-CONFIRM-STALE]` and change
-   nothing. Otherwise log `[GW-WAKE-CONFIRMED] identity=<H> key=<8>`, and if
-   the row has queued outbound packets, send it one wake, so what queued
-   before the confirm moves at once.
+   `UPDATE interfaces SET wake_url_confirmed_key = :k WHERE interface_id = :id AND registration_seq = :seq AND registration_proof = 'signed'`
+   with the record's key and seq. `rowCount() = 0` means a newer registration
+   bound the row after this confirm was sent, whether or not it changed the
+   URL: log `[GW-WAKE-CONFIRM-STALE]` and change nothing. The seq, not the
+   URL, is what makes this exact. A newer registration with the same URL
+   can commit its bind (clearing the confirmation) before it replaces the
+   record, and in that window the DELETE above still succeeds. Otherwise log
+   `[GW-WAKE-CONFIRMED] identity=<H> key=<8>`, and if the row has queued
+   outbound packets, send it one wake, so what queued before the confirm,
+   including during the gap since the bind, moves at once.
 6. **Not confirmed.** A network failure, any other answer, or a signature
    that does not verify: delete the record by `(interface_id, nonce_hex)`,
    log `[GW-WAKE-CONFIRM-FAIL] identity=<H> key=<8> -> <status> <reason>`
@@ -1247,10 +1259,46 @@ signature  2085e0334b54b74f152457865c7e4ac4d18059d0c67eef051fa5902bac469a8f
    packets for it wait in its queue for the next one. `/health` shows the
    row's `wake_confirmed` (§12.5).
 
-**Wake rule.** A signed gateway row is woken only while its
-`wake_url_confirmed_key` equals its `peer_url_key`, and only at its stored
-`peer_url`. PHP-peer URL rows are proven by §10. Legacy (`none`) rows are woken
-as today until `enforce_signed_transit` (§16.1.2).
+**Wake rule.** A signed gateway row is woken only at its stored `peer_url`,
+only while its `wake_url_confirmed_key` equals its `peer_url_key`, and only
+while it has no outstanding wake (`wake_outstanding = 0`):
+
+- a wake that left, meaning its request was written in full, sets
+  `wake_outstanding`. A wake that did not leave is already reported as
+  `[WAKE-DROP]` (connect, handshake or write failure,
+  `fireAndForgetWakeWithSocket`, `request_php_wake_trait.php:162-232`). It
+  sets nothing;
+- an authenticated exchange from the row, and its next signed bind (§4.4),
+  clear it.
+
+So a gateway gets at most one wake between two of its own exchanges. A live
+gateway answers a wake with an exchange, which allows the next one. If a
+wake that left is lost, relay-to-gateway traffic waits for the gateway's next
+exchange, which its own outbound packets drive (§9 step 5).
+
+PHP-peer URL rows are proven by §10. Legacy (`none`) rows are woken as today
+until `enforce_signed_transit` (§16.1.2).
+
+**What ends wakes to a gateway that stops.** Nothing in the row's lifetime
+does. A signed row is permanent (§12.4, §12.5). At bae739a every peer row
+receives every relayed announce whatever its status (`allOtherInterfaceIds`,
+`request_relay_routing_trait.php:933-949`). Pending outbound packets are never
+expired (`request_maintenance_trait.php:80`). And `dispatchWakes` wakes every
+peer row with pending outbound at most once per `min_wake_interval_ms`
+(`request_php_wake_trait.php:75-113`). Without the rule above, a gateway that
+stopped would be woken at its last confirmed URL for as long as the row
+exists. With it:
+
+- **At most one wake is delivered after the gateway's last exchange.** A
+  host that later takes over its name (a lapsed dynamic-DNS name) and accepts
+  connections on that port receives at most that one wake: a fixed body
+  carrying no credentials.
+- **Every later attempt fails before anything is sent**, or is not made. A
+  name that no longer resolves, or a host that refuses, is a `[WAKE-DROP]`
+  each time: nothing leaves, and it costs this relay one failed connect per
+  `min_wake_interval_ms`, as any dead peer does today.
+- **The row's own wakes end** only when its gateway registers again (which
+  confirms afresh) or an operator deletes the row (§12.5).
 
 **The gateway.** Its wake server (Rust `PostInterface::wake_server`, Python
 `PostInterface._start_wake_server`) answers `POST /v1/gateway/confirm`.
@@ -1287,12 +1335,12 @@ as today until `enforce_signed_transit` (§16.1.2).
   for each it refuses, with the code.
 
 **When the wake URL changes.** `wake_url` is configuration, read at start, so
-a change means a restart, and the restart's signed registration names the new
-`peer_url`. The bind clears `wake_url_confirmed_key` in the same UPDATE (§4.4).
-From that commit the relay wakes neither URL: not the old one, which the row
-no longer names, and not the new one until its confirm lands. A confirm still
-in flight for the old URL fails at the gateway (check 4) or at the relay's
-`UPDATE` (step 5).
+a change means a restart. The restart's signed registration names the new
+`peer_url` and, like every signed registration, clears the confirmation in
+its bind (§4.4) and starts a confirm. The relay then wakes neither URL: not
+the old one, which the row no longer names, and not the new one until its
+confirm lands. A confirm still in flight for the old URL fails at the gateway
+(check 4) or at the relay (step 5).
 
 Vectors: `gateway_confirm` (§14).
 
@@ -1839,10 +1887,11 @@ again.
 | `interfaces.peer_url_key` | `VARCHAR(64) DEFAULT NULL` + `CREATE INDEX idx_interfaces_peer_url_key …` (not unique: a signed gateway row and a legacy row may name one URL until §4.5 retires the legacy one) |
 | `interfaces.previous_session_token_hash` | `VARCHAR(64) DEFAULT NULL` |
 | `interfaces.peer_state` | `VARCHAR(64) DEFAULT NULL` |
-| `interfaces.wake_url_confirmed_key` | `VARCHAR(64) DEFAULT NULL`: the `peer_url_key` §9.8 confirmed for a signed gateway row |
+| `interfaces.wake_url_confirmed_key` | `VARCHAR(64) DEFAULT NULL`: the `peer_url_key` §9.8 confirmed for a signed gateway row since its last registration |
+| `interfaces.wake_outstanding` | `TINYINT NOT NULL DEFAULT 0`: a wake left for this signed gateway row and it has not exchanged since (§9.8) |
 | `peer_registration_nonces` | `peer_url_key VARCHAR(64) NOT NULL PRIMARY KEY, peer_url VARCHAR(512) NOT NULL, nonce_hex VARCHAR(32) NOT NULL, local_interface_id VARCHAR(64) NOT NULL, next_session_token VARCHAR(128) NOT NULL, created_at INT NOT NULL DEFAULT 0` |
 | `peer_registration_pending` | `peer_url_key VARCHAR(64) NOT NULL, nonce_hex VARCHAR(32) NOT NULL, peer_url VARCHAR(512) NOT NULL, peer_interface_id VARCHAR(64) NOT NULL, peer_session_token VARCHAR(128) NOT NULL, new_interface_id VARCHAR(64) NOT NULL, new_session_token VARCHAR(128) NOT NULL, created_at INT NOT NULL DEFAULT 0, PRIMARY KEY (peer_url_key, nonce_hex)` + an index on `new_interface_id` |
-| `gateway_wake_confirms` | `interface_id VARCHAR(64) NOT NULL PRIMARY KEY, peer_url_key VARCHAR(64) NOT NULL, peer_url VARCHAR(512) NOT NULL, nonce_hex VARCHAR(32) NOT NULL, created_at INT NOT NULL DEFAULT 0` (§9.8) |
+| `gateway_wake_confirms` | `interface_id VARCHAR(64) NOT NULL PRIMARY KEY, peer_url_key VARCHAR(64) NOT NULL, peer_url VARCHAR(512) NOT NULL, registration_seq BIGINT NOT NULL, nonce_hex VARCHAR(32) NOT NULL, created_at INT NOT NULL DEFAULT 0` (§9.8) |
 | `transport_state` row | `registration_challenge_secret_hex` |
 
 Revision 3 adds `peer_registration_pending.peer_url`, the canonical URL the
@@ -1850,6 +1899,8 @@ confirm goes to (§10.5). Revision 2 took it from the config, which an open
 peering may not have. No column is removed: the accept-list and
 `transit_identities` were config, never schema. Revision 4 adds
 `interfaces.wake_url_confirmed_key` and `gateway_wake_confirms` (§9.8).
+Revision 5 adds `interfaces.wake_outstanding` and
+`gateway_wake_confirms.registration_seq`.
 
 ### 12.2 Lookups never compare free text (A9)
 
@@ -1963,6 +2014,7 @@ public. Logs give them in full or as 8-hex prefixes.
 | `[PEER-REGISTER]`, `[PEER-REGISTER-LEGACY]`, `[PEER-CONFIRM]`, `[PEER-CONFIRMED-BY]`, `[PEER-CONFIRM-FAIL]`, `[PEER-CONFIRM-LATE]`, `[PEER-PROMOTE-MISMATCH]`, `[PEER-HTTP]`, `[PEER-SUPERSEDED]`, `[PEER-401-UNCONFIGURED]`, `[WAKE-UNKNOWN-PEER]` | §10. `exchangeWithPhpPeer` logs every non-2xx as `[PEER-HTTP] <url> -> <status> <error>`, and `httpPostJson` must return the status, not `null`. |
 | `[WAKE-REFUSED]` | a wake whose `waker_url` does not match the stored URL (§0.1; live since d3a0eb5) |
 | `[GW-WAKE-CONFIRM]`, `[GW-WAKE-CONFIRMED]`, `[GW-WAKE-CONFIRM-FAIL]`, `[GW-WAKE-CONFIRM-LATE]`, `[GW-WAKE-CONFIRM-STALE]`, `[GW-WAKE-CONFIRM-BACKLOG]`, each with `identity=<H>` and, where there is a URL, `key=<8>` | §9.8 |
+| `[WAKE-DROP]` | a wake that did not leave (existing); for a signed gateway row it leaves `wake_outstanding` unset (§9.8) |
 | `[ANNOUNCE-FOREIGN]`, `[ANNOUNCE-LEGACY-REFUSED]` | §8 |
 | `[SCHEMA-PEER-URL]` | §12.3 |
 
@@ -2005,6 +2057,9 @@ challenges, nonces, MACs, pinned encrypted tokens, token negatives and
 canonical URLs are byte-identical, because none of them depended on the
 audience. What changed from format 3 (revision 4): only the new
 `gateway_confirm` section and the format number. Every other byte is the same.
+Revision 5 changes no byte: re-confirming at every registration and the
+outstanding-wake rule change when a confirm runs and when a wake is sent, not
+what is signed.
 
 How the file was checked when it was committed (revision 4):
 
@@ -2154,7 +2209,7 @@ Reticulum-post, against the real traits (SQLite in memory or `php -S`):
   `wake_exchanges_only_with_stored_peer_url_test.php` does:
   - an unconfirmed signed gateway row is never woken: with packets queued for
     it, `dispatchWakes` sends it nothing, before the confirm, after a failed
-    one, and after a URL change;
+    one, after a re-registration with the same URL, and after a URL change;
   - the confirm goes only to the stored canonical `peer_url` plus
     `/v1/gateway/confirm`. The stand-ins see exactly one POST per runner, to
     that URL, whatever form the registration wrote the URL in, and never to a
@@ -2167,12 +2222,24 @@ Reticulum-post, against the real traits (SQLite in memory or `php -S`):
     it, and the first runner's success is discarded); with 64 records of
     other rows, a registration still answers `200`, makes no record, spawns
     no runner, and logs `[GW-WAKE-CONFIRM-BACKLOG]`;
-  - a re-registration with the same confirmed URL starts no confirm and keeps
-    the row woken. One with a new URL clears the confirmation in the bind's
-    UPDATE, wakes neither URL, and confirms the new one. A confirm for the old
-    URL that lands afterwards logs `[GW-WAKE-CONFIRM-STALE]` and confirms
-    nothing. A static check pins the `SET` order of §4.4, which SQLite cannot
-    show;
+  - **re-confirm every time:** a re-registration with the same, confirmed URL
+    clears the confirmation and `wake_outstanding` in the bind's UPDATE (on
+    SQLite: §4.4's assignments are now constants, so no engine-specific `SET`
+    order is left to pin), starts exactly one confirm, and wakes nothing until
+    that confirm succeeds. Packets queued in the gap go out in the one wake
+    sent at confirm time. One with a new URL does the same, and wakes neither
+    URL in the gap;
+  - **a stale confirm is discarded:** the previous registration's confirm,
+    for the same URL, landing after the new bind confirms nothing and logs
+    `[GW-WAKE-CONFIRM-STALE]`. That holds both when it lands after the new
+    record replaced its own (the `DELETE` fails) and when it lands between the
+    new bind and the new record (the `registration_seq` in the `UPDATE`
+    fails). The same holds for a confirm for an old URL;
+  - **one outstanding wake:** after a wake that left, the row is not woken
+    again until its next authenticated exchange or signed bind, however many
+    packets queue; a wake reported `[WAKE-DROP]` leaves it wakeable; and a
+    gateway that stops exchanging receives exactly one wake after its last
+    exchange, then none, with packets still queued;
   - legacy `reticulum-php` rows and `local`/`confirmed` URL rows are woken
     exactly as before.
 - **`peer_session_rotation_test.php`** stays green. It drives the connect and
@@ -2306,16 +2373,23 @@ pass on the fixed refs.
    claims. This is the exposure of any open RNS transport interface: payloads
    stay end-to-end encrypted, but delivery can be denied and link metadata
    seen. James accepted open peering on 2026-10-03.
-10. **A gateway's wake URL is proven once per URL.** Revision 3 woke a signed
-    gateway row at its unproven `peer_url` (A15). Revision 4 confirms it first
-    (§9.8, James 2026-10-03: "Confirm it first"). What remains:
-    - a URL stays confirmed while the gateway re-registers with it. If the
-      host behind it later changes hands (a lapsed dynamic-DNS name), the
-      relay's wakes (a fixed body with no credentials) go there until the
-      gateway registers a different URL;
-    - confirms go to unproven URLs by design, from detached runners, at most
-      64 at once and one per registration. A tarpit holds a runner, not a PHP
-      worker, until curl's ceiling;
+10. **A gateway's wake URL is proven at every registration.** Revision 3 woke
+    a signed gateway row at its unproven `peer_url` (A15). Revision 4
+    confirmed it first (§9.8, James 2026-10-03: "Confirm it first"), and
+    revision 5 confirms it again at every signed registration (James: "Re-confirm
+    every time"). What remains:
+    - **after a gateway stops altogether, at most one wake is delivered.** No
+      row lifetime ends a signed gateway row's wakes (§9.8, "What ends
+      wakes"). The outstanding-wake rule does: a host that takes over a lapsed
+      name receives at most one fixed, credential-free wake. Later attempts
+      fail before anything is sent, each a `[WAKE-DROP]` that costs this relay
+      one failed connect per `min_wake_interval_ms`, until the gateway
+      registers again or an operator deletes the row;
+    - **each registration opens a short no-wake gap** until its confirm lands.
+      The one wake at confirm time carries what queued;
+    - **confirms go to unproven URLs by design**, from detached runners, at
+      most 64 at once and one per registration. A tarpit holds a runner, not a
+      PHP worker, until curl's ceiling;
     - legacy `reticulum-php` rows are still woken at unproven URLs, as today,
       until `enforce_signed_transit` (item 2).
 11. **The table can fill with permanent rows.** Signed rows (a fresh key each)
@@ -2367,6 +2441,12 @@ James answered revision 3's questions the same day:
 | 4. §8.5's routing cost: add gravity, or not? | "Leave it, watch it" | §11.2's Phase 1 note; §16.1.13. Gravity is the fix if it ever matters |
 | 1. `reticulum-post` (`[post_interface_peers]`) | Still open | Below |
 
+James answered revision 4's question the same day:
+
+| Revision 4 asked | James decided | Revision 5 |
+|---|---|---|
+| A confirmation lasted while the URL was unchanged, so a restart was not re-confirmed, and a lapsed name behind a confirmed URL kept being woken. Re-confirm on every registration? | "Re-confirm every time" | §4.4 clears the confirmation at every signed bind; §9.8 starts a confirm at every signed registration, with the CAS on `registration_seq`; §9.8 states what ends wakes to a gateway that stops, and bounds it with one outstanding wake; §16.1.10 |
+
 Still open:
 
 1. **`reticulum-post` (`[post_interface_peers]`)** has no path once
@@ -2416,7 +2496,7 @@ decisions of 2026-10-03, and §18 says how.
 
 ---
 
-## 18. Revisions 3 and 4: James's decisions of 2026-10-03
+## 18. Revisions 3 to 5: James's decisions of 2026-10-03
 
 | Decision | What changed |
 |---|---|
@@ -2430,6 +2510,7 @@ decisions of 2026-10-03, and §18 says how.
 | **Keep the initiator rule, revisit later** (revision 4) | §10.3 records it; §16.1.12 marks the gap a known limit, to revisit with POST Reticulum hosting. |
 | **§8.5's cost: leave it, watch it** (revision 4) | §8.5, §11.2's Phase 1 note and §16.1.13 record it; gravity is the fix if it ever matters. |
 | **`[post_interface_peers]` stays open** (revision 4) | §16.2; the live configs are checked before Phase 3c, and §11.2's Phase 3c gate includes it. |
+| **Re-confirm every time** (revision 5) | §4.4: every signed re-bind sets `wake_url_confirmed_key = NULL, wake_outstanding = 0`, so the `CASE` and its `SET`-order note are gone. §9.8: a confirm at every signed registration; the record carries `registration_seq`, and step 5's `UPDATE` matches on it; "What ends wakes to a gateway that stops" and the outstanding-wake rule. §12.1 (two columns), §13, §15, §16.1.10, §16.2. No vector bytes change. |
 
 Revision 3 also had to change these, because the decisions above required
 them. James did not decide them, and §16.2 or this list is where to object:
@@ -2468,6 +2549,7 @@ decide:
 - **A confirmation lasts while the URL is unchanged**: a gateway restart with
   the same URL is not confirmed again. A URL change clears it in the bind's
   UPDATE, with the `SET` order that MySQL's left-to-right evaluation needs.
+  *(Superseded by revision 5: James chose "Re-confirm every time".)*
 - **No confirm retry.** A failed confirm waits for the gateway's next signed
   registration (§3 of the principles).
 - **One wake at confirm time** when packets are queued, so what waited moves
@@ -2476,3 +2558,21 @@ decide:
   (§5 of the principles).
 - **New state:** `interfaces.wake_url_confirmed_key`, the
   `gateway_wake_confirms` table, and `/health`'s `wake_confirmed`.
+
+Revision 5's "Re-confirm every time" also required these, which James did
+not decide:
+
+- **The stale-confirm check uses `registration_seq`, not the URL.** With the
+  URL unchanged, a previous registration's confirm can land between the new
+  bind and the new record, where the `DELETE` by nonce still succeeds. Only
+  the seq tells the two registrations apart.
+- **One outstanding wake per signed gateway row** (§9.8's wake rule). Asked
+  what ends wakes to a gateway that stops altogether: nothing in the row's
+  lifetime does. Signed rows are permanent, peer rows get every relayed
+  announce whatever their status, pending packets never expire, and
+  `dispatchWakes` wakes any peer row with pending packets. The event that
+  bounds it is the gateway's own exchange: at most one wake that left between
+  two of its exchanges. The cost: a wake that left but was lost delays
+  relay-to-gateway traffic until the gateway's next exchange.
+- **New state:** `interfaces.wake_outstanding` and
+  `gateway_wake_confirms.registration_seq`.
