@@ -12,8 +12,10 @@
  * signature, re-derives every canonical peer URL, checks the gateway
  * wake-URL confirm (section 9.8) with its own gateway handler and relay
  * answer verifier, checks the PHP relay peer (section 10: identity file,
- * token decryption as the PHP client does it, confirm handler, link order),
- * and runs a
+ * token decryption as the PHP client does it, confirm handler, link order,
+ * and since revision 7 its transport id: the identity file's hash, the
+ * pre-switch id kept as its own, and packets put into transport through
+ * each), and runs a
  * REFERENCE verifier (REGISTRATION.md section 4.3, in its normative order)
  * over every positive and negative vector, comparing the HTTP status, the
  * error code and the step that fails. The reference verifier is deliberately
@@ -456,7 +458,7 @@ function decryptToken(string $blob, string $x25519Private, string $identityHash)
 $expect($doc['constants']['register_domain'] === REGISTER_DOMAIN, 'register domain');
 $expect($doc['constants']['challenge_domain'] === CHALLENGE_DOMAIN, 'challenge domain');
 $expect($doc['constants']['challenge_length'] === CHALLENGE_BYTES, 'challenge length');
-$expect($doc['format_version'] === 5, 'format 5 (revision 3: no audience; revision 4: the gateway confirm; revision 6: the PHP relay peer)');
+$expect($doc['format_version'] === 6, 'format 6 (revision 3: no audience; revision 4: the gateway confirm; revision 6: the PHP relay peer; revision 7: its transport id)');
 $expect($doc['constants']['signed_field_order'] === ['domain', 'challenge', 'public_key', 'name', 'bitrate', 'mtu', 'client', 'mode', 'transport', 'peer_url', 'peer_interface_id', 'peer_session_token'], 'the twelve signed fields, in order');
 foreach ($doc['lp_examples'] as $ex) {
     $in = isset($ex['input_utf8']) ? $ex['input_utf8'] : (string) hex2bin($ex['input_hex']);
@@ -691,6 +693,46 @@ if (is_array($pr)) {
         $expect($c1 === $l['canonical_1'] && $c2 === $l['canonical_2'] && $l['link_is_registration_of'] === $first && $l['stands_down'] === $second,
             'php relay link order: ' . $l['note']);
     }
+
+    // Revision 7: the transport id is the identity file's hash; the
+    // pre-switch id stays the relay's own; nothing else is.
+    $tid = $pr['transport_id'] ?? null;
+    $expect(is_array($tid), 'php relay transport id: section present (revision 7)');
+    if (is_array($tid)) {
+        $expect($tid['transport_id_hex'] === bin2hex($rbHash), 'php relay transport id: the identity file\'s hash (section 10.2)');
+        $pre = (string) hex2bin($tid['pre_switch_transport_id_hex']);
+        $expect(strlen($pre) === 16 && !hash_equals($rbHash, $pre), 'php relay transport id: a distinct 16-byte pre-switch id');
+        $ownIds = [$rbHash, $pre];
+        $expect($tid['own_transport_ids_hex'] === [bin2hex($rbHash), bin2hex($pre)], 'php relay transport id: its own ids are the transport id and the pre-switch id, and only those');
+        $sent = (string) hex2bin($tid['sent']['raw_hex']);
+        $sentHash = hash('sha256', chr(ord($sent[0]) & 0x0F) . substr($sent, 2), true);
+        $expect((ord($sent[0]) >> 6) === 0 && (ord($sent[0]) & 0x03) === 2 && bin2hex(substr($sent, 2, 16)) === $tid['sent']['destination_hash_hex'],
+            'php relay transport id: the sent packet is a HEADER_1 link request for its destination');
+        $expect(bin2hex($sentHash) === $tid['sent']['packet_hash_hex'], 'php relay transport id: the sent packet\'s hash');
+        $packetCount = 0;
+        foreach ($tid['packets'] as $pk) {
+            $packetCount++;
+            $raw = (string) hex2bin($pk['raw_hex']);
+            $nextHop = (string) hex2bin($pk['next_hop_hex']);
+            $built = chr((1 << 6) | (1 << 4) | (ord($sent[0]) & 0x0F)) . $sent[1] . $nextHop . substr($sent, 2);
+            $expect($raw === $built, "transport packet {$pk['id']}: put into transport as RNS Transport.outbound does");
+            $h = $pk['header'];
+            $expect($h['flags_hex'] === bin2hex($raw[0]) && $h['hops'] === ord($raw[1]) && $h['transport_id_hex'] === bin2hex(substr($raw, 2, 16))
+                && $h['destination_hash_hex'] === bin2hex(substr($raw, 18, 16)) && $h['context_hex'] === bin2hex($raw[34]),
+                "transport packet {$pk['id']}: header fields");
+            $carried = substr($raw, 2, 16);
+            $own = false;
+            foreach ($ownIds as $id) {
+                $own = $own || hash_equals($id, $carried);
+            }
+            $want = $own ? ['own' => true] : ['own' => false, 'filter' => 'transport_id_mismatch'];
+            $expect(($pk['expected'] ?? null) === $want, "transport packet {$pk['id']}: expected " . json_encode($want) . ', file says ' . json_encode($pk['expected'] ?? null));
+            $hash = hash('sha256', chr(ord($raw[0]) & 0x0F) . substr($raw, 18), true);
+            $expect(bin2hex($hash) === $pk['packet_hash_hex'] && hash_equals($sentHash, $hash), "transport packet {$pk['id']}: its hash leaves the transport id out");
+        }
+        $ownCount = count(array_filter($tid['packets'], static fn (array $pk): bool => ($pk['expected']['own'] ?? null) === true));
+        $expect($packetCount === 3 && $ownCount === 2, 'php relay transport id: three packets, two of them own');
+    }
 }
 
 // Revision 3: nothing in the file carries an audience.
@@ -704,8 +746,9 @@ if ($failures !== []) {
     exit(1);
 }
 
-printf("PASS: %d checks (%d registrations, %d negative, %d token negatives, %d URLs, gateway confirm: 1 positive, %d refusals, %d answer negatives; php relay peer: %d decrypt negatives, %d confirm refusals, %d link orders) with PHP %s sodium/openssl\n",
+printf("PASS: %d checks (%d registrations, %d negative, %d token negatives, %d URLs, gateway confirm: 1 positive, %d refusals, %d answer negatives; php relay peer: %d decrypt negatives, %d confirm refusals, %d link orders, %d transport-id packets) with PHP %s sodium/openssl\n",
     $checks, count($doc['registrations']), count($doc['negative']), count($doc['tokens_negative']),
     count($doc['url_canonical']), count($gc['gateway_refusals'] ?? []), count($gc['answer_negative'] ?? []),
-    count($pr['decrypt_negative'] ?? []), count($pr['confirm_refusals'] ?? []), count($pr['link_order'] ?? []), PHP_VERSION);
+    count($pr['decrypt_negative'] ?? []), count($pr['confirm_refusals'] ?? []), count($pr['link_order'] ?? []),
+    count($pr['transport_id']['packets'] ?? []), PHP_VERSION);
 exit(0);

@@ -1,6 +1,6 @@
 {
   "spec": "Reticulum-post/REGISTRATION.md",
-  "format_version": 5,
+  "format_version": 6,
   "generator": "Reticulum-post/tools/registration_vectors.py (RNS 1.5.2)",
   "note": "Every byte below is derived from fixed labels; regenerate with the generator, never by hand. Hex is lower-case throughout.",
   "constants": {
@@ -2245,6 +2245,76 @@
         "link_is_registration_of": "https://relay-a.example.org/reticulum",
         "stands_down": "https://relay-b.example.org/reticulum"
       }
-    ]
+    ],
+    "transport_id": {
+      "rule": "REGISTRATION.md section 10.2 (revision 7): the transport id is the identity hash, SHA-256(x25519_pub || ed25519_pub)[:16] of the identity file, and is the only id the relay writes; the pre-switch id (transport_state.identity_hash_hex) stays its own too",
+      "transport_id_hex": "6dc1140ebf2306f750df931da80bb5be",
+      "pre_switch_transport_id_hex": "d0ac3d0d7f0ad6c5f640f400f6c2dd14",
+      "own_transport_ids_hex": [
+        "6dc1140ebf2306f750df931da80bb5be",
+        "d0ac3d0d7f0ad6c5f640f400f6c2dd14"
+      ],
+      "sent": {
+        "description": "A link request for the browser's lxmf.delivery destination, as its sender packs it (HEADER_1, hops 0), before it is put into transport.",
+        "destination_hash_hex": "52f362b69b3bb5cb7cca05c5405c52ce",
+        "raw_hex": "020052f362b69b3bb5cb7cca05c5405c52ce00530b03972786f298cc4875a43aa54c44281db46c9aa18e06b69fb9afe83d922974d2656ce1c4dfef2d60c21368076d16b97ad7e3af02461a28ef318d49448537",
+        "packet_hash_hex": "2d98d4d4d05e394db684ee90afcab689a6c529e734c47b58bc9451276ea98bdc"
+      },
+      "into_transport": "flags = HEADER_2 << 6 | TRANSPORT << 4 | (flags & 0x0f); raw = flags || hops || next_hop(16) || raw[2:] (RNS 1.5.2 Transport.outbound, Transport.py:1397-1403)",
+      "packets": [
+        {
+          "id": "via-transport-id",
+          "description": "The sender learned its path from an announce relay B relayed after the switch: the next hop is B's transport id. B forwards it.",
+          "next_hop_hex": "6dc1140ebf2306f750df931da80bb5be",
+          "raw_hex": "52006dc1140ebf2306f750df931da80bb5be52f362b69b3bb5cb7cca05c5405c52ce00530b03972786f298cc4875a43aa54c44281db46c9aa18e06b69fb9afe83d922974d2656ce1c4dfef2d60c21368076d16b97ad7e3af02461a28ef318d49448537",
+          "header": {
+            "flags_hex": "52",
+            "hops": 0,
+            "transport_id_hex": "6dc1140ebf2306f750df931da80bb5be",
+            "destination_hash_hex": "52f362b69b3bb5cb7cca05c5405c52ce",
+            "context_hex": "00"
+          },
+          "packet_hash_hex": "2d98d4d4d05e394db684ee90afcab689a6c529e734c47b58bc9451276ea98bdc",
+          "expected": {
+            "own": true
+          }
+        },
+        {
+          "id": "via-pre-switch-id",
+          "description": "The sender learned its path before the switch: the next hop is B's pre-switch id. B still forwards it.",
+          "next_hop_hex": "d0ac3d0d7f0ad6c5f640f400f6c2dd14",
+          "raw_hex": "5200d0ac3d0d7f0ad6c5f640f400f6c2dd1452f362b69b3bb5cb7cca05c5405c52ce00530b03972786f298cc4875a43aa54c44281db46c9aa18e06b69fb9afe83d922974d2656ce1c4dfef2d60c21368076d16b97ad7e3af02461a28ef318d49448537",
+          "header": {
+            "flags_hex": "52",
+            "hops": 0,
+            "transport_id_hex": "d0ac3d0d7f0ad6c5f640f400f6c2dd14",
+            "destination_hash_hex": "52f362b69b3bb5cb7cca05c5405c52ce",
+            "context_hex": "00"
+          },
+          "packet_hash_hex": "2d98d4d4d05e394db684ee90afcab689a6c529e734c47b58bc9451276ea98bdc",
+          "expected": {
+            "own": true
+          }
+        },
+        {
+          "id": "via-another-node",
+          "description": "The next hop is another transport node (the gateway's identity hash): not B's. B's packet filter refuses it.",
+          "next_hop_hex": "03f43750ef2ba1ad2d3c67c5f358349b",
+          "raw_hex": "520003f43750ef2ba1ad2d3c67c5f358349b52f362b69b3bb5cb7cca05c5405c52ce00530b03972786f298cc4875a43aa54c44281db46c9aa18e06b69fb9afe83d922974d2656ce1c4dfef2d60c21368076d16b97ad7e3af02461a28ef318d49448537",
+          "header": {
+            "flags_hex": "52",
+            "hops": 0,
+            "transport_id_hex": "03f43750ef2ba1ad2d3c67c5f358349b",
+            "destination_hash_hex": "52f362b69b3bb5cb7cca05c5405c52ce",
+            "context_hex": "00"
+          },
+          "packet_hash_hex": "2d98d4d4d05e394db684ee90afcab689a6c529e734c47b58bc9451276ea98bdc",
+          "expected": {
+            "own": false,
+            "filter": "transport_id_mismatch"
+          }
+        }
+      ]
+    }
   }
 }

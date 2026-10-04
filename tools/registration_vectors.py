@@ -30,7 +30,10 @@ Every vector is verified before it is written:
 - the PHP relay peer (section 10): its registration as an ordinary positive
   vector, its identity file, its token decryption and every decryption it
   must refuse with this script's reference decrypt, its confirm handler and
-  the link-order examples.
+  the link-order examples;
+- the PHP relay's transport id (section 10.2, revision 7): the identity
+  file's hash with RNS Identity.from_bytes, and each packet put into
+  transport through it with RNS Packet.unpack and Packet.get_hash.
 
 --check additionally regenerates the file in memory and compares it byte for
 byte with the committed copy.
@@ -1169,6 +1172,77 @@ def build():
                            "stands_down": canonical_url(down)[0]})
     assert link_order[1]["link_is_registration_of"] == "https://retichat.com/reticulum"
 
+    # Revision 7 (James, 2026-10-04): relay B's transport id is the hash of its
+    # identity file, as RNS's transport id is Transport.identity.hash, and the
+    # random id it had before the switch stays its own. Each packet is a link
+    # request for the browser's lxmf.delivery destination, sent by a node whose
+    # path to it goes through some next hop, and put into transport the way
+    # RNS 1.5.2 Transport.outbound does it (Transport.py:1397-1403).
+    rb_from_file = RNS.Identity.from_bytes(bytes.fromhex(identity_json["relay_b"]["private_key_hex"]))
+    assert rb_from_file is not None and rb_from_file.hash == rb.hash
+    pre_switch_id = label_bytes("php-relay-peer/pre-switch-transport-id", 16)
+    assert pre_switch_id != rb.hash
+    own_ids = [rb.hash, pre_switch_id]
+    lr_dest = RNS.Destination.hash(idents["browser"], "lxmf", "delivery")
+    lr_ident, _ = make_identity("link-request-sender")
+    lr_flags = (RNS.Packet.HEADER_1 << 6) | (RNS.Transport.BROADCAST << 4) | (RNS.Destination.SINGLE << 2) | RNS.Packet.LINKREQUEST
+    lr_raw = bytes([lr_flags, 0]) + lr_dest + bytes([RNS.Packet.NONE]) + lr_ident.get_public_key()
+    lr_packet = RNS.Packet(None, lr_raw)
+    assert lr_packet.unpack() and lr_packet.header_type == RNS.Packet.HEADER_1
+    assert lr_packet.destination_hash == lr_dest and lr_packet.packet_type == RNS.Packet.LINKREQUEST
+    lr_hash = lr_packet.get_hash()
+
+    def into_transport(raw, next_hop):
+        flags = (RNS.Packet.HEADER_2 << 6) | (RNS.Transport.TRANSPORT << 4) | (raw[0] & 0b00001111)
+        return bytes([flags]) + raw[1:2] + next_hop + raw[2:]
+
+    transport_packets = []
+    for tid_case, description, next_hop in [
+        ("via-transport-id", "The sender learned its path from an announce relay B relayed after the "
+         "switch: the next hop is B's transport id. B forwards it.", rb.hash),
+        ("via-pre-switch-id", "The sender learned its path before the switch: the next hop is B's "
+         "pre-switch id. B still forwards it.", pre_switch_id),
+        ("via-another-node", "The next hop is another transport node (the gateway's identity hash): "
+         "not B's. B's packet filter refuses it.", gw.hash),
+    ]:
+        raw = into_transport(lr_raw, next_hop)
+        p = RNS.Packet(None, raw)
+        assert p.unpack() and p.header_type == RNS.Packet.HEADER_2 and p.transport_id == next_hop, tid_case
+        assert p.destination_hash == lr_dest and p.packet_type == RNS.Packet.LINKREQUEST, tid_case
+        assert p.get_hash() == lr_hash, tid_case + ": the transport id is not part of the packet hash"
+        own = next_hop in own_ids
+        transport_packets.append({
+            "id": tid_case,
+            "description": description,
+            "next_hop_hex": next_hop.hex(),
+            "raw_hex": raw.hex(),
+            "header": {"flags_hex": "%02x" % raw[0], "hops": raw[1], "transport_id_hex": raw[2:18].hex(),
+                       "destination_hash_hex": raw[18:34].hex(), "context_hex": "%02x" % raw[34]},
+            "packet_hash_hex": p.get_hash().hex(),
+            "expected": {"own": True} if own else {"own": False, "filter": "transport_id_mismatch"},
+        })
+    assert [t["expected"]["own"] for t in transport_packets] == [True, True, False]
+
+    transport_id = {
+        "rule": "REGISTRATION.md section 10.2 (revision 7): the transport id is the identity hash, "
+                "SHA-256(x25519_pub || ed25519_pub)[:16] of the identity file, and is the only id the "
+                "relay writes; the pre-switch id (transport_state.identity_hash_hex) stays its own too",
+        "transport_id_hex": rb.hash.hex(),
+        "pre_switch_transport_id_hex": pre_switch_id.hex(),
+        "own_transport_ids_hex": [x.hex() for x in own_ids],
+        "sent": {
+            "description": "A link request for the browser's lxmf.delivery destination, as its sender "
+                           "packs it (HEADER_1, hops 0), before it is put into transport.",
+            "destination_hash_hex": lr_dest.hex(),
+            "raw_hex": lr_raw.hex(),
+            "packet_hash_hex": lr_hash.hex(),
+        },
+        "into_transport": "flags = HEADER_2 << 6 | TRANSPORT << 4 | (flags & 0x0f); "
+                          "raw = flags || hops || next_hop(16) || raw[2:] "
+                          "(RNS 1.5.2 Transport.outbound, Transport.py:1397-1403)",
+        "packets": transport_packets,
+    }
+
     php_relay_peer = {
         "identity": "relay_b",
         "identity_file_hex": identity_json["relay_b"]["private_key_hex"],
@@ -1194,6 +1268,7 @@ def build():
         "confirm_refusals": rb_refusals,
         "confirm_answer_negative": rb_answer_negative,
         "link_order": link_order,
+        "transport_id": transport_id,
     }
 
     gateway_confirm = {
@@ -1229,7 +1304,7 @@ def build():
 
     return {
         "spec": "Reticulum-post/REGISTRATION.md",
-        "format_version": 5,
+        "format_version": 6,
         "generator": "Reticulum-post/tools/registration_vectors.py (RNS " + RNS.__version__ + ")",
         "note": "Every byte below is derived from fixed labels; regenerate with the "
                 "generator, never by hand. Hex is lower-case throughout.",
