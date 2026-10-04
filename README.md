@@ -152,16 +152,30 @@ source deploy.env        # see deploy.env.example
 
 `deploy.sh` stamps each deploy: `build.json` (from `write-build-stamp.sh`)
 names the commit, and `GET /health` publishes it as `build.commit`. Before any
-code goes up the node's stamp is set to unknown (`{"commit":null}`), and the new
-one is written only after `verify-deploy.sh` has proved the bytes, so a deploy
-that stops part way leaves `build.commit: null`, never a commit the node was
-not proven to run. `verify-live-stamp.sh [ref] [retichat|selectiv]` compares the
-stamp with a ref from anywhere, with no SSH. It proves the last verified deploy,
-not the bytes now; `verify-deploy.sh` is still the byte-for-byte check.
+code goes live the node's stamp is set to unknown (`{"commit":null}`), and the
+new one is written only after `verify-deploy.sh` has proved the bytes, so a
+deploy that stops part way leaves `build.commit: null`, never a commit the node
+was not proven to run. `verify-live-stamp.sh [ref] [retichat|selectiv]` compares
+the stamp with a ref from anywhere, with no SSH. It proves the last verified
+deploy, not the bytes now; `verify-deploy.sh` is still the byte-for-byte check.
 
 `deploy.sh` refuses a dirty working tree, refuses a red test suite, deploys from
-`git archive <ref>` rather than from your filesystem, syntax-checks what landed,
-and hash-verifies every file afterwards. `./deploy.sh <old-ref>` is the rollback.
+`git archive <ref>` rather than from your filesystem, syntax-checks the code on
+each node before and after it goes live, and hash-verifies every file
+afterwards. `./deploy.sh <old-ref>` is the rollback.
+
+No node ever runs a mix of two releases. Every node first receives the ref in
+`~/reticulum-incoming`, outside the web root, and lints it with its own
+`php -l`; if any file fails on any node, the deploy stops with nothing changed
+live anywhere. Only then does each node swap it in, with one ssh command that
+renames every file over its live name (`lib/` first; each rename is atomic and
+the set takes milliseconds) and removes the files listed in `RETIRED` in
+`deploy.sh`. Before the swap the node's code and stamp are copied to
+`~/reticulum-rollback`, and a failure after it prints the command that puts
+that copy back. A commit that deletes a file under `php/src` adds it to
+`RETIRED`; an entry can go once every node has deployed past that commit.
+`php/tests/deploy_never_mixes_releases_test.php` runs `deploy.sh` against two
+stand-in nodes to hold all of this.
 
 This exists because on 2026-08-17 the working tree held a copy of five lib files
 that was `HEAD` with the newest commit's fixes surgically removed — content in no

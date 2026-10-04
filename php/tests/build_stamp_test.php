@@ -15,10 +15,12 @@
  *       lands next to index.php, where /health reads it;
  *   (d) deploy.sh, run for real against a stand-in node (ssh and scp are
  *       local stubs, verify-deploy.sh a stub that passes or fails): the node
- *       says "unknown" from before the code goes up until verification has
- *       passed, and names the commit only after it; a failed verification or
- *       lint leaves "unknown"; the rollback copy keeps the previous stamp, or
- *       an unknown one for a node that had none;
+ *       says "unknown" from before the code goes live until verification has
+ *       passed, and names the commit only after it; a failed verification, or
+ *       a failed lint of the live files, leaves "unknown"; a ref that fails
+ *       the lint before the swap leaves the node's code and stamp as they
+ *       were; the rollback copy keeps the previous stamp, or an unknown one
+ *       for a node that had none;
  *   (e) verify-live-stamp.sh: match → 0, older commit → 1 with the distance,
  *       no stamp → 2, no answer → 2 (read through file:// URLs, no server).
  *
@@ -107,14 +109,18 @@ echo "(d) deploy.sh names the commit only on verified code\n";
 // (so an uncommitted edit to them is what runs) and a verify-deploy.sh stub.
 // ssh and scp are stubs on PATH that act on a directory standing in for the
 // node's home; deploy.sh runs under `env -i`, so no real credential or host
-// can reach it, and the host is in .invalid, which never resolves.
+// can reach it, and the host is in .invalid, which never resolves. On the
+// node, mv logs the stamp as each file goes live (deploy.sh renames the ref
+// in from ~/reticulum-incoming); deploy_never_mixes_releases_test.php covers
+// the swap itself.
 $sandbox = $tmp . '/deploy';
 $clone = $sandbox . '/repo';
 $bin = $sandbox . '/bin';
+$remoteBin = $sandbox . '/remote-bin';
 $badPhp = $sandbox . '/badphp';
 $node = $sandbox . '/node';
 $stubLog = $sandbox . '/stub.log';
-foreach ([$bin, $badPhp] as $dir) {
+foreach ([$bin, $remoteBin, $badPhp] as $dir) {
     mkdir($dir, 0775, true);
 }
 run('git clone -q ' . escapeshellarg($repo) . ' ' . escapeshellarg($clone));
@@ -129,12 +135,13 @@ while [[ $# -gt 0 ]]; do
 done
 shift
 [[ -n "${STUB_LINT_FAIL:-}" ]] && PATH="$STUB_BADPHP:$PATH"
-cd "$STUB_HOME" && HOME="$STUB_HOME" PATH="$PATH" exec bash -c "$*"
+cd "$STUB_HOME" && HOME="$STUB_HOME" PATH="$STUB_REMOTE_BIN:$PATH" exec bash -c "$*"
 SH,
     $bin . '/scp' => <<<'SH'
 #!/usr/bin/env bash
 # scp stand-in: copy sources to host:~/path under the fake node's home, and
-# log what the node's stamp said when code (a .php file) arrived.
+# log what the node's stamp said if code (a .php file) arrived in the live
+# directory.
 args=()
 while [[ $# -gt 0 ]]; do
   case "$1" in -o) shift 2 ;; -*) shift ;; *) args+=("$1"); shift ;; esac
@@ -142,9 +149,11 @@ done
 n=${#args[@]}
 dest="${args[$((n - 1))]}"
 path="${dest#*:}"; path="${path#\~/}"
-for src in "${args[@]:0:$((n - 1))}"; do
-  case "$src" in *.php) echo "code-upload stamp: $(cat "$STUB_HOME/public_html/reticulum/build.json" 2>/dev/null || echo none)" >> "$STUB_LOG"; break ;; esac
-done
+case "$path" in public_html/*)
+  for src in "${args[@]:0:$((n - 1))}"; do
+    case "$src" in *.php) echo "code-upload stamp: $(cat "$STUB_HOME/public_html/reticulum/build.json" 2>/dev/null || echo none)" >> "$STUB_LOG"; break ;; esac
+  done
+esac
 cp "${args[@]:0:$((n - 1))}" "$STUB_HOME/$path"
 SH,
     $clone . '/verify-deploy.sh' => <<<'SH'
@@ -152,7 +161,22 @@ SH,
 echo "verify-time stamp: $(cat "$STUB_HOME/public_html/reticulum/build.json" 2>/dev/null || echo none)" >> "$STUB_LOG"
 exit "${STUB_VERIFY_EXIT:-0}"
 SH,
-    $badPhp . '/php' => "#!/bin/sh\necho \"PHP Parse error: stand-in lint failure in \$2\"\n",
+    $remoteBin . '/mv' => <<<'SH'
+#!/usr/bin/env bash
+# mv on the node: log what the stamp said as each incoming file went live.
+for a in "$@"; do
+  case "$a" in *reticulum-incoming/*) echo "code-live stamp: $(cat "$STUB_HOME/public_html/reticulum/build.json" 2>/dev/null || echo none)" >> "$STUB_LOG"; break ;; esac
+done
+exec /bin/mv "$@"
+SH,
+    // Fails every lint, or with STUB_LINT_FAIL=live only the lint of the live
+    // directory, after the swap; anything else goes to the real php.
+    $badPhp . '/php' => <<<'SH'
+#!/bin/sh
+if [ "$STUB_LINT_FAIL" = live ] && [ "$PWD" != "$HOME/public_html/reticulum" ]; then exec "$STUB_REAL_PHP" "$@"; fi
+echo "PHP Parse error: stand-in lint failure in $2"
+exit 255
+SH,
 ];
 foreach ($stubs as $path => $script) {
     file_put_contents($path, $script);
@@ -170,7 +194,7 @@ $resetNode = static function (?string $stampCommit) use ($node, $stubLog): void 
     }
     @unlink($stubLog);
 };
-$deploy = static function (array $extraEnv = []) use ($clone, $bin, $badPhp, $node, $stubLog): array {
+$deploy = static function (array $extraEnv = []) use ($clone, $bin, $remoteBin, $badPhp, $node, $stubLog): array {
     [, $gitPath] = run('command -v git');
     $env = array_merge([
         'PATH' => implode(':', [$bin, dirname(PHP_BINARY), dirname($gitPath), '/usr/bin', '/bin']),
@@ -178,6 +202,8 @@ $deploy = static function (array $extraEnv = []) use ($clone, $bin, $badPhp, $no
         'STUB_HOME' => $node,
         'STUB_LOG' => $stubLog,
         'STUB_BADPHP' => $badPhp,
+        'STUB_REMOTE_BIN' => $remoteBin,
+        'STUB_REAL_PHP' => PHP_BINARY,
         'RETICHAT_SSH_HOST' => 'stub@retichat.invalid',
         'DEPLOY_SKIP_TESTS' => '1',
     ], $extraEnv);
@@ -189,14 +215,14 @@ $deploy = static function (array $extraEnv = []) use ($clone, $bin, $badPhp, $no
     return [$code, implode("\n", $out), is_file($stubLog) ? (string) file_get_contents($stubLog) : ''];
 };
 $nodeStamp = static fn (): ?string => BuildStamp::read($node . '/public_html/reticulum')['commit'];
-$rollbackStamp = static fn (): ?string => BuildStamp::read($node . '/public_html/reticulum-rollback')['commit'];
+$rollbackStamp = static fn (): ?string => BuildStamp::read($node . '/reticulum-rollback')['commit'];
 
 $resetNode($parent);
 [$code, $out, $log] = $deploy();
 check('a verified deploy exits 0', $code === 0, $out);
 check('...and the node then names HEAD', $nodeStamp() === $head, (string) $nodeStamp());
-check('...the node said "unknown" when the code arrived, not the old commit',
-    str_contains($log, 'code-upload stamp: {"commit":null}') && !str_contains($log, $parent), $log);
+check('...the node said "unknown" when the code went live, not the old commit',
+    str_contains($log, 'code-live stamp: {"commit":null}') && !str_contains($log, $parent), $log);
 check('...and still "unknown" while verify-deploy.sh ran, not HEAD', str_contains($log, 'verify-time stamp: {"commit":null}'), $log);
 check('...the rollback copy names the commit the node ran before', $rollbackStamp() === $parent, (string) $rollbackStamp());
 check('...and the deployed code is the ref\'s, not the old file',
@@ -211,8 +237,15 @@ check('...with the old stamp kept for a rollback', $rollbackStamp() === $parent,
 
 $resetNode($parent);
 [$code, $out, $log] = $deploy(['STUB_LINT_FAIL' => '1']);
-check('a deploy whose code fails the remote lint exits non-zero, before verification',
+check('a deploy whose code fails the lint on the node exits non-zero, before verification',
     $code !== 0 && str_contains($out, 'does not parse') && !str_contains($log, 'verify-time'), $out);
+check('...with nothing live: the node still runs the old code and names the old commit', $nodeStamp() === $parent
+    && str_contains((string) @file_get_contents($node . '/public_html/reticulum/index.php'), 'old code'), (string) $nodeStamp());
+
+$resetNode($parent);
+[$code, $out, $log] = $deploy(['STUB_LINT_FAIL' => 'live']);
+check('a deploy whose live files fail the lint after the swap exits non-zero, before verification',
+    $code !== 0 && str_contains($out, 'deployed code does not parse') && !str_contains($log, 'verify-time'), $out);
 check('...and leaves the node saying "unknown"', $nodeStamp() === null
     && is_file($node . '/public_html/reticulum/build.json'), (string) @file_get_contents($node . '/public_html/reticulum/build.json'));
 
@@ -220,7 +253,7 @@ $resetNode(null);
 [$code, $out] = $deploy();
 check('a node deployed before stamps gets an explicit unknown rollback stamp',
     $code === 0 && $nodeStamp() === $head
-    && str_contains((string) @file_get_contents($node . '/public_html/reticulum-rollback/build.json'), '"commit":null'), $out);
+    && str_contains((string) @file_get_contents($node . '/reticulum-rollback/build.json'), '"commit":null'), $out);
 
 check('build.json is not a deployed php file verify-deploy.sh would hash', !str_ends_with(BuildStamp::FILE, '.php'));
 $gitignore = (string) file_get_contents($repo . '/.gitignore');
