@@ -22,7 +22,11 @@ Every vector is verified before it is written:
 - every positive and negative registration with this script's own reference
   verifier (REGISTRATION.md section 4.3, in its normative order), which must
   give the expected status and error;
-- every canonical-URL example with this script's own function.
+- every canonical-URL example with this script's own function;
+- the gateway wake-URL confirm (REGISTRATION.md section 9.8): the positive
+  signature with RNS Identity.validate, every gateway refusal with this
+  script's reference gateway handler, and every relay-side answer with its
+  reference answer verifier.
 
 --check additionally regenerates the file in memory and compares it byte for
 byte with the committed copy.
@@ -83,6 +87,12 @@ ALLOWED_METADATA_KEYS = {"client", "implementation", "mode", "transport", "peer_
 KNOWN_CLIENTS = ("rns-js", "reticulum-php", "rns-post-interface")
 
 HEX_RE = re.compile(r"[0-9a-f]+")
+
+# The gateway wake-URL confirm (REGISTRATION.md section 9.8).
+GATEWAY_CONFIRM_DOMAIN = b"reticulum-post/gateway-confirm/v1"
+GATEWAY_CONFIRM_PATH = "/v1/gateway/confirm"
+GATEWAY_CONFIRM_FIELD_ORDER = ["domain", "nonce", "identity_hash", "relay_url", "peer_url"]
+GATEWAY_CONFIRM_KEYS = {"version", "nonce", "identity_hash", "relay_url", "peer_url"}
 
 
 # ---------------------------------------------------------------------------
@@ -403,6 +413,70 @@ def verify_reference(body, relay, state):
 
     # 9. Bind (modelled by the row's seq).
     return {"status": 200, "identity_hash": h.hex(), "registration_seq": state["row_registration_seq"] + 1}
+
+
+# ---------------------------------------------------------------------------
+# Gateway wake-URL confirm (REGISTRATION.md section 9.8)
+# ---------------------------------------------------------------------------
+
+def gateway_confirm_fields(body):
+    """The five signed values, read from the confirm request body as received."""
+    return [
+        ("domain", GATEWAY_CONFIRM_DOMAIN),
+        ("nonce", bytes.fromhex(body["nonce"])),
+        ("identity_hash", bytes.fromhex(body["identity_hash"])),
+        ("relay_url", body["relay_url"].encode("utf-8")),
+        ("peer_url", body["peer_url"].encode("utf-8")),
+    ]
+
+
+def gateway_confirm_bytes(body):
+    fields = gateway_confirm_fields(body)
+    assert [n for n, _ in fields] == GATEWAY_CONFIRM_FIELD_ORDER
+    return b"".join(lp(v) for _, v in fields), fields
+
+
+def gateway_handle_confirm(body, ident, cfg):
+    """The gateway's handler, its checks in their normative order.
+
+    cfg: {node_url, wake_url} exactly as the gateway's config writes them."""
+    def bad(status, error):
+        return {"status": status, "error": error}
+
+    if (not isinstance(body, dict) or set(body.keys()) != GATEWAY_CONFIRM_KEYS
+            or not (is_int(body.get("version")) and body["version"] == 1)
+            or not is_lower_hex(body.get("nonce"), 32)
+            or not is_lower_hex(body.get("identity_hash"), 32)
+            or not (isinstance(body.get("relay_url"), str) and _valid_unicode(body["relay_url"])
+                    and 0 < _utf8_len(body["relay_url"]) <= 512)
+            or not (isinstance(body.get("peer_url"), str) and _valid_unicode(body["peer_url"])
+                    and 0 < _utf8_len(body["peer_url"]) <= 512)):
+        return bad(400, "bad_confirm_request")
+    if not hmac.compare_digest(body["identity_hash"], ident.hash.hex()):
+        return bad(403, "not_my_identity")
+    relay, _ = canonical_url(body["relay_url"])
+    if relay is None or relay != canonical_url(cfg["node_url"])[0]:
+        return bad(403, "unknown_relay")
+    peer, _ = canonical_url(body["peer_url"])
+    if peer is None or peer != canonical_url(cfg["wake_url"])[0]:
+        return bad(403, "not_my_wake_url")
+    msg, _ = gateway_confirm_bytes(body)
+    return {"status": 200, "body": {"signature": ident.sign(msg).hex()}}
+
+
+def relay_verify_confirm_answer(sent_body, status, answer, public_key):
+    """The relay's runner, after its POST: 'confirmed', or why not."""
+    if status != 200:
+        return {"result": "bad_answer", "reason": "status"}
+    if (not isinstance(answer, dict) or set(answer.keys()) != {"signature"}
+            or not is_lower_hex(answer.get("signature"), 128)):
+        return {"result": "bad_answer", "reason": "shape"}
+    msg, _ = gateway_confirm_bytes(sent_body)
+    try:
+        Ed25519PublicKey.from_public_bytes(public_key[32:]).verify(bytes.fromhex(answer["signature"]), msg)
+    except Exception:
+        return {"result": "bad_signature"}
+    return {"result": "confirmed"}
 
 
 # ---------------------------------------------------------------------------
@@ -853,6 +927,111 @@ def build():
     assert keys["https://xn--rtichat-bya.com/reticulum"] != keys["https://retichat.com/reticulum"]
     assert keys["https://rétichat.com/reticulum"] is None
 
+    # The gateway wake-URL confirm (section 9.8). Relay A confirms the wake
+    # URL that the gateway-wake vector's row stores, before ever waking it.
+    gw = idents["gateway"]
+    gw_cfg = {"node_url": "https://relay-a.example.org/reticulum/",
+              "wake_url": "http://gateway.example.net:4371/v1/wake"}
+    relay_a_url = "https://relay-a.example.org/reticulum"
+    relay_b_url = "https://relay-b.example.org/reticulum"
+    stored_peer_url, _ = canonical_url(gateway_wake["metadata"]["peer_url"])
+    assert stored_peer_url == "http://gateway.example.net:4371"
+    assert canonical_url(gw_cfg["node_url"])[0] == relay_a_url
+    confirm_nonce = label_bytes("gateway-confirm/nonce", 16)
+    confirm_body = {"version": 1, "nonce": confirm_nonce.hex(), "identity_hash": gw.hash.hex(),
+                    "relay_url": relay_a_url, "peer_url": stored_peer_url}
+    confirm_msg, confirm_fields = gateway_confirm_bytes(confirm_body)
+    handled = gateway_handle_confirm(confirm_body, gw, gw_cfg)
+    assert handled["status"] == 200, handled
+    confirm_sig = bytes.fromhex(handled["body"]["signature"])
+    assert gw.validate(confirm_sig, confirm_msg), "RNS rejects the confirm signature"
+    gw_pub = gw.get_public_key()
+    assert relay_verify_confirm_answer(confirm_body, 200, handled["body"], gw_pub)["result"] == "confirmed"
+
+    gateway_refusals = []
+
+    def refusal(rid, description, body, status, error):
+        got = gateway_handle_confirm(body, gw, gw_cfg)
+        assert got == {"status": status, "error": error}, rid + ": " + json.dumps(got)
+        gateway_refusals.append({"id": rid, "description": description, "request_body": body,
+                                 "expected": {"status": status, "error": error}})
+
+    b = dict(confirm_body, identity_hash=idents["other"].hash.hex())
+    refusal("not-my-identity", "A confirm for another identity's row. The gateway signs only "
+            "for its own transport identity.", b, 403, "not_my_identity")
+    b = dict(confirm_body, relay_url=relay_b_url)
+    refusal("unknown-relay", "A confirm from a relay this gateway does not register with "
+            "(its node_url is relay A). The gateway is not a signing oracle for anyone else.",
+            b, 403, "unknown_relay")
+    b = dict(confirm_body, peer_url="http://attacker.example.net:4371")
+    refusal("not-my-wake-url", "A confirm naming a wake URL that is not this gateway's own.",
+            b, 403, "not_my_wake_url")
+    b = dict(confirm_body, nonce=confirm_body["nonce"].upper())
+    refusal("bad-nonce", "The nonce in upper-case hex. Hex fields are lower-case only.",
+            b, 400, "bad_confirm_request")
+    b = dict(confirm_body, waker_url=relay_a_url)
+    refusal("extra-key", "A confirm body with a key outside the five.", b, 400, "bad_confirm_request")
+
+    answer_negative = []
+
+    def answer(aid, description, status, body, expected):
+        got = relay_verify_confirm_answer(confirm_body, status, body, gw_pub)
+        assert got == expected, aid + ": " + json.dumps(got)
+        answer_negative.append({"id": aid, "description": description, "answer_status": status,
+                                "answer_body": body, "expected": expected})
+
+    answer("answer-other-key", "The right bytes, signed by another identity.", 200,
+           {"signature": idents["other"].sign(confirm_msg).hex()}, {"result": "bad_signature"})
+    other_nonce = dict(confirm_body, nonce=label_bytes("gateway-confirm/other-nonce", 16).hex())
+    answer("answer-other-nonce", "The gateway's signature over another nonce (an earlier "
+           "confirm's answer).", 200, {"signature": gw.sign(gateway_confirm_bytes(other_nonce)[0]).hex()},
+           {"result": "bad_signature"})
+    other_peer = dict(confirm_body, peer_url="http://attacker.example.net:4371")
+    answer("answer-other-peer-url", "The gateway's signature for another wake URL.", 200,
+           {"signature": gw.sign(gateway_confirm_bytes(other_peer)[0]).hex()}, {"result": "bad_signature"})
+    other_relay = dict(confirm_body, relay_url=relay_b_url)
+    answer("answer-other-relay", "The gateway's signature for relay B's confirm.", 200,
+           {"signature": gw.sign(gateway_confirm_bytes(other_relay)[0]).hex()}, {"result": "bad_signature"})
+    answer("answer-registration-signature", "The gateway's registration signature (vector "
+           "gateway-wake) offered as the answer. The domains keep the two apart.", 200,
+           {"signature": registrations[2]["signature_hex"]}, {"result": "bad_signature"})
+    answer("answer-echo-nonce", "The nonce echoed back. Reaching the URL is not enough: the "
+           "answer must be signed by the row's key.", 200, {"nonce": confirm_body["nonce"]},
+           {"result": "bad_answer", "reason": "shape"})
+    answer("answer-wake-ok", "What today's wake route answers ({\"status\": \"ok\"}).", 200,
+           {"status": "ok"}, {"result": "bad_answer", "reason": "shape"})
+    answer("answer-uppercase-signature", "The right signature in upper-case hex.", 200,
+           {"signature": confirm_sig.hex().upper()}, {"result": "bad_answer", "reason": "shape"})
+    answer("answer-extra-key", "The right signature with a second key.", 200,
+           {"signature": confirm_sig.hex(), "status": "ok"}, {"result": "bad_answer", "reason": "shape"})
+    answer("answer-404", "A server without the handler (an older gateway binary) answers 404.",
+           404, None, {"result": "bad_answer", "reason": "status"})
+
+    gateway_confirm = {
+        "domain": GATEWAY_CONFIRM_DOMAIN.decode(),
+        "domain_hex": GATEWAY_CONFIRM_DOMAIN.hex(),
+        "path": GATEWAY_CONFIRM_PATH,
+        "signed_field_order": GATEWAY_CONFIRM_FIELD_ORDER,
+        "gateway": {"identity": "gateway", "config": gw_cfg},
+        "relay_url": relay_a_url,
+        "positive": {
+            "id": "gateway-confirm",
+            "description": "Relay A confirms the wake URL stored for the gateway-wake row "
+                           "(canonical peer_url) before it ever wakes it. The gateway's config "
+                           "writes its node_url with a trailing slash: it compares canonical forms.",
+            "row": {"identity": "gateway", "peer_url": stored_peer_url, "peer_url_key": url_key(stored_peer_url)},
+            "request_url": stored_peer_url + GATEWAY_CONFIRM_PATH,
+            "request_body": confirm_body,
+            "signed_fields": [{"name": n, "value_hex": v.hex(), "lp_hex": lp(v).hex()} for n, v in confirm_fields],
+            "signed_bytes_hex": confirm_msg.hex(),
+            "signature_hex": confirm_sig.hex(),
+            "response_body": {"signature": confirm_sig.hex()},
+            "expected_relay": {"result": "confirmed"},
+        },
+        "gateway_refusals": gateway_refusals,
+        "answer_negative": answer_negative,
+    }
+
     lp_examples = [
         {"input_hex": "", "output_hex": lp(b"").hex()},
         {"input_utf8": "rns-js", "output_hex": lp(b"rns-js").hex()},
@@ -861,7 +1040,7 @@ def build():
 
     return {
         "spec": "Reticulum-post/REGISTRATION.md",
-        "format_version": 3,
+        "format_version": 4,
         "generator": "Reticulum-post/tools/registration_vectors.py (RNS " + RNS.__version__ + ")",
         "note": "Every byte below is derived from fixed labels; regenerate with the "
                 "generator, never by hand. Hex is lower-case throughout.",
@@ -883,6 +1062,7 @@ def build():
         "negative": negative,
         "tokens_negative": tokens_negative,
         "url_canonical": url_canonical,
+        "gateway_confirm": gateway_confirm,
     }
 
 

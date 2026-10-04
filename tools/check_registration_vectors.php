@@ -9,7 +9,9 @@
  *
  * It re-derives every key, identity hash, challenge MAC, signed byte string
  * and encrypted session token from the vector inputs, verifies every
- * signature, re-derives every canonical peer URL, and runs a
+ * signature, re-derives every canonical peer URL, checks the gateway
+ * wake-URL confirm (section 9.8) with its own gateway handler and relay
+ * answer verifier, and runs a
  * REFERENCE verifier (REGISTRATION.md section 4.3, in its normative order)
  * over every positive and negative vector, comparing the HTTP status, the
  * error code and the step that fails. The reference verifier is deliberately
@@ -30,6 +32,9 @@ const REGISTRATION_KEYS = ['version', 'public_key', 'challenge', 'signature'];
 const ALLOWED_METADATA_KEYS = ['client', 'implementation', 'mode', 'transport', 'peer_url', 'peer_interface_id', 'peer_session_token', 'identity_hash'];
 const KNOWN_CLIENTS = ['rns-js', 'reticulum-php', 'rns-post-interface'];
 const MAX_SAFE_INTEGER = 9007199254740991; // 2^53 - 1
+const GATEWAY_CONFIRM_DOMAIN = 'reticulum-post/gateway-confirm/v1';
+const GATEWAY_CONFIRM_PATH = '/v1/gateway/confirm';
+const GATEWAY_CONFIRM_KEYS = ['version', 'nonce', 'identity_hash', 'relay_url', 'peer_url'];
 
 foreach (['sodium_crypto_sign_verify_detached', 'sodium_crypto_scalarmult', 'hash_hkdf', 'openssl_encrypt'] as $fn) {
     if (!function_exists($fn)) {
@@ -279,6 +284,78 @@ function verifySigned(array $body, array $relay, array $state): array
     return ['status' => 200, 'identity_hash' => bin2hex($identityHash), 'registration_seq' => $state['row_registration_seq'] + 1];
 }
 
+/** Section 9.8: the five signed values of a gateway confirm, from the body as received. */
+function gatewayConfirmBytes(array $body): string
+{
+    return lp(GATEWAY_CONFIRM_DOMAIN)
+        . lp((string) hex2bin($body['nonce']))
+        . lp((string) hex2bin($body['identity_hash']))
+        . lp($body['relay_url'])
+        . lp($body['peer_url']);
+}
+
+function boundedUtf8(mixed $v, int $maxBytes): bool
+{
+    return is_string($v) && $v !== '' && strlen($v) <= $maxBytes && mb_check_encoding($v, 'UTF-8');
+}
+
+/**
+ * Section 9.8, the gateway's handler, its checks in their normative order.
+ *
+ * @param array{node_url:string, wake_url:string} $cfg the gateway's config as written
+ * @return array{status:int, error?:string, signature?:string}
+ */
+function gatewayHandleConfirm(mixed $body, string $ownHash, string $edSecretKey, array $cfg): array
+{
+    if (!is_array($body)) {
+        return ['status' => 400, 'error' => 'bad_confirm_request'];
+    }
+    $keys = array_keys($body);
+    sort($keys);
+    $want = GATEWAY_CONFIRM_KEYS;
+    sort($want);
+    if ($keys !== $want
+        || ($body['version'] ?? null) !== 1
+        || !isLowerHex($body['nonce'] ?? null, 32)
+        || !isLowerHex($body['identity_hash'] ?? null, 32)
+        || !boundedUtf8($body['relay_url'] ?? null, 512)
+        || !boundedUtf8($body['peer_url'] ?? null, 512)
+    ) {
+        return ['status' => 400, 'error' => 'bad_confirm_request'];
+    }
+    if (!hash_equals(bin2hex($ownHash), $body['identity_hash'])) {
+        return ['status' => 403, 'error' => 'not_my_identity'];
+    }
+    [$relay] = canonicalPeerUrl($body['relay_url']);
+    if ($relay === null || $relay !== canonicalPeerUrl($cfg['node_url'])[0]) {
+        return ['status' => 403, 'error' => 'unknown_relay'];
+    }
+    [$peer] = canonicalPeerUrl($body['peer_url']);
+    if ($peer === null || $peer !== canonicalPeerUrl($cfg['wake_url'])[0]) {
+        return ['status' => 403, 'error' => 'not_my_wake_url'];
+    }
+    return ['status' => 200, 'signature' => bin2hex(sodium_crypto_sign_detached(gatewayConfirmBytes($body), $edSecretKey))];
+}
+
+/**
+ * Section 9.8, the relay's runner after its POST.
+ *
+ * @return array{result:string, reason?:string}
+ */
+function relayVerifyConfirmAnswer(array $sent, int $status, mixed $answer, string $publicKey): array
+{
+    if ($status !== 200) {
+        return ['result' => 'bad_answer', 'reason' => 'status'];
+    }
+    if (!is_array($answer) || array_keys($answer) !== ['signature'] || !isLowerHex($answer['signature'], 128)) {
+        return ['result' => 'bad_answer', 'reason' => 'shape'];
+    }
+    if (!sodium_crypto_sign_verify_detached((string) hex2bin($answer['signature']), gatewayConfirmBytes($sent), substr($publicKey, 32, 32))) {
+        return ['result' => 'bad_signature'];
+    }
+    return ['result' => 'confirmed'];
+}
+
 /** RNS Identity.encrypt with a pinned ephemeral key and IV (request_lxmf_handoff_trait.php's derivation). */
 function encryptTokenPinned(string $plaintext, string $x25519Public, string $identityHash, string $ephPrivate, string $iv): string
 {
@@ -311,7 +388,7 @@ function decryptToken(string $blob, string $x25519Private, string $identityHash)
 $expect($doc['constants']['register_domain'] === REGISTER_DOMAIN, 'register domain');
 $expect($doc['constants']['challenge_domain'] === CHALLENGE_DOMAIN, 'challenge domain');
 $expect($doc['constants']['challenge_length'] === CHALLENGE_BYTES, 'challenge length');
-$expect($doc['format_version'] === 3, 'format 3 (revision 3: no audience)');
+$expect($doc['format_version'] === 4, 'format 4 (revision 3: no audience; revision 4: the gateway confirm)');
 $expect($doc['constants']['signed_field_order'] === ['domain', 'challenge', 'public_key', 'name', 'bitrate', 'mtu', 'client', 'mode', 'transport', 'peer_url', 'peer_interface_id', 'peer_session_token'], 'the twelve signed fields, in order');
 foreach ($doc['lp_examples'] as $ex) {
     $in = isset($ex['input_utf8']) ? $ex['input_utf8'] : (string) hex2bin($ex['input_hex']);
@@ -431,6 +508,54 @@ foreach ($doc['url_canonical'] as $u) {
     $key = $canonical === null ? null : hash('sha256', $canonical);
     $expect($key === $u['peer_url_key'], 'url ' . json_encode($u['input']) . ': peer_url_key');
 }
+// ── The gateway wake-URL confirm (section 9.8) ─────────────────────────────
+$gc = $doc['gateway_confirm'] ?? null;
+$expect(is_array($gc), 'gateway confirm: section present');
+if (is_array($gc)) {
+    $expect($gc['domain'] === GATEWAY_CONFIRM_DOMAIN && $gc['domain_hex'] === bin2hex(GATEWAY_CONFIRM_DOMAIN), 'gateway confirm: domain');
+    $expect($gc['path'] === GATEWAY_CONFIRM_PATH && !str_starts_with($gc['path'], '/v1/wake'), 'gateway confirm: path, not under /v1/wake');
+    $expect($gc['signed_field_order'] === ['domain', 'nonce', 'identity_hash', 'relay_url', 'peer_url'], 'gateway confirm: the five signed fields, in order');
+    $gwName = $gc['gateway']['identity'];
+    $gwCfg = $gc['gateway']['config'];
+    $gwPub = (string) hex2bin($doc['identities'][$gwName]['public_key_hex']);
+    $pos = $gc['positive'];
+    $sent = $pos['request_body'];
+    // The URL confirmed is the one the gateway-wake row stores, and the confirm goes there and nowhere else.
+    $wakeRow = null;
+    foreach ($doc['registrations'] as $v) {
+        if ($v['id'] === 'gateway-wake') {
+            $wakeRow = $v;
+        }
+    }
+    [$storedPeerUrl] = canonicalPeerUrl($wakeRow['request_body']['metadata']['peer_url'] ?? null);
+    $expect($storedPeerUrl !== null && $pos['row']['peer_url'] === $storedPeerUrl && $sent['peer_url'] === $storedPeerUrl, 'gateway confirm: names the stored canonical peer_url');
+    $expect($pos['row']['peer_url_key'] === hash('sha256', (string) $storedPeerUrl), 'gateway confirm: the row key');
+    $expect($pos['request_url'] === $storedPeerUrl . GATEWAY_CONFIRM_PATH, 'gateway confirm: sent only to the stored URL');
+    $expect($sent['identity_hash'] === bin2hex($ids[$gwName]['hash']) && $sent['relay_url'] === $gc['relay_url'], 'gateway confirm: identity and relay');
+    $msg = gatewayConfirmBytes($sent);
+    $expect(bin2hex($msg) === $pos['signed_bytes_hex'], 'gateway confirm: signed bytes rebuilt from the body');
+    $joined = '';
+    $names = [];
+    foreach ($pos['signed_fields'] as $f) {
+        $expect(bin2hex(lp((string) hex2bin($f['value_hex']))) === $f['lp_hex'], "gateway confirm: lp of {$f['name']}");
+        $joined .= (string) hex2bin($f['lp_hex']);
+        $names[] = $f['name'];
+    }
+    $expect($names === $gc['signed_field_order'] && $joined === $msg, 'gateway confirm: signed_fields concatenate to the signed bytes');
+    $handled = gatewayHandleConfirm($sent, $ids[$gwName]['hash'], $ids[$gwName]['ed_sk'], $gwCfg);
+    $expect($handled === ['status' => 200, 'signature' => $pos['signature_hex']], 'gateway confirm: the reference gateway signs it, reproduced by sodium (got ' . json_encode($handled) . ')');
+    $expect($pos['response_body'] === ['signature' => $pos['signature_hex']], 'gateway confirm: response body');
+    $expect(relayVerifyConfirmAnswer($sent, 200, $pos['response_body'], $gwPub) === $pos['expected_relay'], 'gateway confirm: the relay accepts the answer');
+    foreach ($gc['gateway_refusals'] as $r) {
+        $got = gatewayHandleConfirm($r['request_body'], $ids[$gwName]['hash'], $ids[$gwName]['ed_sk'], $gwCfg);
+        $expect($got === $r['expected'], "gateway refusal {$r['id']}: expected " . json_encode($r['expected']) . ', got ' . json_encode($got));
+    }
+    foreach ($gc['answer_negative'] as $a) {
+        $got = relayVerifyConfirmAnswer($sent, $a['answer_status'], $a['answer_body'], $gwPub);
+        $expect($got === $a['expected'], "confirm answer {$a['id']}: expected " . json_encode($a['expected']) . ', got ' . json_encode($got));
+    }
+}
+
 // Revision 3: nothing in the file carries an audience.
 $expect(!str_contains((string) file_get_contents($path), 'audience'), 'no vector carries an audience');
 
@@ -442,7 +567,7 @@ if ($failures !== []) {
     exit(1);
 }
 
-printf("PASS: %d checks (%d registrations, %d negative, %d token negatives, %d URLs) with PHP %s sodium/openssl\n",
+printf("PASS: %d checks (%d registrations, %d negative, %d token negatives, %d URLs, gateway confirm: 1 positive, %d refusals, %d answer negatives) with PHP %s sodium/openssl\n",
     $checks, count($doc['registrations']), count($doc['negative']), count($doc['tokens_negative']),
-    count($doc['url_canonical']), PHP_VERSION);
+    count($doc['url_canonical']), count($gc['gateway_refusals'] ?? []), count($gc['answer_negative'] ?? []), PHP_VERSION);
 exit(0);
