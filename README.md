@@ -166,14 +166,20 @@ afterwards. `./deploy.sh <old-ref>` is the rollback.
 
 No node ever runs a mix of two releases. Every node first receives the ref in
 `~/reticulum-incoming`, outside the web root, and lints it with its own
-`php -l`; if any file fails on any node, the deploy stops with nothing changed
+`php -l`, together with the php files the node keeps in the live directory
+(`config.php`, `_test.php`, local tools), which the lint after the swap will
+also meet; if any file fails on any node, the deploy stops with nothing changed
 live anywhere. Only then does each node swap it in, with one ssh command that
 renames every file over its live name (`lib/` first; each rename is atomic and
 the set takes milliseconds) and removes the files listed in `RETIRED` in
 `deploy.sh`. Before the swap the node's code and stamp are copied to
-`~/reticulum-rollback`, and a failure after it prints the command that puts
-that copy back. A commit that deletes a file under `php/src` adds it to
-`RETIRED`; an entry can go once every node has deployed past that commit.
+`~/reticulum-rollback`. If a rename or removal fails, the same command puts
+the previous release back from that copy, stamp included. It ignores a
+hang-up, so a connection that drops part way leaves the node to finish the
+swap. A failure after the swap prints the command that puts the copy back. A
+commit that deletes a file under `php/src` adds it to `RETIRED`; an entry can
+go once every node has deployed past that commit, and an empty list is fine.
+`RETIRED` may never name a file the node owns (`config.php`, `_test.php`).
 `php/tests/deploy_never_mixes_releases_test.php` runs `deploy.sh` against two
 stand-in nodes to hold all of this.
 

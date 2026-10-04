@@ -13,10 +13,11 @@
  * against two stand-in nodes: retichat through sshpass with a fake password,
  * selectiv through key auth. ssh, scp and sshpass are shims, first on PATH,
  * that map stub@<node>.invalid:~/... to a directory per node and refuse every
- * other host. deploy.sh runs under `env -i` with stdin from /dev/null, from a
- * wrapper that sources only the fake deploy.env written here and refuses
- * unless every host in it is in .invalid (which never resolves) and ssh, scp
- * and sshpass resolve to the shims. The real deploy.env is never read.
+ * other host; curl, wget, rsync, sftp and nc are shims that refuse outright.
+ * deploy.sh runs under `env -i` with stdin from /dev/null, from a wrapper that
+ * sources only the fake deploy.env written here and refuses unless every host
+ * in it is in .invalid (which never resolves) and every one of those tools
+ * resolves to its shim. The real deploy.env is never read.
  *
  *   (a) a good ref: code reaches each node only through ~/reticulum-incoming;
  *       it goes live in ONE remote command per node, only after every node
@@ -33,13 +34,28 @@
  *   (f) a rollback copy that lost a file (a full disk, say) stops the swap
  *       before anything changes, so nothing is replaced or removed that the
  *       rollback command could not restore;
- *   (g) the guards: the shims refuse a host outside .invalid and a password
+ *   (g) a php file the node keeps (its _test.php) that does not parse stops
+ *       the deploy before anything goes live on any node, as the live lint
+ *       after the swap would otherwise stop it with one node already live; a
+ *       node file whose name has a space, and a RETIRED file that no longer
+ *       parses, stop nothing (scenario (a));
+ *   (h) a rename that fails part way through the swap: the same command puts
+ *       the previous release back, stamp included, the files it added moved
+ *       back to ~/reticulum-incoming;
+ *   (i) a connection that drops part way through the swap (SIGHUP and SIGPIPE
+ *       to the node's shell, the answer lost): the node finishes the swap;
+ *   (j) deploy.sh refuses a RETIRED list naming a file the node owns
+ *       (config.php, _test.php) before it contacts any node; and (a) holds
+ *       whatever RETIRED lists, nothing included;
+ *   (k) the guards: the shims refuse a host outside .invalid and a password
  *       other than the fake one, and the wrapper refuses a deploy.env that
  *       names a real host or lies outside the sandbox.
  *
  * Run: php tests/deploy_never_mixes_releases_test.php
  * Against another deploy.sh (to see what it would fail):
  *   DEPLOY_SH_UNDER_TEST=/path/to/deploy.sh php tests/deploy_never_mixes_releases_test.php
+ * With dash as the nodes' shell, to hold the remote commands to POSIX sh:
+ *   STUB_REMOTE_SHELL=dash php tests/deploy_never_mixes_releases_test.php
  */
 declare(strict_types=1);
 
@@ -190,8 +206,11 @@ foreach ([$deploySh, $repo . '/verify-deploy.sh', $repo . '/write-build-stamp.sh
         if ($code === '' || $code[0] === '#') {
             continue;
         }
-        if (preg_match('#(^|[\s;&|(`"\'])/[^\s;&|]*/(ssh|scp|sshpass)\b#', $code)) {
-            refuse(basename($script) . ':' . ($n + 1) . ' calls ssh, scp or sshpass by absolute path, past the shims');
+        if (preg_match('#(^|[\s;&|(`"\'])/[^\s;&|]*/(ssh|scp|sshpass|curl|wget|rsync|sftp|nc)\b#', $code)) {
+            refuse(basename($script) . ':' . ($n + 1) . ' calls a network tool by absolute path, past the shims');
+        }
+        if (preg_match('#\b(curl|wget|verify-live-stamp\.sh)\b|https?://#', $code)) {
+            refuse(basename($script) . ':' . ($n + 1) . ' fetches a URL, which the stand-ins do not cover');
         }
         if (preg_match('#(^|[;&|]\s*|\b(then|do|else)\s+)(source|\.)\s+\S*deploy\.env#', $code)) {
             refuse(basename($script) . ':' . ($n + 1) . ' sources a deploy.env itself');
@@ -227,15 +246,44 @@ file_put_contents($fakeEnv, implode("\n", [
     '',
 ]));
 
-// RETIRED, as the working tree's deploy.sh lists it (whatever is under test).
-$retired = [];
-if (preg_match('/^RETIRED=\((.*?)^\)/ms', (string) file_get_contents($repo . '/deploy.sh'), $m)) {
-    foreach (explode("\n", $m[1]) as $line) {
-        $entry = trim(preg_replace('/#.*/', '', $line));
-        if ($entry !== '') {
-            $retired[] = $entry;
+/**
+ * A bash array's entries as a script assigns it (NAME=( ... ), on one line or
+ * several, with comments); null when the script has no such assignment.
+ * @return list<string>|null
+ */
+function bashArray(string $script, string $name): ?array
+{
+    $entries = null;
+    foreach (file($script, FILE_IGNORE_NEW_LINES) as $line) {
+        if ($entries === null) {
+            if (!preg_match('/^' . preg_quote($name, '/') . '=\((.*)$/', $line, $m)) {
+                continue;
+            }
+            $entries = [];
+            $line = $m[1];
+        }
+        $code = trim((string) preg_replace('/#.*/', '', $line));
+        $closed = strpos($code, ')');
+        if ($closed !== false) {
+            $code = substr($code, 0, $closed);
+        }
+        if (trim($code) !== '') {
+            array_push($entries, ...preg_split('/\s+/', trim($code)));
+        }
+        if ($closed !== false) {
+            return $entries;
         }
     }
+    return null;
+}
+
+// RETIRED, as the working tree's deploy.sh lists it (whatever is under test).
+// It may be empty: entries are dropped once every node is past them. The
+// deploy's own "retiring, where present:" line is checked against it, so a
+// list this parser misread fails the test instead of silently testing less.
+$retired = bashArray($repo . '/deploy.sh', 'RETIRED');
+if ($retired === null) {
+    refuse('deploy.sh has no RETIRED=( ... ) list to take the expected removals from');
 }
 
 // ── The stand-ins ───────────────────────────────────────────────────────
@@ -298,12 +346,21 @@ home="$STUB_NODES/$node"
 op=$(next_op)
 before=$(live_fp "$home")
 stamp_before=$(stamp "$home")
-(cd "$home" && HOME="$home" STUB_OP="$op" STUB_NODE="$node" PATH="$STUB_REMOTE_BIN:$PATH" bash -c "$*")
+# The command's output is held back until it ends: when the node side marks
+# the connection dropped (the mv stand-in's STUB_MV_HUP), none of it arrives.
+(cd "$home" && HOME="$home" STUB_OP="$op" STUB_NODE="$node" PATH="$STUB_REMOTE_BIN:$PATH" "$STUB_REMOTE_SHELL" -c "$*") > "$STUB_SANDBOX/ssh-out"
 rc=$?
+if [[ -f "$STUB_LOG.dropped" ]]; then
+  rm -f "$STUB_LOG.dropped"
+  : > "$STUB_SANDBOX/ssh-out"
+  echo "stand-in: connection to $target lost" >&2
+  rc=255
+fi
 changed=0
 [[ "$before" != "$(live_fp "$home")" ]] && changed=1
 printf 'OP\t%s\tssh\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$op" "$node" "${STUB_VIA:-key}" "$batch" "$changed" "$rc" \
   "$stamp_before" "$(stamp "$home")" "$*" >> "$STUB_LOG"
+while IFS= read -r line || [[ -n "$line" ]]; do printf '%s\n' "$line"; done < "$STUB_SANDBOX/ssh-out"
 exit $rc
 SH,
     $bin . '/scp' => <<<'SH'
@@ -373,11 +430,26 @@ SH,
     $remoteBin . '/mv' => <<<'SH'
 #!/usr/bin/env bash
 # mv on the node: logs what the stamp said at the instant of each rename.
+# STUB_MV_FAIL=<rel>: renaming ~/reticulum-incoming/<rel> fails (a full disk).
+# STUB_MV_HUP=<rel>: before renaming it, the connection drops: the shell
+# running the command gets SIGHUP and SIGPIPE, and the ssh stand-in returns
+# none of its output.
 . "$STUB_LIB"
 ops=()
 for a in "$@"; do case "$a" in -*) ;; *) ops+=("$a") ;; esac; done
+src=$(abs_path "${ops[0]:-}")
+if [[ -n "${STUB_MV_FAIL:-}" && "$src" == "$HOME/reticulum-incoming/$STUB_MV_FAIL" ]]; then
+  printf 'MVFAIL\t%s\t%s\t%s\n' "${STUB_OP:-?}" "${STUB_NODE:-?}" "$src" >> "$STUB_LOG"
+  echo "mv: cannot move '${ops[0]}': Disk quota exceeded" >&2
+  exit 1
+fi
+if [[ -n "${STUB_MV_HUP:-}" && "$src" == "$HOME/reticulum-incoming/$STUB_MV_HUP" ]]; then
+  : > "$STUB_LOG.dropped"
+  kill -HUP "$PPID"
+  kill -PIPE "$PPID"
+fi
 printf 'MV\t%s\t%s\t%s\t%s\t%s\n' "${STUB_OP:-?}" "${STUB_NODE:-?}" "$(stamp "$HOME")" \
-  "$(abs_path "${ops[0]:-}")" "$(abs_path "${ops[1]:-}")" >> "$STUB_LOG"
+  "$src" "$(abs_path "${ops[1]:-}")" >> "$STUB_LOG"
 exec /bin/mv "$@"
 SH,
     $remoteBin . '/rm' => <<<'SH'
@@ -407,11 +479,14 @@ SH,
 # php on the node. `php -l <file>` is the real lint (remembered by content,
 # so the same bytes are not linted twice), logged with where it ran.
 # STUB_LINT_FAIL_NODE=<node> fails every lint on that node;
-# STUB_LIVE_LINT_FAIL_NODE=<node> fails only lints run in its live directory.
+# STUB_LIVE_LINT_FAIL_NODE=<node> fails only lints run in its live directory
+# after the swap (while the stamp says "unknown").
 if [[ $# -eq 2 && "$1" == "-l" ]]; then
   f="$2"
+  . "$STUB_LIB"
   if [[ -n "${STUB_LINT_FAIL_NODE:-}" && "$STUB_LINT_FAIL_NODE" == "${STUB_NODE:-}" ]] \
-     || [[ -n "${STUB_LIVE_LINT_FAIL_NODE:-}" && "$STUB_LIVE_LINT_FAIL_NODE" == "${STUB_NODE:-}" && "$PWD" == "$HOME/public_html/reticulum" ]]; then
+     || [[ -n "${STUB_LIVE_LINT_FAIL_NODE:-}" && "$STUB_LIVE_LINT_FAIL_NODE" == "${STUB_NODE:-}" \
+           && "$PWD" == "$HOME/public_html/reticulum" && "$(stamp "$HOME")" == '{"commit":null}' ]]; then
     printf 'LINT\t%s\t%s\t%s\t%s\tfail\n' "${STUB_OP:-?}" "${STUB_NODE:-?}" "$PWD" "$f" >> "$STUB_LOG"
     echo "PHP Parse error:  stand-in parse error in $f on line 1"
     echo "Errors parsing $f"
@@ -454,13 +529,22 @@ for v in RETICHAT_SSH_HOST SELECTIV_SSH_HOST; do
     *) echo "wrapper: refusing: $v=${!v:-} is not a stand-in in .invalid" >&2; exit 97 ;;
   esac
 done
-for tool in ssh scp sshpass; do
+for tool in ssh scp sshpass curl wget rsync sftp nc; do
   [ "$(command -v "$tool")" = "$STUB_BIN/$tool" ] \
     || { echo "wrapper: refusing: $tool resolves to $(command -v "$tool"), not the stand-in" >&2; exit 97; }
 done
 exec bash "$@"
 SH,
 ];
+// Nothing under test calls these (the test refuses to run a script that
+// does), but should one start to, it reaches no host either.
+foreach (['curl', 'wget', 'rsync', 'sftp', 'nc'] as $tool) {
+    $scripts[$bin . '/' . $tool] = <<<SH
+#!/usr/bin/env bash
+. "\$STUB_LIB"
+refuse "$tool \$*"
+SH;
+}
 foreach ($scripts as $path => $script) {
     file_put_contents($path, $script);
     chmod($path, 0755);
@@ -482,6 +566,8 @@ $baseEnv = [
     'STUB_REAL_PHP' => PHP_BINARY,
     'STUB_FAKE_PASS' => FAKE_PASS,
     'DEPLOY_SKIP_TESTS' => '1',
+    // The shell the stand-in nodes run commands with (dash: are they POSIX?).
+    'STUB_REMOTE_SHELL' => getenv('STUB_REMOTE_SHELL') ?: 'bash',
 ];
 
 /** env -i with only the sandbox's variables, stdin from /dev/null. */
@@ -579,8 +665,11 @@ $resetNode = static function (string $home) use ($headCode, $retired, $oldStampJ
     foreach ($headCode as $rel => $content) {
         put("$live/$rel", preg_replace('/<\?php/', '<?php /* previous release */', $content, 1));
     }
-    foreach ($retired as $rel) {
-        put("$live/$rel", "<?php\n// $rel, as the previous release had it\n");
+    // The last RETIRED file no longer parses: the swap removes it, so the
+    // lint before the swap must not stop the deploy over it.
+    foreach ($retired as $i => $rel) {
+        put("$live/$rel", "<?php\n// $rel, as the previous release had it\n"
+            . ($i === count($retired) - 1 ? "function (\n" : ''));
     }
     put("$live/build.json", $oldStampJson . "\n");
     // The node's own: secrets, state, logs, and files no commit ever had.
@@ -589,6 +678,7 @@ $resetNode = static function (string $home) use ($headCode, $retired, $oldStampJ
     put("$live/config.php", "<?php\nreturn ['owned_by' => 'the node'];\n");
     put("$live/_test.php", "<?php\n// a node-owned scratch file\n");
     put("$live/local_tool.php", "<?php\n// a php file the node keeps that no commit has\n");
+    put("$live/local tool.php", "<?php\n// another, whose name has a space\n");
     put("$live/lib/local_extra.php", "<?php\n// another, in lib/\n");
     put("$live/notes.txt", "not code\n");
     put("$live/.htaccess", "Options -Indexes\n");
@@ -636,6 +726,12 @@ check('the deploy of HEAD to both nodes exits 0, verified', $code === 0 && str_c
 check('no host outside .invalid was asked for, and no other password', $log['refused'] === [], implode('; ', $log['refused']));
 
 $removeSet = array_values(array_diff($retired, array_keys($headCode)));
+$announced = preg_match('/retiring, where present: (.+)$/m', $out, $m) ? preg_split('/\s+/', trim($m[1])) : [];
+sort($announced);
+$expectedRemovals = $removeSet;
+sort($expectedRemovals);
+check('deploy.sh retires exactly the RETIRED files HEAD lacks' . ($removeSet === [] ? ' (none: RETIRED lists nothing HEAD lacks)' : ''),
+    $announced === $expectedRemovals, 'it said: ' . (implode(' ', $announced) ?: 'nothing') . '; expected: ' . (implode(' ', $expectedRemovals) ?: 'nothing'));
 $firstLive = null;
 foreach ($log['ops'] as $o) {
     if ($o['changed']) {
@@ -673,6 +769,23 @@ foreach ($nodes as $name => $home) {
     check("$name: the node's php -l ran on every file of the ref before it went live", $lintedFiles === $codeFiles,
         'linted ' . count($lintedFiles) . ' of ' . count($codeFiles));
 
+    // The live lint after the swap meets the php files the node keeps, so
+    // they are linted before anything goes live too; the files the swap
+    // removes are not (the last RETIRED one does not parse).
+    $nodeKept = [];
+    foreach (array_keys($before[$name]) as $rel) {
+        $short = substr($rel, strlen('public_html/reticulum/'));
+        if ($isLiveCode($rel) && !isset($headCode[$short]) && !in_array($short, $removeSet, true)) {
+            $nodeKept[] = $short;
+        }
+    }
+    sort($nodeKept);
+    $keptLinted = array_values(array_unique(array_column(array_filter($log['lints'], static fn (array $l): bool => $l['node'] === $name
+        && $l['pwd'] === "$home/public_html/reticulum" && $firstLive !== null && $l['op'] < $firstLive), 'file')));
+    sort($keptLinted);
+    check("$name: ...and on every php file the node keeps that the swap leaves live, not on the ones it removes",
+        $keptLinted === $nodeKept, 'linted: ' . implode(', ', $keptLinted) . '; expected: ' . implode(', ', $nodeKept));
+
     $changing = array_values(array_filter($nodeOps, static fn (array $o): bool => $o['changed']));
     check("$name: exactly one remote command changed the live directory, an ssh (the swap)",
         count($changing) === 1 && $changing[0]['kind'] === 'ssh', $describeOps($changing));
@@ -700,8 +813,8 @@ foreach ($nodes as $name => $home) {
     check("$name: ...and the node names HEAD once verified", stampCommit($live) === $head, (string) stampCommit($live));
 
     $stillThere = array_values(array_filter($removeSet, static fn (string $rel): bool => file_exists("$live/$rel")));
-    check("$name: the RETIRED files are gone from the live directory", $removeSet !== [] && $stillThere === [],
-        $removeSet === [] ? 'RETIRED lists nothing the ref lacks' : implode(', ', $stillThere));
+    check("$name: the RETIRED files are gone from the live directory" . ($removeSet === [] ? ' (RETIRED lists nothing to remove)' : ''),
+        $stillThere === [], implode(', ', $stillThere));
 
     $notHeld = [];
     foreach ($before[$name] as $rel => $hash) {
@@ -823,8 +936,92 @@ $liveOnly = static fn (array $snap): array => array_filter($snap,
 check('...the live directory is untouched: code, RETIRED files and stamp', $liveOnly($afterG) === $liveOnly($beforeG),
     snapshotDiff($liveOnly($beforeG), $liveOnly($afterG)));
 
-// ── (g) the guards ───────────────────────────────────────────────────────
-echo "(g) the stand-ins and the wrapper refuse anything that is not the sandbox\n";
+// ── (g) a php file the node keeps that does not parse ────────────────────
+echo "(g) a php file the node keeps that does not parse stops the deploy before anything goes live\n";
+foreach ($nodes as $name => $nodeHome) {
+    $resetNode($nodeHome);
+}
+put($nodes['retichat'] . '/public_html/reticulum/_test.php', "<?php\n// the node's own scratch file, broken\nfunction (\n");
+foreach ($nodes as $name => $nodeHome) {
+    $before[$name] = snapshot($nodeHome);
+}
+[$code, $out, $log] = $deploy('HEAD');
+check('the deploy exits non-zero, naming the node\'s _test.php, before any verification',
+    $code !== 0 && preg_match('/on the node, not in [0-9a-f]+: \S*_test\.php: php -l exited/', $out) === 1
+    && str_contains($out, 'nothing went live on any node') && !str_contains($out, 'Verifying deployed bytes'), $out);
+foreach ($nodes as $name => $nodeHome) {
+    check("$name: nothing outside ~/reticulum-incoming changed: live code, stamp, rollback copy",
+        $withoutIncoming(snapshot($nodeHome)) === $withoutIncoming($before[$name]),
+        snapshotDiff($withoutIncoming($before[$name]), $withoutIncoming(snapshot($nodeHome))));
+}
+
+// ── (h) a rename that fails part way ─────────────────────────────────────
+echo "(h) a swap that fails part way puts the previous release back in the same command\n";
+$added = 'lib/added_by_this_release.php';
+$withAdded = $commitOnHead(["php/src/$added" => "<?php\n// new in this release\n"], 'deploy test: a release that adds a file');
+$resetNode($home);
+$beforeH = snapshot($home);
+[$code, $out, $log] = $deploy($withAdded, 'retichat', ['STUB_MV_FAIL' => 'index.php']);
+check('the deploy exits non-zero, saying the swap failed and was undone, before verification',
+    $code !== 0 && str_contains($out, 'swap failed and was undone') && !str_contains($out, 'Verifying deployed bytes'), $out);
+check('...with no rollback for a person to run', !str_contains($out, 'roll back with'), $out);
+$swapOps = array_values(array_filter($log['ops'], static fn (array $o): bool => str_contains($o['detail'], 'mv -f')));
+$swapMvs = array_values(array_filter($log['mvs'], static fn (array $m): bool => $m['op'] === ($swapOps[0]['op'] ?? -1)));
+$addedIn = array_filter($swapMvs, static fn (array $m): bool => $m['src'] === "$home/reticulum-incoming/$added" && $m['dst'] === "$live/$added");
+$addedOut = array_filter($swapMvs, static fn (array $m): bool => $m['src'] === "$live/$added" && $m['dst'] === "$home/reticulum-incoming/$added");
+$putBack = array_filter($swapMvs, static fn (array $m): bool => $m['src'] === "$home/reticulum-incoming/.put-back" && within($m['dst'], $live));
+check('...one command renamed lib/ in, the new file included, failed at the entry point, and renamed it all back',
+    count($swapOps) === 1 && $addedIn !== [] && $addedOut !== [] && count($putBack) > 1
+    && array_filter($log['ops'], static fn (array $o): bool => $o['changed']) === [],
+    count($swapOps) . ' swap command(s), ' . count($swapMvs) . ' renames, ' . count($putBack) . ' put back');
+check('...the live directory is exactly as before: code, RETIRED files, stamp, the node\'s own files',
+    $liveOnly(snapshot($home)) === $liveOnly($beforeH), snapshotDiff($liveOnly($beforeH), $liveOnly(snapshot($home))));
+check('...the file the release added went back to ~/reticulum-incoming, not deleted',
+    !file_exists("$live/$added") && is_file("$home/reticulum-incoming/$added"));
+check('...no rm touched the live directory', array_filter($log['rms'], static fn (array $r): bool => within($r['path'], $live)) === [],
+    implode(', ', array_column($log['rms'], 'path')));
+check('...and ~/reticulum-rollback still holds the previous tree', (function () use ($beforeH, $home, $isLiveCode): bool {
+    foreach ($beforeH as $rel => $hash) {
+        if ($isLiveCode($rel) && @md5_file("$home/reticulum-rollback/" . substr($rel, strlen('public_html/reticulum/'))) !== $hash) {
+            return false;
+        }
+    }
+    return true;
+})());
+
+// ── (i) the connection drops part way through the swap ──────────────────
+echo "(i) a connection that drops part way through the swap does not stop it there\n";
+$resetNode($home);
+[$code, $out, $log] = $deploy('HEAD', 'retichat', ['STUB_MV_HUP' => 'index.php']);
+check('the deploy exits non-zero with no answer from the node, printing the rollback command, before verification',
+    $code !== 0 && str_contains($out, 'no answer from the node') && str_contains($out, 'roll back with')
+    && !str_contains($out, 'Verifying deployed bytes'), $out);
+$mismatched = array_keys(array_filter($headCode, static fn (string $content, string $rel): bool => @file_get_contents("$live/$rel") !== $content, ARRAY_FILTER_USE_BOTH));
+check('...the node, hung up on, finished the swap: the live code is the ref\'s, every file', $mismatched === [],
+    count($mismatched) . ' of ' . count($headCode) . ' not the ref\'s: ' . implode(', ', array_slice($mismatched, 0, 5)));
+$stillThere = array_values(array_filter($removeSet, static fn (string $rel): bool => file_exists("$live/$rel")));
+check('...the RETIRED files are gone', $stillThere === [], implode(', ', $stillThere));
+check('...and the stamp says "unknown"', stampCommit($live) === null, (string) stampCommit($live));
+
+// ── (j) a RETIRED list naming a file the node owns ───────────────────────
+echo "(j) deploy.sh refuses a RETIRED list that names a file the node owns\n";
+$underTest = (string) file_get_contents($deploySh);
+foreach (['config.php', '_test.php'] as $owned) {
+    if (preg_match('/^RETIRED=\(/m', $underTest) !== 1) {
+        check("RETIRED listing $owned is refused", false, 'the deploy.sh under test has no RETIRED list');
+        continue;
+    }
+    $variant = $clone . '/deploy-retiring-' . $owned . '.sh';
+    file_put_contents($variant, preg_replace('/^RETIRED=\(/m', 'RETIRED=(' . $owned . ' ', $underTest, 1));
+    chmod($variant, 0755);
+    @unlink($stubLog);
+    [$code, $out] = $isolated(implode(' ', array_map('esc', ['bash', $wrapper, $fakeEnv, $variant, 'HEAD'])));
+    check("RETIRED listing $owned is refused before any node is contacted",
+        $code !== 0 && str_contains($out, "RETIRED lists $owned") && !is_file($stubLog), $out);
+}
+
+// ── (k) the guards ───────────────────────────────────────────────────────
+echo "(k) the stand-ins and the wrapper refuse anything that is not the sandbox\n";
 @unlink($stubLog);
 [$code, $out] = $isolated(esc("$bin/ssh") . ' -o BatchMode=yes stub@guard-test.example ' . esc('echo ran-on-the-node'));
 check('the ssh stand-in refuses a host outside .invalid, running nothing',
@@ -834,6 +1031,9 @@ check('the ssh stand-in refuses a host outside .invalid, running nothing',
 check('the scp stand-in refuses one too', $code === 255 && str_contains((string) @file_get_contents($stubLog), 'REFUSED'), $out);
 [$code, $out] = $isolated('env SSHPASS=some-other-password ' . esc("$bin/sshpass") . ' -e ssh stub@retichat.invalid ' . esc('echo ran-on-the-node'));
 check('the sshpass stand-in refuses any password but the fake one', $code === 255 && !str_contains($out, 'ran-on-the-node'), $out);
+@unlink($stubLog);
+[$code, $out] = $isolated('curl -s https://guard-test.example/health');
+check('curl on the sandbox PATH is a stand-in that refuses', $code === 255 && str_contains((string) @file_get_contents($stubLog), 'REFUSED'), $out);
 $guardEnv = $tmp . '/guard.env';
 file_put_contents($guardEnv, "export RETICHAT_SSH_HOST=\"stub@guard-test.example\"\nexport SELECTIV_SSH_HOST=\"stub@selectiv.invalid\"\n");
 @unlink($stubLog);

@@ -36,14 +36,20 @@
 #
 #   stage — every node receives the ref's *.php and lib/*.php in a fresh
 #           ~/reticulum-incoming, outside the web root, and lints them with
-#           its own php -l. If any file fails on any node the deploy stops
-#           there, with nothing changed live on any node, stamps included.
+#           its own php -l, together with every php file the node keeps in the
+#           live directory that the ref does not replace or retire (config.php,
+#           _test.php, a local tool): the files the live lint after the swap
+#           will meet. If any file fails on any node the deploy stops there,
+#           with nothing changed live on any node, stamps included.
 #   swap  — then, node by node, the rollback copy is refreshed, and ONE ssh
 #           command checks it, clears the stamp, mv's every incoming file over
 #           its live name (lib/ first, so a request that meets a new entry
 #           point meets the whole new lib/; each rename is atomic and the set
-#           takes milliseconds) and removes the RETIRED files. The live files
-#           are then linted again.
+#           takes milliseconds) and removes the RETIRED files. If a rename or
+#           removal fails, the same command puts back what it had changed, from
+#           the rollback copy, stamp included. It ignores a hang-up, so a
+#           dropped connection does not stop it half way. The live files are
+#           then linted again.
 #
 # It also leaves a build stamp: build.json (write-build-stamp.sh) names the
 # commit, and GET /health publishes it, so verify-live-stamp.sh can say which
@@ -51,12 +57,13 @@
 # the node was not proven to run, so before any code goes live the node's
 # stamp is replaced with an unknown one ({"commit":null}), in the same command
 # as the swap, and the new stamp is uploaded only after verify-deploy.sh has
-# proved every node's bytes. A deploy that stops before the swap leaves the
-# node's code and stamp as they were; one that stops after it leaves
-# "unknown", never the old commit's name on new code or the new commit's name
-# on unverified code. The rollback copy (~/reticulum-rollback, outside the web
-# root) carries the previous stamp (or an explicit unknown one), so restoring
-# it does not leave the new commit's name on old code either.
+# proved every node's bytes. A deploy that stops before the swap, or whose
+# swap failed and was put back, leaves the node's code and stamp as they were;
+# one that stops after it leaves "unknown", never the old commit's name on new
+# code or the new commit's name on unverified code. The rollback copy
+# (~/reticulum-rollback, outside the web root) carries the previous stamp (or
+# an explicit unknown one), so restoring it does not leave the new commit's
+# name on old code either.
 #
 # Credentials come from the environment. Keep them in a gitignored deploy.env:
 #
@@ -100,9 +107,11 @@ EXCLUDE=(config.toml config.local.toml config.php _test.php)
 # ships it itself: `./deploy.sh <older-ref>` keeps what that ref needs.
 #
 # Add a file here in the commit that deletes it. Drop an entry once every node
-# has deployed past that commit. Only top-level and lib/ .php files, which is
-# all the rollback copy holds. Nothing that is not listed here is ever
-# removed: not config, not var/, not a file the node keeps for itself.
+# has deployed past that commit; an empty list is fine. Only top-level and
+# lib/ .php files, which is all the rollback copy holds, and never a file in
+# EXCLUDE: deploy.sh refuses to start otherwise. Nothing that is not listed
+# here is ever removed: not config, not var/, not a file the node keeps for
+# itself.
 RETIRED=(
   post_interface.php                     # e3c05ea
   lib/request_post_interface_trait.php   # e3c05ea
@@ -111,6 +120,18 @@ RETIRED=(
 
 die() { echo "${RED}✗ $*${NC}" >&2; exit 1; }
 step() { echo; echo "${CYAN}▸ $*${NC}"; }
+
+# File names that go into remote shell commands: only plain ones pass.
+NAME_RE='^(lib/)?[A-Za-z0-9._-]+\.php$'
+
+for retired in ${RETIRED[@]+"${RETIRED[@]}"}; do
+  [[ "$retired" =~ $NAME_RE ]] \
+    || die "RETIRED may list only top-level and lib/ .php files, all the rollback copy holds: ${retired}"
+  for excluded in "${EXCLUDE[@]}"; do
+    [[ "$retired" != "$excluded" ]] \
+      || die "RETIRED lists ${retired}, a file the node owns (EXCLUDE); a deploy never removes it"
+  done
+done
 
 trap 'echo "${RED}deploy aborted${NC}"' ERR
 
@@ -208,7 +229,6 @@ echo "  ${GREEN}✓${NC} build stamp: $(cat "$STAGE_SRC/build.json")"
 
 # The ref's code as paths under php/src, lib/ first: the swap renames in this
 # order. The names go into remote shell commands, so only plain ones pass.
-NAME_RE='^(lib/)?[A-Za-z0-9._-]+\.php$'
 CODE_FILES=""
 for path in "$STAGE_SRC"/lib/*.php "$STAGE_SRC"/*.php; do
   [[ -f "$path" ]] || continue
@@ -219,10 +239,9 @@ done
 [[ -n "$CODE_FILES" ]] || die "${REF_SHA} has no php files under ${SRC_PREFIX}"
 
 # The RETIRED files this ref does not ship: the swap removes exactly these.
+# (RETIRED's names were checked at the top.)
 REMOVE_FILES=""
 for retired in ${RETIRED[@]+"${RETIRED[@]}"}; do
-  [[ "$retired" =~ $NAME_RE ]] \
-    || die "RETIRED may list only top-level and lib/ .php files, all the rollback copy holds: ${retired}"
   case " ${CODE_FILES} " in
     *" ${retired} "*) echo "  ${DIM}${retired} is RETIRED but ${REF_SHA} ships it — kept${NC}" ;;
     *) REMOVE_FILES="${REMOVE_FILES:+${REMOVE_FILES} }${retired}" ;;
@@ -232,9 +251,16 @@ done
 
 # Sentinels the remote commands print last, so a lint or swap that did not
 # run to the end (a dropped connection, a missing directory) is never read as
-# one that found nothing wrong.
+# one that found nothing wrong. SWAP_UNDONE: the swap failed part way and put
+# back everything it had changed.
 LINT_OK="lint-ok"
 SWAP_OK="swap-ok"
+SWAP_UNDONE="swap-undone"
+
+# A remote shell function: php -l "$1", printing nothing when it passes and
+# otherwise "$2$1: php -l exited N" with php's own messages. Quoted, so a file
+# the node keeps may have any name.
+REMOTE_LINT_FN="lint() { out=\$(php -l \"\$1\" 2>&1) || echo \"\$2\$1: php -l exited \$?\"; printf '%s\n' \"\$out\" | grep -v '^No syntax errors'; }"
 
 # ── 4. Upload to every node, outside its web root, and lint there ────────
 # Sets host, scp_cmd and ssh_cmd for one node; returns 1 when its host is not
@@ -296,14 +322,26 @@ stage_node() {
   fi
 
   # The node's own php -l on every file of the ref, by name, so one that did
-  # not arrive fails as well. The swap renames, so incoming and live must be
-  # on one filesystem: across two, mv copies and is not atomic.
-  local lint
-  lint="$("${ssh_cmd[@]}" "$host" "cd ~/${INCOMING_DIR} || exit 1; dev() { stat -c %d \"\$1\" 2>/dev/null || stat -f %d \"\$1\"; }; [ \"\$(dev .)\" = \"\$(dev ~/${REMOTE_DIR})\" ] || echo '~/${INCOMING_DIR} and ~/${REMOTE_DIR} are on different filesystems'; for f in ${CODE_FILES}; do out=\$(php -l \$f 2>&1) || echo \"\$f: php -l exited \$?\"; printf '%s\n' \"\$out\" | grep -v '^No syntax errors'; done; echo ${LINT_OK}")"
+  # not arrive fails as well; then on every php file in the live directory
+  # that the swap leaves in place (the node's config.php, _test.php, a local
+  # tool), because the live lint after the swap meets those too, and a
+  # failure there would come only after this node had gone live. The swap
+  # renames, so incoming and live must be on one filesystem: across two, mv
+  # copies and is not atomic.
+  local lint stage_lint="cd ~/${INCOMING_DIR} || exit 1"
+  stage_lint+="; dev() { stat -c %d \"\$1\" 2>/dev/null || stat -f %d \"\$1\"; }"
+  stage_lint+="; [ \"\$(dev .)\" = \"\$(dev ~/${REMOTE_DIR})\" ] || echo '~/${INCOMING_DIR} and ~/${REMOTE_DIR} are on different filesystems'"
+  stage_lint+="; ${REMOTE_LINT_FN}"
+  stage_lint+="; for f in ${CODE_FILES}; do lint \"\$f\" ''; done"
+  stage_lint+="; cd ~/${REMOTE_DIR} || exit 1"
+  # A name with anything but the plain characters is never one of the ref's.
+  stage_lint+="; for f in *.php lib/*.php; do [ -f \"\$f\" ] || continue; case \"\$f\" in *[!A-Za-z0-9._/-]*) ;; *) case ' ${CODE_FILES} ${REMOVE_FILES} ' in *\" \$f \"*) continue ;; esac ;; esac; lint \"\$f\" 'on the node, not in ${REF_SHA}: ~/${REMOTE_DIR}/'; done"
+  stage_lint+="; echo ${LINT_OK}"
+  lint="$("${ssh_cmd[@]}" "$host" "$stage_lint")"
   if [[ "$lint" != "$LINT_OK" ]]; then
-    echo "${RED}  ${REF_SHA} fails the lint on ${label}:${NC}"
+    echo "${RED}  the lint on ${label} failed:${NC}"
     sed -e "/^${LINT_OK}\$/d" -e 's/^/    /' <<< "${lint:-(no answer from the node)}"
-    die "${label}: ${REF_SHA} does not parse there — nothing went live on any node"
+    die "${label}: a file does not parse there (${REF_SHA}'s, or one the node keeps) — nothing went live on any node"
   fi
 
   STAGED="${STAGED}${label}|${host_var}|${pass_var}"$'\n'
@@ -324,38 +362,61 @@ swap_node() {
     "cd ~/${REMOTE_DIR} && rm -rf ~/${ROLLBACK_DIR} && mkdir -p ~/${ROLLBACK_DIR}/lib && cp *.php ~/${ROLLBACK_DIR}/ 2>/dev/null; cp lib/*.php ~/${ROLLBACK_DIR}/lib/ 2>/dev/null; if [ -f build.json ]; then cp build.json ~/${ROLLBACK_DIR}/; else echo '{\"commit\":null}' > ~/${ROLLBACK_DIR}/build.json; fi; true" \
     || die "${label}: backup failed"
 
-  # The swap, in ONE command. It refuses, with nothing changed, unless every
-  # incoming file is there and the rollback copy holds every live file it
-  # replaces or removes. Then the stamp says "unknown" (from here until the
-  # stamp step the node's code is unproven), every file is renamed over its
-  # live name, and the RETIRED files the ref does not ship are removed.
+  # The swap, in ONE command. It ignores a hang-up and a closed output, so a
+  # connection that drops part way does not leave half a release live: the
+  # node finishes (or undoes) the swap on its own. It refuses, with nothing
+  # changed, unless every incoming file is there and the rollback copy holds
+  # every live file it replaces or removes, and the stamp. Then the stamp says
+  # "unknown" (from here until the stamp step the node's code is unproven),
+  # every file is renamed over its live name, and the RETIRED files the ref
+  # does not ship are removed. If any of that fails, it puts back what it had
+  # changed, each file by a rename again: from the rollback copy what was
+  # there before, and back into ~/reticulum-incoming what was not (it never
+  # deletes a file to undo), then the old stamp.
+  local inc="~/${INCOMING_DIR}" rb="~/${ROLLBACK_DIR}"
   local swap="cd ~/${REMOTE_DIR} || exit 1"
-  swap+="; for f in ${CODE_FILES}; do [ -f ~/${INCOMING_DIR}/\$f ] || { echo \"~/${INCOMING_DIR}/\$f is missing; nothing changed\"; exit 1; }; done"
-  swap+="; for f in *.php lib/*.php; do [ -f \"\$f\" ] || continue; sum=\$(cksum < \"\$f\") && [ \"\$sum\" = \"\$(cksum 2>/dev/null < ~/${ROLLBACK_DIR}/\"\$f\")\" ] || { echo \"~/${ROLLBACK_DIR} does not hold \$f; nothing changed\"; exit 1; }; done"
-  swap+="; echo '{\"commit\":null}' > build.json || exit 1"
-  swap+="; for f in ${CODE_FILES}; do mv -f ~/${INCOMING_DIR}/\$f \$f || exit 1; done"
+  swap+="; trap '' HUP PIPE"
+  swap+="; for f in ${CODE_FILES}; do [ -f ${inc}/\$f ] || { echo \"${inc}/\$f is missing; nothing changed\"; exit 1; }; done"
+  swap+="; for f in *.php lib/*.php; do [ -f \"\$f\" ] || continue; sum=\$(cksum < \"\$f\") && [ \"\$sum\" = \"\$(cksum 2>/dev/null < ${rb}/\"\$f\")\" ] || { echo \"${rb} does not hold \$f; nothing changed\"; exit 1; }; done"
+  swap+="; [ -f ${rb}/build.json ] || { echo '${rb} does not hold build.json; nothing changed'; exit 1; }"
+  swap+="; failed= moved="
+  swap+="; echo '{\"commit\":null}' > build.json || failed=build.json"
+  swap+="; if [ -z \"\$failed\" ]; then for f in ${CODE_FILES}; do mv -f ${inc}/\$f \$f || { failed=\$f; break; }; moved=\"\$moved \$f\"; done; fi"
   if [[ -n "$REMOVE_FILES" ]]; then
-    swap+="; for f in ${REMOVE_FILES}; do rm -f \$f || exit 1; done"
+    swap+="; if [ -z \"\$failed\" ]; then for f in ${REMOVE_FILES}; do rm -f \$f || { failed=\$f; break; }; done; fi"
   fi
+  swap+="; if [ -n \"\$failed\" ]; then bad="
+  swap+="; put_back() { cp ${rb}/\$1 ${inc}/.put-back && mv -f ${inc}/.put-back \$1; }"
+  swap+="; for f in \$moved; do if [ -f ${rb}/\$f ]; then put_back \$f || bad=\"\$bad \$f\"; else mv -f \$f ${inc}/\$f || bad=\"\$bad \$f\"; fi; done"
+  if [[ -n "$REMOVE_FILES" ]]; then
+    swap+="; for f in ${REMOVE_FILES}; do [ -f \$f ] || [ ! -f ${rb}/\$f ] || put_back \$f || bad=\"\$bad \$f\"; done"
+  fi
+  swap+="; put_back build.json || bad=\"\$bad build.json\""
+  swap+="; if [ -z \"\$bad\" ]; then echo \"could not put \$failed in place; put back the release the node ran, stamp included, from ${rb}\"; echo ${SWAP_UNDONE}"
+  swap+="; else echo \"could not put \$failed in place, and could not put back:\$bad\"; fi"
+  swap+="; exit 1; fi"
   swap+="; echo ${SWAP_OK}"
 
   local swapped
   swapped="$("${ssh_cmd[@]}" "$host" "$swap")"
   if [[ "$swapped" != "$SWAP_OK" ]]; then
-    echo "${RED}  the swap on ${label} did not complete:${NC}"
-    sed -e "/^${SWAP_OK}\$/d" -e 's/^/    /' <<< "${swapped:-(no answer from the node)}"
+    echo "${RED}  the swap on ${label} did not report success:${NC}"
+    sed -e "/^${SWAP_OK}\$/d" -e "/^${SWAP_UNDONE}\$/d" -e 's/^/    /' <<< "${swapped:-(no answer from the node)}"
+    if [[ "${swapped##*$'\n'}" == "$SWAP_UNDONE" ]]; then
+      die "${label}: swap failed and was undone — the node runs the release it ran before, stamp included"
+    fi
     rollback_hint "$host" "$pass_var"
     die "${label}: swap failed — unless it says nothing changed, roll back"
   fi
 
   # Syntax-check what is now live, in place, as it serves requests.
   local lint
-  lint="$("${ssh_cmd[@]}" "$host" "cd ~/${REMOTE_DIR} && for f in *.php lib/*.php; do php -l \$f 2>&1 | grep -v '^No syntax errors'; done" 2>/dev/null)"
-  if [[ -n "$lint" ]]; then
+  lint="$("${ssh_cmd[@]}" "$host" "cd ~/${REMOTE_DIR} || exit 1; ${REMOTE_LINT_FN}; for f in *.php lib/*.php; do [ -f \"\$f\" ] || continue; lint \"\$f\" ''; done; echo ${LINT_OK}" 2>/dev/null)"
+  if [[ "$lint" != "$LINT_OK" ]]; then
     echo "${RED}  syntax errors on ${label}:${NC}"
-    sed 's/^/    /' <<< "$lint"
+    sed -e "/^${LINT_OK}\$/d" -e 's/^/    /' <<< "${lint:-(no answer from the node)}"
     rollback_hint "$host" "$pass_var"
-    die "${label}: deployed code does not parse"
+    die "${label}: deployed code does not parse (or could not be linted)"
   fi
 
   DEPLOYED="${DEPLOYED}${label}|${host_var}|${pass_var}"$'\n'
