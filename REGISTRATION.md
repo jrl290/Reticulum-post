@@ -2445,7 +2445,8 @@ wakes. It keeps what it sends, with these changes from Phase 1:
   at NOTICE when it succeeded and WARNING when it did not. These lines are the
   completion events tests and operators wait on (§5 of the principles). The
   heal's own `[peer] session to <X> was dead … re-registered` line goes
-  through the node's one logger: today that call throws (§15).
+  through the node's one logger too. On b6c7809 that call throws (§15); since
+  2b2ad9c it is written with `error_log()`, to PHP's own file.
 - **Its sends are asserted under §1.** `connectToPeer`'s registration POST and
   `exchangeWithPhpPeer`'s exchange POST each log
   `[LINK-SEND-LATE] <X> <register|exchange> ms=<n>` when the answer comes more
@@ -3271,15 +3272,23 @@ after-the-answer jobs, `/v1/initialize`'s outcome and the shutdown callback's
 
 Today `HttpApi::log` writes only error and warning lines and drops the rest,
 and `Storage`, which holds all of this code, has no `log()` at all: it writes
-with `error_log()` to PHP's own file, and its `$this->log(…)` calls
-(`request_php_wake_trait.php:327, 414, 449, 704`, and
+with `error_log()` to PHP's own file. On b6c7809 its five `$this->log(…)`
+calls (`request_php_wake_trait.php:327, 414, 449, 704`, and
 `request_control_plane_trait.php:373`, guarded by `method_exists`, which
 writes nothing) fail. The one at line 704 runs after every heal of a dead
-legacy peer session (§10.12), so today that line is never written: the call
+legacy peer session (§10.12), so there that line is never written: the call
 throws, the request that ran maintenance answers 500 before it ingests
-anything, and the loop over `[interfaces]` stops there. Every gate of §16.2
-reads `var/router.log`, and reads an absence only after a positive line from
-the same test has been seen in that same file.
+anything, and the loop over `[interfaces]` stops there. 2b2ad9c makes all
+five `error_log()` calls, tagged `[peer]` and `[local_destinations]` as
+`Storage`'s other lines are tagged, so from it on they land in PHP's
+`error_log` file, not in `var/router.log`, until the one logger takes them;
+and `static_check_methods.php` now resolves each call on the class it runs
+in, which reports all five on b6c7809. The line at 327 still cannot be
+written: that `json_encode` is given `JSON_PARTIAL_OUTPUT_ON_ERROR`, which
+takes precedence over `JSON_THROW_ON_ERROR`, so it never throws and its catch
+never runs. Every gate of §16.2 reads `var/router.log`, and reads an absence
+only after a positive line from the same test has been seen in that same
+file.
 
 Every refusal and every legacy acceptance is logged; nothing is dropped
 silently. Logs MUST NOT contain session tokens, wake tokens, the address
@@ -4202,7 +4211,14 @@ answered, the suite runs on SQLite only.
   `storage.log_path` at NOTICE as well as ERROR; a heal of a dead
   `[interfaces]` session writes its `[peer]` line instead of throwing. Fails on
   b6c7809 twice: `HttpApi::log` drops NOTICE, and `Storage::log()` is
-  undefined at `request_php_wake_trait.php:704`.
+  undefined at `request_php_wake_trait.php:704`. Fails on 2b2ad9c twice too:
+  `HttpApi::log` still drops NOTICE, and the heal's `[peer]` line, written
+  since then, goes to PHP's `error_log` file instead of `storage.log_path`.
+  Three tests read such lines from PHP's error log today and move to
+  `storage.log_path` with the logger: `peer_session_heal_request_test.php`
+  (the heal's line), `peer_ack_list_log_test.php` (the ack list's two
+  `[peer]` lines) and `local_destination_moves_test.php`
+  (`[local_destinations]`).
 - **`clear_all_data_test.php`:** `clearAllData()` empties `transport_state`
   and `interfaces` (passes on b6c7809: it pins behaviour); and, with a SQLite
   `CREATE TRIGGER … BEFORE DELETE ON transport_state BEGIN SELECT RAISE(ABORT,
@@ -5318,9 +5334,9 @@ carry over as the lists below say.
   exchange after the answer, with their outcome lines; the §1 assertions on
   its registration and exchange; the config-load ERROR when no link can form;
 - logging (§15): one logger to an absolute `storage.log_path`; `Storage`'s
-  `$this->log(…)` calls and the existing `error_log()` tags (`[WAKE-DROP]`,
-  `[WAKE-REFUSED]`, `[REG-WAKE-URL-IGNORED]`, `[REG-BAD-IDENTITY]`) go
-  through it;
+  `error_log()` lines go through it: the tags `[WAKE-DROP]`, `[WAKE-REFUSED]`,
+  `[REG-WAKE-URL-IGNORED]` and `[REG-BAD-IDENTITY]`, and the `[peer]` and
+  `[local_destinations]` lines that were `$this->log(…)` calls until 2b2ad9c;
 - the schema becomes §14.1's (sentinel `NOT NULL` columns; `bitrate`, `mtu`
   and `announce_emitted` widened; `inbound_batch_packets`; the new indexes);
   `/health`'s `schema_migrated` compares fingerprints, and `links_skipped`
@@ -5525,7 +5541,8 @@ Git keeps the full text of every revision.
 | 5ae640f | 2026-10-04 | 7: the transport id from the node's identity; detached runners checked by an OS lock |
 | d4ceda7 | 2026-10-04 | 8: corrections from the review of revision 7 (its first 13 findings) |
 | 56bf5db | 2026-10-04 | 9: a rewrite in James's words, with D1 to D8 applied and all 43 findings of that review disposed of |
-| this commit | 2026-10-05 | 10: the 64 findings of the review of revision 9: locks the operating system releases in place of the attempt's 50 s and of unbounded exchanges; a batch taken in packet by packet; wakes first, at most 16 a pass, with starved wakes released and `stream_set_blocking`; the legacy gateway row under the claim; the stale sweep off signed and own rows; RNS 1.5.2's mode names, cull, raw emission times and "only a move is forwarded"; §20 rebuilt from James's recorded words; fifteen new open questions |
+| 87c6bee | 2026-10-05 | 10: the 64 findings of the review of revision 9: locks the operating system releases in place of the attempt's 50 s and of unbounded exchanges; a batch taken in packet by packet; wakes first, at most 16 a pass, with starved wakes released and `stream_set_blocking`; the legacy gateway row under the claim; the stale sweep off signed and own rows; RNS 1.5.2's mode names, cull, raw emission times and "only a move is forwarded"; §20 rebuilt from James's recorded words; fifteen new open questions |
+| this commit | 2026-10-05 | 10, corrected: §10.12, §15, §17 and §22.1 say what 2b2ad9c changed (`Storage`'s five `$this->log()` calls write with `error_log()`); nothing else changes |
 
 Revision 7's question 3 (the double link after the later node's database
 reset) and revision 8's question 12 (a node that loses its identity file and
@@ -5536,5 +5553,7 @@ Code commits this document refers to: d3a0eb5 (the wake handler sends
 credentials only to the stored address), 3281ad5 (no `LIKE` wildcard claim),
 bae739a (the code revisions 2 to 8 described), e3c05ea (the `wake_url` path
 and the `[post_interface_peers]` client removed), 2b94b32, e259d8e and
-1d99d49 (`deploy.sh` stages, lints, swaps and undoes), and b6c7809 (the TCP
-bridge removed; the code as it is).
+1d99d49 (`deploy.sh` stages, lints, swaps and undoes), b6c7809 (the TCP
+bridge removed; the code as it is), and 2b2ad9c on top of it (`Storage`'s
+five `$this->log()` calls made `error_log()`, and the method check resolves
+each call on the class it runs in).
