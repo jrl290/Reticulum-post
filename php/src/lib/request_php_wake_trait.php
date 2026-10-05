@@ -324,7 +324,7 @@ trait RequestPhpWakeTrait
                 'ack_batch_ids' => $ackBatchIds,
             ], JSON_THROW_ON_ERROR | JSON_PARTIAL_OUTPUT_ON_ERROR);
         } catch (\JsonException $e) {
-            $this->log('exchangeWithPhpPeer: json_encode failed: ' . $e->getMessage());
+            error_log('[peer] exchangeWithPhpPeer: json_encode failed: ' . $e->getMessage());
             return ['status' => 'encode_failed', 'message' => $e->getMessage(), 'peer_url' => $peerUrl];
         }
 
@@ -411,7 +411,7 @@ trait RequestPhpWakeTrait
                 $decoded = self::decodeJson($json);
                 $ids = is_array($decoded) ? $decoded : [];
             } catch (\JsonException $e) {
-                $this->log('error', 'drainPeerAckBatchIds: decodeJson failed for ' . $peerInterfaceId . ': ' . $e->getMessage());
+                error_log('[peer] drainPeerAckBatchIds: decodeJson failed for ' . $peerInterfaceId . ': ' . $e->getMessage());
                 $ids = [];
             }
         }
@@ -446,7 +446,7 @@ trait RequestPhpWakeTrait
                         $ids = $decoded;
                     }
                 } catch (\JsonException $e) {
-                    $this->log('error', 'appendPeerAckBatchId: decodeJson failed for ' . $peerInterfaceId . ': ' . $e->getMessage());
+                    error_log('[peer] appendPeerAckBatchId: decodeJson failed for ' . $peerInterfaceId . ': ' . $e->getMessage());
                     $ids = [];
                 }
             }
@@ -701,7 +701,15 @@ trait RequestPhpWakeTrait
 
             $result = $this->connectToPeer($exchangeUrl, $wakeUrl, $hostUrl, (string) $ifaceName);
             $summary['peer_sessions_healed'][] = $result;
-            $this->log('warning', sprintf(
+            // error_log(), as every line Storage writes: log() is HttpApi's
+            // (RequestHttpApiHelperTrait), and this trait runs as Storage.
+            // Until 2026-10-05 this was $this->log(), so the request whose
+            // prelude had just re-registered the session died with "Call to
+            // undefined method Storage::log()" and answered 500, and no entry
+            // after this one was checked. Pinned by
+            // tests/peer_session_heal_request_test.php; the class of bug by
+            // tests/static_check_methods.php.
+            error_log(sprintf(
                 '[peer] session to %s was dead (%s) — re-registered: %s',
                 $exchangeUrl,
                 $existing === null ? 'no row' : 'row ' . ($existing['status'] ?? '?'),

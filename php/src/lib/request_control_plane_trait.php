@@ -369,12 +369,13 @@ trait RequestControlPlaneTrait
         $del->bindValue(':dest', $destinationHashHex, PDO::PARAM_STR);
         $del->bindValue(':iface', $existingIface, PDO::PARAM_STR);
         $del->execute();
-        if (method_exists($this, 'log')) {
-            $this->log(sprintf(
-                '[local_destinations] %s moved: newer announce via %s evicts local registration on %s',
-                substr($destinationHashHex, 0, 12), substr($announcingInterfaceId, 0, 8), substr($existingIface, 0, 8)
-            ));
-        }
+        // Until 2026-10-05 this line sat behind method_exists($this, 'log').
+        // This trait runs as Storage, which has no log() (HttpApi has), so it
+        // was never written. It goes where every line Storage writes goes.
+        error_log(sprintf(
+            '[local_destinations] %s moved: newer announce via %s evicts local registration on %s',
+            substr($destinationHashHex, 0, 12), substr($announcingInterfaceId, 0, 8), substr($existingIface, 0, 8)
+        ));
     }
 
     private function localDestinationRaw(string $destinationHashHex): ?array
