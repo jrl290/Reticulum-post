@@ -10,6 +10,13 @@
  * message for it was queued as local_delivery to that interface and never
  * relayed. RNS: the newer announce wins (Transport.py:2229-2252).
  *
+ * The eviction writes one line to PHP's error log, "[local_destinations]
+ * <dest> moved: newer announce via <iface> evicts local registration on
+ * <iface>". On b6c7809 that line was $this->log(...) behind
+ * method_exists($this, 'log'); the trait runs as Storage, which has no log(),
+ * so it was never written. Each case below checks the line: once for the
+ * move, never when the destination stays local.
+ *
  * Run: php tests/local_destination_moves_test.php
  */
 declare(strict_types=1);
@@ -17,6 +24,20 @@ require_once __DIR__ . '/path_selection_test_fixture.php';
 
 $pass = 0; $fail = 0;
 function check(string $label, bool $ok): void { global $pass, $fail; if ($ok) { $pass++; echo "  ok   $label\n"; } else { $fail++; echo "  FAIL $label\n"; } }
+
+// What the eviction writes goes to PHP's error log: a file of the test's own.
+$logFile = tempnam(sys_get_temp_dir(), 'local-dest-moves-');
+ini_set('error_log', $logFile);
+ini_set('log_errors', '1');
+register_shutdown_function(static function () use ($logFile): void { @unlink($logFile); });
+/** The [local_destinations] lines written since the last call. */
+function movedLines(): array {
+    global $logFile; static $offset = 0;
+    clearstatcache(true, $logFile);
+    $log = (string) file_get_contents($logFile, false, null, $offset);
+    $offset += strlen($log);
+    return array_values(array_filter(explode("\n", $log), static fn (string $l): bool => str_contains($l, '[local_destinations]')));
+}
 
 $dest = 'b42714bda794d70a05dd70ce6140f59a';
 $browser = 'iface_browser';
@@ -40,6 +61,9 @@ seedLocal($r, $dest, $browser);
     mkAnnounce(['random_hash_hex' => 'bbbb11112222333344445555', 'announce_emitted' => $t0 + 30]));
 check("path accepted the newer announce ($reason)", $status === 'path_updated');
 check('local registration on the dead browser interface is gone', localIface($r, $dest) === null);
+$moved = movedLines();
+check('the move is logged once: "[local_destinations] b42714bda794 moved: newer announce via iface_pe evicts local registration on iface_br"',
+    count($moved) === 1 && str_contains($moved[0], '[local_destinations] b42714bda794 moved: newer announce via iface_pe evicts local registration on iface_br'));
 
 echo "── an echo of the browser's own announce (same random hash) keeps it local ──\n";
 $r = new PathSelectionMockRouter();
@@ -49,6 +73,7 @@ $r->test_upsertPathFromAnnounce($peer,
     mkPacket(['destination_hash_hex' => $dest, 'hops' => 3]),
     mkAnnounce(['random_hash_hex' => 'aaaa11112222333344445555', 'announce_emitted' => $t0]));
 check('echo does not evict the local registration', localIface($r, $dest) === $browser);
+check('and logs no move', movedLines() === []);
 
 echo "── an older announce from elsewhere keeps it local ──\n";
 $r = new PathSelectionMockRouter();
@@ -58,6 +83,7 @@ $r->test_upsertPathFromAnnounce($peer,
     mkPacket(['destination_hash_hex' => $dest, 'hops' => 2]),
     mkAnnounce(['random_hash_hex' => 'cccc11112222333344445555', 'announce_emitted' => $t0 - 30]));
 check('older announce does not evict', localIface($r, $dest) === $browser);
+check('and logs no move', movedLines() === []);
 
 echo "── the browser re-announcing on its own interface keeps it local ──\n";
 $r = new PathSelectionMockRouter();
@@ -67,6 +93,7 @@ $r->test_upsertPathFromAnnounce($browser,
     mkPacket(['destination_hash_hex' => $dest, 'hops' => 1]),
     mkAnnounce(['random_hash_hex' => 'dddd11112222333344445555', 'announce_emitted' => $t0 + 30]));
 check('same interface keeps the local registration', localIface($r, $dest) === $browser);
+check('and logs no move', movedLines() === []);
 
 echo "\nResults: $pass passed, $fail failed\n";
 exit($fail > 0 ? 1 : 0);
