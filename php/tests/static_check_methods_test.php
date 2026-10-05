@@ -19,13 +19,28 @@
  *       heredoc is a call: sibling traits, a trait's own trait, an `as`
  *       alias, self:: and static::, parent:: on a built-in parent, typed
  *       properties ($this->storage->, $this->db->), Name::m(), [$this, 'm'],
- *       a first-class callable. Its warnings name a trait no class uses and
- *       a private method nothing calls, and not one a sibling trait calls
+ *       a first-class callable, and the other ways to name a method of the
+ *       class ($this::m(), array($this, 'm'), [__CLASS__, 'm'],
+ *       [Name::class, 'm'], 'self::m', a fully qualified 'Name::m',
+ *       [$this->p, 'm']). Its warnings name a trait no class uses and a
+ *       private method nothing calls, and not one a sibling trait calls
  *       (b6c7809's check listed 114 private methods as unused, 109 of them
  *       called).
- *   (c) Every kind of call that does not resolve is reported, each once.
- *   (d) On php/src the check passes, and the methods it gives each class are
- *       the ones PHP reflects with index.php loaded.
+ *   (c) Every kind of call that does not resolve is reported, each once:
+ *       among them $this->p->m() on a class that declares no p (HttpApi's
+ *       $this->db->, a Storage trait's $this->storage->), and each of those
+ *       other ways of naming log() from a Storage trait.
+ *   (d) As in PHP, a concrete method implements a trait's abstract one
+ *       whichever `use` comes first, and a parent's does too; `insteadof`
+ *       decides which trait's method a class gets.
+ *   (e) What cannot be checked is listed as NOT CHECKED, counted, never
+ *       counted as resolved, and does not fail the check: calls in a closure
+ *       rebound by Closure::bind(), ->bindTo() or ->call(), a rebinding the
+ *       check cannot follow, names decided at run time, a property without a
+ *       class type, and an undeclared one on a class with __get().
+ *   (f) On php/src the check passes with nothing left unchecked, and the
+ *       methods it gives each class are the ones PHP reflects with index.php
+ *       loaded.
  *
  * Run: php php/tests/static_check_methods_test.php
  */
@@ -233,15 +248,33 @@ final class Storage
     }
 
     private PDO $db;
+    private ?PDO $spare = null, $other = null;
 
     public function __construct()
     {
         $this->db = new PDO('sqlite::memory:');
     }
 
+    /** $other is declared with $spare, so it is a PDO too. */
+    public function other(): void
+    {
+        $this->other?->prepare('SELECT 2');
+    }
+
     public function publicEntry(): int
     {
         return $this->one() + $this->aliasedHelper() + count([$this, 'fromTraitThree']);
+    }
+
+    /** The other ways to name a method, each a call that runs. */
+    public function callables(): int
+    {
+        return call_user_func(array($this, 'one'))
+            + call_user_func([__CLASS__, 'staticHelper'])
+            + call_user_func([Storage::class, 'staticHelper'])
+            + call_user_func('self::staticHelper')
+            + strlen(call_user_func('ReticulumPhp\\Database::quoteTable', 't'))
+            + $this::staticHelper();
     }
 }
 
@@ -259,7 +292,8 @@ final class HttpApi
 <script>function flushStale() { return 1; }</script> {$this->storage->publicEntry()}
 HTML;
         $callable = $this->storage->publicEntry(...);
-        return $text . $page . Database::quoteTable('x') . (string) $callable();
+        $named = [$this->storage, 'publicEntry'];
+        return $text . $page . Database::quoteTable('x') . (string) $callable() . (string) $named();
     }
 }
 PHP,
@@ -337,10 +371,13 @@ PHP,
 ]);
 [$code, $out] = runCheck($checker, $dir);
 check('every call resolves: exit 0 and "Undefined: 0"', $code === 0 && str_contains($out, 'Undefined: 0 ') && undefinedLines($out) === [], $out);
-// ApiError 1 (parent::), Storage 3 (two $this->, one [$this, 'm']), HttpApi 3
-// (heredoc, first-class callable, Name::), TraitOne 4, TraitTwo 1 ($this->db->),
-// TraitThree 1; OrphanTrait's call resolves on no class.
-check('all 13 calls were read and resolved, none skipped', preg_match('/^(\d+) calls resolved/m', $out, $m) === 1 && (int) $m[1] === 13, $out);
+// ApiError 1 (parent::), Storage 10 (two $this->, one [$this, 'm'], $this->other?->,
+// and the six in callables()), HttpApi 4 (heredoc, first-class callable, Name::,
+// [$this->p, 'm']), TraitOne 4, TraitTwo 1 ($this->db->), TraitThree 1;
+// OrphanTrait's call resolves on no class.
+check('all 21 calls were read and resolved, none skipped and none left unchecked',
+    preg_match('/^(\d+) calls resolved on the class they run in; (\d+) calls not checked/m', $out, $m) === 1
+    && (int) $m[1] === 21 && (int) $m[2] === 0, $out);
 check('the trait no class uses is named', str_contains($out, 'TRAIT USED BY NO CLASS: ReticulumPhp\OrphanTrait (lib/orphan_trait.php)'), $out);
 check('the private method nothing calls is named, and only it (the orphan trait\'s are not listed again)',
     str_contains($out, 'UNUSED: lib/trait_two.php::neverCalled()') && !str_contains($out, '::lonely()')
@@ -404,6 +441,7 @@ final class HttpApi
 <script>function flushStale() {}</script>
 HTML;
         $this->flushStale();
+        $this->db->query('SELECT 1');
     }
 }
 PHP;
@@ -431,6 +469,15 @@ trait StorageTrait
         Database::privateHelper();
         Database::noSuchStatic();
         NoSuchClass::make();
+        $this->storage->healthSummary();
+        $this::log('warning', 'x');
+        array_map(array($this, 'log'), []);
+        call_user_func([Storage::class, 'log'], 'warning', 'x');
+        call_user_func([__CLASS__, 'log'], 'warning', 'x');
+        call_user_func('self::log', 'warning', 'x');
+        call_user_func('ReticulumPhp\\Storage::log', 'warning', 'x');
+        call_user_func('Storage::run');
+        array_map([$this->db, 'notAPdoMethodEither'], []);
     }
 }
 PHP;
@@ -470,11 +517,23 @@ $expected = [
     'a call behind method_exists()' => 'ReticulumPhp\Storage has no method note(), called as $this->note() at ' . $at('lib/storage_trait.php', $storageTrait, '$this->note') . ' (trait StorageTrait); defined only in HttpApiTrait (used by HttpApi)',
     'self::m() that only another class has' => 'ReticulumPhp\Storage has no method decodeJson(), called as self::decodeJson() at ' . $at('lib/storage_trait.php', $storageTrait, 'self::decodeJson') . ' (trait StorageTrait); defined only in HttpApiTrait (used by HttpApi)',
     'static::m() nothing has' => 'ReticulumPhp\Storage has no method encodeJson(), called as static::encodeJson() at ' . $at('lib/storage_trait.php', $storageTrait, 'static::encodeJson') . ' (trait StorageTrait)',
-    '[$this, \'m\'] nothing has' => 'ReticulumPhp\Storage has no method mapper(), called as $this->mapper() at ' . $at('lib/storage_trait.php', $storageTrait, "'mapper'") . ' (trait StorageTrait)',
+    '[$this, \'m\'] nothing has' => 'ReticulumPhp\Storage has no method mapper(), called as [$this, \'mapper\'] at ' . $at('lib/storage_trait.php', $storageTrait, "'mapper'") . ' (trait StorageTrait)',
     'a method PDO lacks, on the PDO-typed $db' => 'PDO has no method notAPdoMethod(), called as $this->db->notAPdoMethod() at ' . $at('lib/storage_trait.php', $storageTrait, 'notAPdoMethod') . ' (trait StorageTrait)',
     'a private static method of another class' => 'ReticulumPhp\Database::privateHelper() is private, called from ReticulumPhp\Storage as Database::privateHelper() at ' . $at('lib/storage_trait.php', $storageTrait, 'Database::privateHelper') . ' (trait StorageTrait)',
     'a static method a class lacks' => 'ReticulumPhp\Database has no method noSuchStatic(), called as Database::noSuchStatic() at ' . $at('lib/storage_trait.php', $storageTrait, 'noSuchStatic') . ' (trait StorageTrait)',
     'a class that does not exist' => 'NoSuchClass::make() at ' . $at('lib/storage_trait.php', $storageTrait, 'NoSuchClass') . ' (trait StorageTrait): class ReticulumPhp\NoSuchClass does not exist',
+    // A property is resolved on the class the code runs in, as a method is.
+    '$this->p->m() on a class that declares no p' => 'ReticulumPhp\HttpApi has no property $db, called as $this->db->query() at ' . $at('index.php', $index, '$this->db->query') . '; declared only in Storage',
+    '$this->p->m() from a trait, p only another class has' => 'ReticulumPhp\Storage has no property $storage, called as $this->storage->healthSummary() at ' . $at('lib/storage_trait.php', $storageTrait, '$this->storage->healthSummary') . ' (trait StorageTrait); declared only in HttpApi',
+    // The other ways to name log() from a Storage trait: each fails at run time.
+    '$this::m()' => 'ReticulumPhp\Storage has no method log(), called as $this::log() at ' . $at('lib/storage_trait.php', $storageTrait, '$this::log') . ' (trait StorageTrait); defined only in HttpApiTrait (used by HttpApi)',
+    'array($this, \'m\')' => 'ReticulumPhp\Storage has no method log(), called as array($this, \'log\') at ' . $at('lib/storage_trait.php', $storageTrait, 'array($this') . ' (trait StorageTrait); defined only in HttpApiTrait (used by HttpApi)',
+    '[Name::class, \'m\']' => 'ReticulumPhp\Storage has no method log(), called as [Storage::class, \'log\'] at ' . $at('lib/storage_trait.php', $storageTrait, '[Storage::class') . ' (trait StorageTrait); defined only in HttpApiTrait (used by HttpApi)',
+    '[__CLASS__, \'m\']' => 'ReticulumPhp\Storage has no method log(), called as [__CLASS__, \'log\'] at ' . $at('lib/storage_trait.php', $storageTrait, '[__CLASS__') . ' (trait StorageTrait); defined only in HttpApiTrait (used by HttpApi)',
+    '\'self::m\'' => 'ReticulumPhp\Storage has no method log(), called as \'self::log\' at ' . $at('lib/storage_trait.php', $storageTrait, "'self::log'") . ' (trait StorageTrait); defined only in HttpApiTrait (used by HttpApi)',
+    'a namespaced \'Name::m\'' => 'ReticulumPhp\Storage has no method log(), called as \'ReticulumPhp\\\\Storage::log\' at ' . $at('lib/storage_trait.php', $storageTrait, "Storage::log'") . ' (trait StorageTrait); defined only in HttpApiTrait (used by HttpApi)',
+    '\'Name::m\' is fully qualified, as PHP reads it' => '\'Storage::run\' at ' . $at('lib/storage_trait.php', $storageTrait, "'Storage::run'") . ' (trait StorageTrait): class Storage does not exist',
+    '[$this->p, \'m\'] the property\'s class lacks' => 'PDO has no method notAPdoMethodEither(), called as [$this->db, \'notAPdoMethodEither\'] at ' . $at('lib/storage_trait.php', $storageTrait, 'notAPdoMethodEither') . ' (trait StorageTrait)',
 ];
 $lines = undefinedLines($out);
 foreach ($expected as $label => $line) {
@@ -483,8 +542,277 @@ foreach ($expected as $label => $line) {
 check('nothing else is reported, and the check fails', count($lines) === count($expected) && $code === 1 && str_contains($out, 'Undefined: ' . count($expected) . ' '), $out);
 exec('rm -rf ' . escapeshellarg($dir));
 
-// ─── (d) php/src ───────────────────────────────────────────────────────────
-echo "(d) php/src passes, and each class has the methods PHP gives it\n";
+// ─── (d) Abstract methods and insteadof ────────────────────────────────────
+echo "(d) a concrete method implements an abstract one, as in PHP; insteadof picks the method\n";
+
+$dir = fixture([
+    'index.php' => <<<'PHP'
+<?php
+
+declare(strict_types=1);
+
+namespace ReticulumPhp;
+
+use PDO;
+
+final class NeedsFirst
+{
+    use TraitNeeds;
+    use TraitGives;
+}
+
+final class GivesFirst
+{
+    use TraitGives;
+    use TraitNeeds;
+}
+
+class Base
+{
+    protected ?PDO $pdo = null;
+
+    public function fromParent(): string
+    {
+        return 'parent';
+    }
+}
+
+final class Child extends Base
+{
+    use TraitAbstract;
+
+    public function prepares(): void
+    {
+        $this->pdo->prepare('SELECT 1');
+    }
+}
+
+final class Picks
+{
+    use TraitLeft, TraitRight {
+        TraitRight::pick insteadof TraitLeft;
+    }
+
+    public function run(): string
+    {
+        return $this->pick();
+    }
+}
+PHP,
+    'lib/trait_needs.php' => <<<'PHP'
+<?php
+
+declare(strict_types=1);
+
+namespace ReticulumPhp;
+
+trait TraitNeeds
+{
+    abstract protected function given(): string;
+
+    public function needs(): string
+    {
+        return $this->given();
+    }
+}
+PHP,
+    'lib/trait_gives.php' => <<<'PHP'
+<?php
+
+declare(strict_types=1);
+
+namespace ReticulumPhp;
+
+trait TraitGives
+{
+    protected function given(): string
+    {
+        return 'given';
+    }
+}
+PHP,
+    'lib/trait_abstract.php' => <<<'PHP'
+<?php
+
+declare(strict_types=1);
+
+namespace ReticulumPhp;
+
+trait TraitAbstract
+{
+    abstract public function fromParent(): string;
+
+    public function run(): string
+    {
+        return $this->fromParent();
+    }
+}
+PHP,
+    'lib/trait_left.php' => <<<'PHP'
+<?php
+
+declare(strict_types=1);
+
+namespace ReticulumPhp;
+
+trait TraitLeft
+{
+    private function pick(): string
+    {
+        return 'left';
+    }
+}
+PHP,
+    'lib/trait_right.php' => <<<'PHP'
+<?php
+
+declare(strict_types=1);
+
+namespace ReticulumPhp;
+
+trait TraitRight
+{
+    private function pick(): string
+    {
+        return 'right';
+    }
+}
+PHP,
+]);
+// What PHP itself makes of these classes.
+$probe = 'foreach (glob($argv[1] . "/lib/*.php") as $f) { require $f; } require $argv[1] . "/index.php";'
+    . ' echo (new ReticulumPhp\NeedsFirst())->needs(), " ", (new ReticulumPhp\GivesFirst())->needs(), " ",'
+    . ' (new ReticulumPhp\Child())->run(), " ", (new ReticulumPhp\Picks())->run();';
+$proc = proc_open([PHP_BINARY, '-r', $probe, $dir], [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);
+$ran = stream_get_contents($pipes[1]) . stream_get_contents($pipes[2]);
+fclose($pipes[1]);
+fclose($pipes[2]);
+check('PHP runs all four: "given given parent right"', proc_close($proc) === 0 && $ran === 'given given parent right', $ran);
+[$code, $out] = runCheck($checker, $dir);
+check('so the check passes: a sibling trait\'s given() implements the abstract one in either `use` order, and the parent\'s fromParent() does too',
+    $code === 0 && undefinedLines($out) === [] && str_contains($out, 'Undefined: 0 '), $out);
+// NeedsFirst 1, GivesFirst 1, Child 2 ($this->fromParent(), and $this->pdo->
+// on the parent's protected property), Picks 1.
+check('all 5 calls resolved, the parent\'s protected property included',
+    preg_match('/^(\d+) calls resolved on the class they run in; (\d+) calls not checked/m', $out, $m) === 1
+    && (int) $m[1] === 5 && (int) $m[2] === 0, $out);
+check('insteadof: Picks gets TraitRight\'s pick(), so TraitLeft\'s is the one nothing calls',
+    str_contains($out, 'UNUSED: lib/trait_left.php::pick()') && !str_contains($out, 'trait_right.php::pick()'), $out);
+exec('rm -rf ' . escapeshellarg($dir));
+
+// ─── (e) What cannot be checked ────────────────────────────────────────────
+echo "(e) what cannot be checked is listed and counted, never resolved, never a failure\n";
+
+$index = <<<'PHP'
+<?php
+
+declare(strict_types=1);
+
+namespace ReticulumPhp;
+
+final class Storage
+{
+    public function call(): void
+    {
+    }
+}
+
+final class HttpApi
+{
+    private $thing;
+    private \Closure $handler;
+
+    public function __construct(private readonly Storage $storage)
+    {
+        $this->handler = function () { $this->log('handler', 'x'); };
+    }
+
+    public function handle(string $name): void
+    {
+        \Closure::bind(function () { $this->log('bind', 'x'); }, $this->storage, Storage::class)();
+        (function () { $this->log('bindTo', 'x'); })->bindTo($this->storage, Storage::class)();
+        (function () { $this->log('call', 'x'); })->call($this->storage);
+        (fn () => $this->log('arrow', 'x'))->call($this->storage);
+        $later = function () { $this->log('variable', 'x'); };
+        $later->call($this->storage);
+        $made = $this->make();
+        $made->bindTo($this->storage);
+        $this->$name();
+        $this->{'log'}('dynamic', 'x');
+        self::$name();
+        $this->storage->$name();
+        $this->thing->whatever();
+        array_map(function (): void { $this->log('not rebound', 'x'); }, []);
+        $this->handler->call($this->storage);
+        $this->storage->call();
+        $other = new Storage();
+        $other->call();
+    }
+
+    private function make(): \Closure
+    {
+        return function () { $this->log('made', 'x'); };
+    }
+
+    private function log(string $level, string $message): void
+    {
+    }
+}
+
+final class Magic
+{
+    public function __get(string $name): mixed
+    {
+        return null;
+    }
+
+    public function run(): void
+    {
+        $this->anything->method();
+    }
+}
+PHP;
+$dir = fixture(['index.php' => $index]);
+[$code, $out] = runCheck($checker, $dir);
+$rebound = static fn (string $needle, string $by): string => '$this->log() at ' . $at('index.php', $index, $needle)
+    . ' runs in a closure rebound at ' . $at('index.php', $index, $by) . ', as whatever object and class that gives it';
+$expected = [
+    'a closure passed straight to Closure::bind()' => $rebound("'bind'", "'bind'"),
+    'a closure in parentheses before ->bindTo()' => $rebound("'bindTo'", "'bindTo'"),
+    'a closure in parentheses before ->call()' => $rebound("'call'", "'call'"),
+    'an arrow function before ->call()' => $rebound("'arrow'", "'arrow'"),
+    'a closure assigned to a variable the body rebinds' => $rebound("'variable'", '$later->call'),
+    'a rebinding the check cannot follow' => '->bindTo() at ' . $at('index.php', $index, '$made->bindTo')
+        . ' rebinds a closure this check cannot follow; the calls in that closure were resolved on the class whose body holds it',
+    '->call() on a property declared \\Closure' => '$this->handler->call() at ' . $at('index.php', $index, '$this->handler->call')
+        . ' rebinds the closure in $handler, which this check cannot follow; the calls in that closure were resolved on the class whose body holds it',
+    '$this->$name()' => '$this->$name() at ' . $at('index.php', $index, '$this->$name()') . ': the name is decided at run time',
+    '$this->{...}()' => '$this->{...}() at ' . $at('index.php', $index, "'dynamic'") . ': the name is decided at run time',
+    'self::$name()' => 'self::$name() at ' . $at('index.php', $index, 'self::$name()') . ': the name is decided at run time',
+    '$this->p->$name()' => '$this->storage->$name() at ' . $at('index.php', $index, '$this->storage->$name()') . ': the name is decided at run time',
+    'a property without a class type' => '$this->thing->whatever() at ' . $at('index.php', $index, '$this->thing->whatever')
+        . ': property $thing of ReticulumPhp\HttpApi has no class type',
+    'an undeclared property on a class with __get()' => '$this->anything->method() at ' . $at('index.php', $index, '$this->anything')
+        . ': ReticulumPhp\Magic declares no property $anything and has __get()',
+];
+preg_match_all('/^  NOT CHECKED: (.*)$/m', $out, $listed);
+foreach ($expected as $label => $line) {
+    check($label, count(array_keys($listed[1], $line, true)) === 1, "expected: {$line}\n--- output ---\n{$out}");
+}
+check('nothing else is listed (->call() on Storage, a typed property, and on a local variable are not rebindings), the count says 13, and none of it fails the check',
+    count($listed[1]) === count($expected) && $code === 0 && undefinedLines($out) === []
+    && str_contains($out, 'Undefined: 0 ') && str_contains($out, 'Not checked: 13')
+    && preg_match('/; 13 calls not checked/', $out) === 1, $out);
+// Closure::bind() itself, $this->make(), the closures in the constructor, in
+// make() and in array_map() (nothing this check sees rebinds them),
+// $this->handler->call() (Closure has call()) and $this->storage->call();
+// none of the thirteen. $other->call() is on a local variable: not read.
+check('only the 7 calls that can be resolved are counted resolved',
+    preg_match('/^(\d+) calls resolved/m', $out, $m) === 1 && (int) $m[1] === 7, $out);
+exec('rm -rf ' . escapeshellarg($dir));
+
+// ─── (f) php/src ───────────────────────────────────────────────────────────
+echo "(f) php/src passes with nothing left unchecked, and each class has the methods PHP gives it\n";
 
 $src = dirname(__DIR__) . '/src';
 [$code, $out] = runCheck($checker, $src);
@@ -493,6 +821,9 @@ check('it resolved Storage\'s and HttpApi\'s calls',
     preg_match('/^  Storage\s+\d+ methods, +(\d+) traits$/m', $out, $s) === 1 && (int) $s[1] > 0
     && preg_match('/^  HttpApi\s+\d+ methods, +(\d+) traits$/m', $out, $h) === 1 && (int) $h[1] > 0
     && preg_match('/^(\d+) calls resolved/m', $out, $r) === 1 && (int) $r[1] > 500, $out);
+check('every call it reads in php/src is checked: none is listed NOT CHECKED',
+    preg_match('/; (\d+) calls not checked/', $out, $u) === 1 && (int) $u[1] === 0
+    && str_contains($out, 'Not checked: 0') && !str_contains($out, 'NOT CHECKED:'), $out);
 
 [$code, $json] = runCheck($checker, $src, ['--methods']);
 $composed = json_decode($json, true);
