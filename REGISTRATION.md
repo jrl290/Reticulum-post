@@ -12,8 +12,9 @@
 > Read [`../DESIGN_PRINCIPLES.md`](../DESIGN_PRINCIPLES.md) first. Every rule
 > below follows it: events, not timers; no retries, except the registration
 > backoff James decided (§10.6, §11.5) and the browser's existing wait of 5 s
-> before it registers again, which open question 17 puts to him; no timeouts
-> as a fix; strict ordering; §1's 5 seconds. One part of the principles is
+> before it registers again, which Stage 1's open question 4 puts to him
+> (`REGISTRATION-STAGE1.md`); no timeouts as a fix; strict ordering; §1's 5
+> seconds. One part of the principles is
 > out of date: its §3 still says the registration backoff resets "whenever
 > the relay wakes it", and speaks of a "PHP relay" and a "wake-URL confirm".
 > James's D5 (only a successful registration resets it) and D1 (the words)
@@ -624,19 +625,24 @@ The full bytes are in the vector file.
 
 Revision 2 signed the host the connector connected to (`audience`), so that a
 PHP node the user chose could not forward another PHP node's challenge (A12).
-Asked whether to keep it, James answered "Don't we have ssl to prevent
-spoofing?" (2026-10-03), and it was dropped. The signed bytes carry no PHP
-node's address, the node does not read `Host` for registration, and there is
-no `audience_mismatch` error.
+Asked whether to keep it, James answered with a question, "Don't we have ssl
+to prevent spoofing?" (2026-10-03), and it was dropped without that question
+being answered: he was never told that TLS does not close A12. It is asked
+now, as `REGISTRATION-STAGE1.md`'s open question 5. Meanwhile the signed bytes
+carry no PHP node's address, the node does not read `Host` for registration,
+and there is no `audience_mismatch` error.
 
 TLS alone does not close A12, and this spec does not claim it does. TLS proves
 which PHP node a connector reached. It does not stop that node, when it is the
 one the user chose, from fetching another node's challenge for the user's
 identity, having the browser sign it, and forwarding the body; the other node
 then binds the identity's row there, and the forwarding node holds its
-session. The risk is accepted because nobody can choose another PHP node
-today: the web client's CSP `connect-src` (Retichat-js `.htaccess`) allows
-only the page's own origin, `https://retichat.com/reticulum/` and
+session, since the connector hands its token to the node it registered
+through at every exchange; the encrypted token does not change that. This
+document accepts the risk, pending `REGISTRATION-STAGE1.md`'s open question
+5, because nobody can choose another PHP node today: the web client's CSP
+`connect-src` (Retichat-js `.htaccess`) allows only the page's own origin,
+`https://retichat.com/reticulum/` and
 `https://selectivesubconscious.com/reticulum/` (and `esm.sh` for modules);
 gateways register only at their configured `node_url`; PHP nodes register
 only at the PHP nodes in their own `[interfaces]` (§10.3). Revisit this if
@@ -2489,7 +2495,7 @@ wakes. It keeps what it sends, with these changes from Phase 1:
 - **The claim, for every legacy row but the legacy peering's own.** A legacy
   carrier row whose `peer_url_key` is not the key of an entry §10.3 counts
   (the NAS gateway's row until Phase 3, and strangers' legacy carrier rows)
-  takes D3's claim from Phase 1, as a signed row does:
+  takes §6.3's claim from Phase 1, as a signed row does:
 
   ```sql
   UPDATE interfaces SET wake_outstanding = 1, wake_claimed_at_ms = :claimed_at_ms
@@ -2514,9 +2520,9 @@ wakes. It keeps what it sends, with these changes from Phase 1:
   and take no claim** (open question 12). In the legacy peering a node
   collects from the other only when it is woken (`exchangeWithPhpPeer` sends
   no packets), so a claim left by a dropped wake would stop that direction
-  until the legacy re-registration of a peer row offline for an hour. D3's
-  gate fix reaches the link between the two hosts only at Phase 3b. Until
-  then:
+  until the legacy re-registration of a peer row offline for an hour. The
+  claim (§6.3, this document's choice, §20.2) reaches the link between the
+  two hosts only at Phase 3b. Until then:
   - a wake to such a row writes its send time just before its connect, only
     when none is recorded:
     `UPDATE interfaces SET wake_claimed_at_ms = :now_ms WHERE interface_id = :id AND registration_proof = 'none' AND wake_claimed_at_ms = 0`.
@@ -4475,7 +4481,7 @@ design pass and the reviews, and where each stands:
 | A9 | Look-alike addresses under a case- and accent-folding collation | Closed: d3a0eb5 (live) and lookups by key only (§4.4, §14.2). |
 | A10 | A row becomes a carrier by its label | Closed: only by proof, or as a legacy row under the switch (§2.4). |
 | A11 | Outbound calls a stranger can trigger hold request handlers | No process is started (D2). Wakes, and a woken PHP node's exchange, run after the answer (D3); this document runs the other calls after the answer too, pending open question 20, all under ceilings (§2.5). Credentials go only to stored addresses (§10.10). What a stranger can still cost is item 3. |
-| A12 | A PHP node the user chose forwards another node's challenge | Accepted (James, 2026-10-03; §4.3.2). |
+| A12 | A PHP node the user chose forwards another node's challenge | Accepted by this document, pending `REGISTRATION-STAGE1.md` open question 5; James's 2026-10-03 answer was a question, never answered (§4.3.2). |
 | A13 | The challenge revealed when an identity used the web client | Closed: the challenge is opaque (§3). |
 | A14 | Unbounded rows | Bounded by §14.3; item 9 says what stays. |
 | A15 | Wakes aimed wherever a registrant says | Closed: no wake before the address check (§5). |
@@ -4529,7 +4535,8 @@ design pass and the reviews, and where each stands:
    `rememberKnownDestination`, like RNS 1.5.2's `Identity.validate_announce`,
    stores the ratchet and `app_data` of any valid announce, replays included.
    Changing that would depart from the reference.
-7. **A12**, accepted while nobody can choose a PHP node other than James's two
+7. **A12**, accepted by this document while nobody can choose a PHP node
+   other than James's two, pending `REGISTRATION-STAGE1.md` open question 5
    (§4.3.2).
 8. **Open peering gives anyone a carrier row.** A carrier row can deliver a
    destination's fresh announce first and hold its path until the
@@ -4704,7 +4711,7 @@ document's labels.
 | 2026-10-03 02:38 | "Hotfix the wake credential leak now? ..." | "Hotfix now (Recommended)": shipped as d3a0eb5 | §10.10 |
 | 2026-10-03 02:38 | "Which relays and gateways may act as transit (relay traffic for others)? ..." | "Keep peering open" | §2.4 |
 | 2026-10-03 02:38 | "When two devices or tabs hold the same identity on one relay, the spec has the newest registration win and the older one stop with 'connected elsewhere' ... OK?" | "Newest wins (Recommended)" | §9 |
-| 2026-10-03 02:43 | "Sign the relay address the browser actually connected to (stops a rogue relay proxying your registration)?" | "Don't we have ssl to prevent spoofing?": no address is signed | §4.3.2 |
+| 2026-10-03 02:43 | "Sign the relay address the browser actually connected to (stops a rogue relay proxying your registration)?" | "Don't we have ssl to prevent spoofing?": a question, not a decision. It was never answered (TLS does not close A12, §4.3.2), and no address is signed meanwhile (§20.2); `REGISTRATION-STAGE1.md` open question 5 asks it | §4.3.2 |
 | 2026-10-03 02:43 | "Gateway after a hard refusal: stop and show offline until woken or restarted?" | "Exponential back off": recorded in `DESIGN_PRINCIPLES.md` §3 for "a server error or a terminal refusal code" | §11.5 |
 | 2026-10-03 02:43 | "Separate enforcement switches for browsers and for gateways/relay peers?" | "Yes (Recommended)" | §16.1 |
 | 2026-10-04 00:41 | "... Should the gateway confirm its wake URL first?" | "Confirm it first (Recommended)" | §5 |
@@ -4763,6 +4770,7 @@ them, and the open questions of §21 that touch one say so.
 | The emission check compares with `>`, on raw emission times; an expired path is culled when an announce meets it; only a move is forwarded | RNS 1.5.2 parity | §12.5 |
 | The locks a request's own worker holds: one registration attempt and one exchange at a time per link | this revision, from "Check the process" and §5 of the principles | §10.6, §10.7; open question 10 |
 | A `mysql:8.4` container on James's Mac to prove MySQL | a proposal | §16.2; open question 5 |
+| No PHP node's address in the signed bytes (A12 accepted while only James's two nodes can be chosen) | revision 3, from James's question of 2026-10-03, which was never answered | §4.3.2; `REGISTRATION-STAGE1.md` open question 5 |
 | The double links of the two-way rule after a database reset (revision 7's question 3), and the rule's case of a lost identity file and database (revision 8's question 12) | applied as recommended, not decided by James | §10.4; open question 6 |
 | `DESIGN_PRINCIPLES.md` §3 is out of date (a wake resets the backoff; "relay", "wake-URL confirm"); this document holds where they differ | D1, D5 | header; open question 17 |
 
@@ -4781,9 +4789,10 @@ These need James. Everything else in this document either follows from his
 decisions (§20.1) or is one of the choices listed in §20.2, which he may
 overrule. Questions 1 to 4 are from revision 9 (question 4 restated with
 corrected facts); 5 to 19 are new in revision 10; 20 was added on 2026-10-05,
-when the record of D2 was corrected. Questions 4, 5 and 16 concern browsers
-and are asked for Stage 1 in `REGISTRATION-STAGE1.md` (its open questions 1,
-3 and 2); his answers there hold here.
+when the record of D2 was corrected. Questions 4, 5, 16 and 17.3 concern
+browsers and are asked for Stage 1 in `REGISTRATION-STAGE1.md` (its open
+questions 1, 3, 2 and 4), and so is A12 (its open question 5, §4.3.2); his
+answers there hold here.
 
 1. **Address checks and wakes to addresses inside a host's network.** When a
    gateway or PHP node registers, the PHP node sends its address check to the
@@ -5067,9 +5076,12 @@ and are asked for Stage 1 in `REGISTRATION-STAGE1.md` (its open questions 1,
     each collects from the other only when woken. Its wakes are limited to
     one a second per node: a wake needed in the same second as the last one
     is skipped, and its packets wait for the next request that wakes that
-    node. You asked (D3) for that limit to go. For every other row it goes
-    from Phase 1, the gateway's legacy row included (§10.12), but not for
-    these two rows:
+    node. This document proposes (§20.2) that the limit go, replaced by the
+    wake claim (§6.3). You have not been asked, and the code says "DO NOT
+    remove the min_wake_interval gating" (revision 8's question 9 left that
+    to you). As written it goes from Phase 1 for every other row, the
+    gateway's legacy row included (§10.12), but not for these two rows. You
+    may also overrule it for the other rows (§20.2):
     - (a) Keep the one-a-second limit on these two rows until Phase 3b, and
       log each skip (`[WAKE-DROP] phase=gate`). This is today's behaviour, and
       it ends with the legacy peering.
@@ -5082,7 +5094,8 @@ and are asked for Stage 1 in `REGISTRATION-STAGE1.md` (its open questions 1,
       limit was added to stop.
 
     **Recommendation: (a).** Removing "DO NOT remove the min_wake_interval
-    gating" from the code's comments, for the other rows, rests on D3.
+    gating" from the code's comments, for the other rows, rests on §20.2's
+    choice, and waits for your yes or no to it.
 13. **A batch handed out again under a new id after 300 s.** A PHP node hands
     a connector the same batch, under the same id, until it is acknowledged,
     so a batch delivered twice is taken in once. But after 300 s an
@@ -5187,7 +5200,9 @@ and are asked for Stage 1 in `REGISTRATION-STAGE1.md` (its open questions 1,
     - 17.3 A browser registers again every 5 s after a network failure or a
       5xx, as today (`post_interface.js:36-44`), as RNS's own TCP client
       interface reconnects. (a) Keep it, as a recorded exception. (b) Give it
-      the same backoff as a gateway.
+      the same backoff as a gateway. Asked for Stage 1, as
+      `REGISTRATION-STAGE1.md`'s open question 4, with a third option; his
+      answer there holds here.
 
     **Recommendation: (a) for each.**
 18. **This document's own words.** You chose the names of the parties (PHP
@@ -5368,9 +5383,9 @@ carry over as the lists below say.
   a batch is made; the legacy claim for the gateway's and strangers' legacy
   rows, and the gate, the wake time and `phase=gate` for the legacy peering's
   own rows. The wake trait's header ("WAKE GATING", and "DO NOT ... Remove the
-  min_wake_interval gating") is rewritten to say that D3 replaced the gate
-  with the claim, and that the gate stays only on the legacy peering's own
-  rows until Phase 3b;
+  min_wake_interval gating") is rewritten to say that the claim (§6.3, once
+  James agrees to §20.2's choice) replaced the gate, and that the gate stays
+  only on the legacy peering's own rows until Phase 3b;
 - `respond()` runs the request's after-the-answer jobs (§2.5) instead of
   spawning them; the shutdown callback rolls back first and logs through the
   one logger; the CLI gains `node-identity` (with `--project-root` and
@@ -5597,7 +5612,8 @@ Git keeps the full text of every revision.
 | d4ceda7 | 2026-10-04 | 8: corrections from the review of revision 7 (its first 13 findings) |
 | 56bf5db | 2026-10-04 | 9: a rewrite in James's words, with D1 to D8 applied and all 43 findings of that review disposed of |
 | 87c6bee | 2026-10-05 | 10: the 64 findings of the review of revision 9: locks the operating system releases in place of the attempt's 50 s and of unbounded exchanges; a batch taken in packet by packet; wakes first, at most 16 a pass, with starved wakes released and `stream_set_blocking`; the legacy gateway row under the claim; the stale sweep off signed and own rows; RNS 1.5.2's mode names, cull, raw emission times and "only a move is forwarded"; §20 rebuilt from James's recorded words; fifteen new open questions |
-| this commit | 2026-10-05 | 10, record corrected: D2 restated as James decided it (no process but the storage reclaim); when the address check, registrations at and exchanges with PHP nodes, and goodbyes run is open question 20, not his decision; this document becomes the roadmap for Stages 2 and 3, and Stage 1 is specified in `REGISTRATION-STAGE1.md` |
+| 8e271d1 | 2026-10-05 | 10, record corrected: D2 restated as James decided it (no process but the storage reclaim); when the address check, registrations at and exchanges with PHP nodes, and goodbyes run is open question 20, not his decision; this document becomes the roadmap for Stages 2 and 3, and Stage 1 is specified in `REGISTRATION-STAGE1.md` |
+| this commit | 2026-10-05 | 10, record corrected again: A12 is accepted by this document, not by James, whose 2026-10-03 answer was a question (§4.3.2, §19, §20; Stage 1's open question 5); question 12 and §10.12 no longer say James asked for the one-a-second wake limit to go (it is §20.2's choice); question 17.3 is asked in Stage 1 |
 
 Revision 7's question 3 (the double link after the later node's database
 reset) and revision 8's question 12 (a node that loses its identity file and
