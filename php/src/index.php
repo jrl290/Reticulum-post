@@ -1190,6 +1190,8 @@ final class HttpApi
                     $this->respond(400, ['status' => 'error', 'error' => 'Type YES to confirm']);
                 }
                 $this->storage->clearAllData();
+                // The wiped interfaces must get their 401 at the next poll.
+                EmptyPoll::clearAll($this->config);
                 $this->respond(200, ['status' => 'ok']);
             }
 

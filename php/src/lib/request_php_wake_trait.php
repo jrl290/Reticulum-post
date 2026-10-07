@@ -4,6 +4,10 @@ declare(strict_types=1);
 
 namespace ReticulumPhp;
 
+// Loaded here as well as by index.php: deploy.sh renames lib/ before
+// index.php, and a request between the two runs the old index.php.
+require_once __DIR__ . '/empty_poll.php';
+
 use PDO;
 
 /**
@@ -437,6 +441,8 @@ trait RequestPhpWakeTrait
 
     private function appendPeerAckBatchId(string $peerInterfaceId, string $batchId): void
     {
+        // An acknowledgement owed to a peer is a wake owed (EmptyPoll).
+        EmptyPoll::noteWakesOwed($this->config ?? []);
         $stmt = $this->db->prepare(
             'SELECT pending_ack_batch_ids_json FROM interfaces WHERE interface_id = :interface_id'
         );

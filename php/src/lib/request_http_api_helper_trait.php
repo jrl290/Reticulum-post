@@ -4,6 +4,10 @@ declare(strict_types=1);
 
 namespace ReticulumPhp;
 
+// Loaded here as well as by index.php: deploy.sh renames lib/ before
+// index.php, and a request between the two runs the old index.php.
+require_once __DIR__ . '/empty_poll.php';
+
 /**
  * HTTP API Helper Trait — request lifecycle and exchange orchestration.
  *

@@ -55,6 +55,12 @@ namespace ReticulumPhp;
  *
  * Anything this class cannot read or write means "no shortcut": the poll
  * takes the full path, which is what every poll did before.
+ *
+ * What it gives up: a database the full path cannot reach is a 500 to every
+ * request, and a marked client's empty polls still get "nothing" until its
+ * mark runs out (seconds()). An operator who edits the interfaces table in
+ * SQL is seen by marked browsers seconds() late too; the operator wipes
+ * (/v1/monitor/clear, monitor.php) remove every mark, and peers have none.
  */
 final class EmptyPoll
 {
@@ -178,7 +184,7 @@ final class EmptyPoll
      *
      * @param callable(): int $unacknowledgedCount
      */
-    public static function markIdle(array $config, string $interfaceId, string $sessionToken, callable $unacknowledgedCount): void
+    public static function markIdle(array $config, string $interfaceId, string $sessionToken, callable $unacknowledgedCount, ?int $writtenAt = null): void
     {
         if (self::seconds($config) === 0) {
             return;
@@ -189,7 +195,9 @@ final class EmptyPoll
         }
         $mark = self::markPath($dir, $interfaceId);
         $tmp = $mark . '.' . bin2hex(random_bytes(4));
-        if (@file_put_contents($tmp, self::tokenDigest($interfaceId, $sessionToken)) === false || !@rename($tmp, $mark)) {
+        if (@file_put_contents($tmp, self::tokenDigest($interfaceId, $sessionToken)) === false
+            || !@touch($tmp, $writtenAt ?? time())
+            || !@rename($tmp, $mark)) {
             @unlink($tmp);
             return;
         }
@@ -278,7 +286,9 @@ final class EmptyPoll
     /** One directory per node, beside its maintenance lock file. */
     private static function dir(array $config): string
     {
-        $hostHash = substr(hash('sha256', (string) ($config['host_url'] ?? 'default')), 0, 16);
+        // Config::load's host_url, or monitor.php's raw one: same directory.
+        $host = rtrim((string) ($config['host_url'] ?? $config['http']['advertise_url'] ?? 'default'), '/');
+        $hostHash = substr(hash('sha256', $host), 0, 16);
         return sys_get_temp_dir() . '/reticulum-php-idle-' . $hostHash;
     }
 

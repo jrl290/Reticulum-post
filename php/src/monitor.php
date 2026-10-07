@@ -81,6 +81,9 @@ if ($action === 'clear' && ($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
             try { $db->exec($backend === 'mysql' ? "DELETE FROM `{$t}`" : "DELETE FROM {$t}"); }
             catch (\Throwable $e) { $message .= "{$t}: " . $e->getMessage() . "\n"; }
         }
+        // The wiped interfaces must get their 401 at the next poll (EmptyPoll).
+        require_once __DIR__ . '/lib/empty_poll.php';
+        \ReticulumPhp\EmptyPoll::clearAll($config);
         if ($message === '') { $message = 'All tables cleared.'; $cleared = true; }
     } else { $message = 'Type YES to confirm.'; }
 }

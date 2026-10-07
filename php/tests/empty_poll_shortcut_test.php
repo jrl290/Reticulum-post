@@ -238,6 +238,14 @@ $pdo->prepare("INSERT INTO interfaces (interface_id, name, session_token, bitrat
     ->execute([$peerId, time(), time()]);
 $storage->markIdleIfNothingQueued($peerId, 'ptok');
 check('a PHP peer is never marked (its rotation deletes the row in SQL, which must refuse it at once)', !is_file($markPath($peerId)));
+@unlink($markDir . '/wakes-owed');
+$queue($peerId);
+check('a packet queued for a PHP peer outside any epilogue (a /v1/wake pull) notes a wake owed', is_file($markDir . '/wakes-owed'));
+@unlink($markDir . '/wakes-owed');
+$storage->markIdleIfNothingQueued($b['interface_id'], 'not-its-token');
+check('a token the row no longer holds gets no mark (revoked while its exchange ran)', !is_file($markPath($b['interface_id'])));
+$storage->markIdleIfNothingQueued('no-such-interface', 'tok');
+check('a row deleted while its exchange ran gets no mark', !is_file($markPath('no-such-interface')));
 
 echo "(h) markIdle writes before it counts\n";
 $c = 'unit-' . bin2hex(random_bytes(4));
@@ -287,12 +295,15 @@ file_put_contents($old, 'x');
 touch($old, time() - 120);
 \ReticulumPhp\EmptyPoll::sweep($config);
 check('a second sweep within the minute does nothing', is_file($old));
+\ReticulumPhp\EmptyPoll::clearAll($config);
+check('the operator wipe removes every mark, fresh or old, and leaves the wake mark', !is_file($old) && !is_file($fresh) && is_file($markDir . '/wakes-owed'));
 @unlink($markDir . '/wakes-owed');
 
 echo "(k) the queue's one writer, and no transactions around it\n";
 $srcFiles = array_merge([$src . '/index.php'], glob($src . '/lib/*.php') ?: []);
 $inserts = [];
 $transactions = [];
+$unloaded = [];
 foreach ($srcFiles as $file) {
     // Code only: comments may describe a write without making one.
     $code = '';
@@ -308,7 +319,12 @@ foreach ($srcFiles as $file) {
     if (preg_match('/->\s*(beginTransaction|commit)\s*\(/', $code) === 1) {
         $transactions[] = basename($file);
     }
+    if (str_contains($file, '/lib/') && basename($file) !== 'empty_poll.php' && str_contains($code, 'EmptyPoll::')
+        && !str_contains($code, "require_once __DIR__ . '/empty_poll.php'")) {
+        $unloaded[] = basename($file);
+    }
 }
+check('every lib file that calls EmptyPoll loads it (deploy.sh swaps lib/ before index.php)', $unloaded === [], implode(', ', $unloaded));
 check('outbound_packets is inserted into only by queueOutboundPacket', $inserts === ['request_interface_runtime_trait.php' => 1], json_encode($inserts));
 check('the node opens no transactions (the mark is removed right after the autocommit write)', $transactions === [], implode(', ', $transactions));
 

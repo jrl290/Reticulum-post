@@ -86,10 +86,12 @@ $assigns = $count('/^UPDATE outbound_packets\s+SET delivered_batch_id/i');
 $check(count($batch['packets']) === 5, 'batch carries the five packets (' . count($batch['packets']) . ')');
 $check($assigns === 1, "batch assignment is one UPDATE, not one per packet ($assigns)");
 
-// Peer check is memoised within a request.
+// Peer check is memoised within a request. Asked of an interface queueing
+// has not looked up: queueOutboundPacket checks its interface too, to note a
+// wake owed to a PHP peer (EmptyPoll), so $iface's answer is already cached.
 $reset();
-$storage->isPhpPeerInterface($iface);
-$storage->isPhpPeerInterface($iface);
+$storage->isPhpPeerInterface('memo-' . $iface);
+$storage->isPhpPeerInterface('memo-' . $iface);
 $check($count('/^SELECT 1 FROM interfaces WHERE interface_id = :id AND peer_url/i') === 1, 'peer check queried once per interface per request');
 
 array_map('unlink', glob($dir . '/*') ?: []);
