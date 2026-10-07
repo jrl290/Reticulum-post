@@ -126,6 +126,10 @@ trait RequestInterfaceRuntimeTrait
             Database::executeWithRetry($stmt, 'queueOutboundPacket');
         }
 
+        // The packet is committed (autocommit; the node opens no
+        // transactions): the interface's next poll must take the full path.
+        EmptyPoll::clear($this->config ?? [], $interfaceId);
+
         // Cap pending outbound per interface at 256. Drop oldest unissued entries.
         // Python RNS caps announce_queue at MAX_QUEUED_ANNOUNCES (16384).
         // The queue cap is per interface, not per packet: check it once per
@@ -180,6 +184,26 @@ trait RequestInterfaceRuntimeTrait
                 Database::executeWithRetry($delStmt, 'capOutboundQueue');
             }
         }
+    }
+
+    /**
+     * After a full exchange or poll from $interfaceId (see EmptyPoll::markIdle).
+     * A PHP peer (another node, or a gateway) gets no mark: its credentials are
+     * revoked by deleting its row in SQL (README, rotating a leaked peer
+     * session), which no code here sees, and the old credential must be
+     * refused at the very next exchange, not when a mark runs out.
+     */
+    public function markIdleIfNothingQueued(string $interfaceId, string $sessionToken): void
+    {
+        if ($this->isPhpPeerInterface($interfaceId)) {
+            return;
+        }
+        EmptyPoll::markIdle(
+            $this->config,
+            $interfaceId,
+            $sessionToken,
+            fn (): int => $this->pendingOutboundPacketCount($interfaceId),
+        );
     }
 
     private function pendingOutboundPacketCount(string $interfaceId): int

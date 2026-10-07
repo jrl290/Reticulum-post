@@ -25,6 +25,7 @@ require_once __DIR__ . '/lib/request_relay_routing_trait.php';
 require_once __DIR__ . '/lib/request_schema_trait.php';
 require_once __DIR__ . '/lib/request_storage_budget_trait.php';
 require_once __DIR__ . '/lib/request_php_wake_trait.php';
+require_once __DIR__ . '/lib/empty_poll.php';
 
 // Reticulum-php is request-operated. Queued transport bytes only move during
 // authenticated request/response exchanges. Wake helpers exist to prompt the
@@ -1207,6 +1208,10 @@ final class HttpApi
                     $interfaceStaleSeconds,
                     $this->maintenanceInt('batch_ttl_seconds', 86400),
                 );
+                if ($force) {
+                    // Every client is stale now; its next poll must say so.
+                    EmptyPoll::clearAll($this->config);
+                }
                 $this->respond(200, ['status' => 'ok', 'force' => $force, 'flushed' => $results]);
             }
 
@@ -1252,6 +1257,8 @@ final class HttpApi
                 }
 
                 $registration = $this->storage->registerInterface($name, $bitrate, $mtu, $metadata);
+                // A re-registration can give an existing interface a new token.
+                EmptyPoll::clear($this->config, (string) $registration['interface_id']);
                 $response = [
                     'status' => 'registered',
                     'interface_id' => $registration['interface_id'],
@@ -1279,6 +1286,9 @@ final class HttpApi
                 [$interfaceId, $sessionToken] = $this->requireInterfaceCredentials($body);
                 $this->storage->authenticateInterface($interfaceId, $sessionToken);
                 $dropped = $this->storage->goodbyeInterface($interfaceId);
+                // A page restored after its goodbye must take the full path,
+                // which marks it online again.
+                EmptyPoll::clear($this->config, $interfaceId);
                 $this->respond(200, ['status' => 'offline', 'interface_id' => $interfaceId, 'dropped' => $dropped]);
             }
 
@@ -1319,6 +1329,7 @@ final class HttpApi
                 $t4 = microtime(true);
                 $this->runInterfaceRequestEpilogue();
                 $t5 = microtime(true);
+                $this->markIdleIfNothingQueued($interfaceId, $sessionToken);
 
 
                 $this->respond(200, [
@@ -1379,6 +1390,7 @@ final class HttpApi
                 $acked = $this->storage->acknowledgeOutboundBatches($interfaceId, $ackBatchIds);
                 $batch = $this->storage->fetchOutboundBatch($interfaceId, $maxPackets);
                 $this->runInterfaceRequestEpilogue();
+                $this->markIdleIfNothingQueued($interfaceId, $sessionToken);
 
                 $this->respond(200, [
                     'status' => 'ok',
@@ -1404,8 +1416,7 @@ final class HttpApi
     }
 }
 
-/** @return array{0: array, 1: Storage} */
-function initializeRuntime(string $projectRoot): array
+function loadRuntimeConfig(string $projectRoot): array
 {
     $reticulumPhpConfig = Config::load($projectRoot);
 
@@ -1414,6 +1425,14 @@ function initializeRuntime(string $projectRoot): array
     if ($phpMemoryLimit !== '' && ini_set('memory_limit', $phpMemoryLimit) === false) {
         error_log('Reticulum-php: unable to set memory_limit=' . $phpMemoryLimit);
     }
+
+    return $reticulumPhpConfig;
+}
+
+/** @return array{0: array, 1: Storage} */
+function initializeRuntime(string $projectRoot, ?array $reticulumPhpConfig = null): array
+{
+    $reticulumPhpConfig ??= loadRuntimeConfig($projectRoot);
 
     Config::ensureDirectories($reticulumPhpConfig);
     Environment::verify();
@@ -1477,13 +1496,16 @@ function runIndexCli(string $projectRoot, array $argv): int
 
 function runIndexHttp(string $projectRoot): never
 {
-    [$reticulumPhpConfig, $reticulumPhpStorage] = initializeRuntime($projectRoot);
+    $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+    $uri = $_SERVER['REQUEST_URI'] ?? '/';
+    $reticulumPhpConfig = loadRuntimeConfig($projectRoot);
+    // An idle client's empty poll is answered here, before the database is
+    // opened; anything else returns and takes the full path.
+    EmptyPoll::answer($reticulumPhpConfig, $method, $uri, $_SERVER);
+
+    [$reticulumPhpConfig, $reticulumPhpStorage] = initializeRuntime($projectRoot, $reticulumPhpConfig);
     $api = new HttpApi($reticulumPhpConfig, $reticulumPhpStorage);
-    $api->handle(
-        $_SERVER['REQUEST_METHOD'] ?? 'GET',
-        $_SERVER['REQUEST_URI'] ?? '/',
-        $_SERVER,
-    );
+    $api->handle($method, $uri, $_SERVER);
 }
 
 if (realpath($_SERVER['SCRIPT_FILENAME'] ?? '') === __FILE__) {

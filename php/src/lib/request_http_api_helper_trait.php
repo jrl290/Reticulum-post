@@ -67,6 +67,60 @@ namespace ReticulumPhp;
  *   - Make wake dispatch synchronous/blocking.
  */
 
+/**
+ * The request path and the response headers, shared by HttpApi and by the
+ * empty-poll shortcut (EmptyPoll), which answers before HttpApi exists and
+ * must route and answer exactly as HttpApi would.
+ */
+final class HttpIo
+{
+    public static function normalizedPath(string $uri, array $server): string
+    {
+        $path = parse_url($uri, PHP_URL_PATH);
+        $path = is_string($path) ? $path : '/';
+
+        $scriptName = $server['SCRIPT_NAME'] ?? $server['PHP_SELF'] ?? null;
+        if (is_string($scriptName) && $scriptName !== '') {
+            $path = self::stripPathPrefix($path, rtrim($scriptName, '/'));
+
+            $scriptDir = dirname($scriptName);
+            if (is_string($scriptDir) && $scriptDir !== '' && $scriptDir !== '.' && $scriptDir !== DIRECTORY_SEPARATOR) {
+                $path = self::stripPathPrefix($path, rtrim(str_replace('\\', '/', $scriptDir), '/'));
+            }
+        }
+
+        $path = rtrim($path, '/');
+        return $path === '' ? '/' : $path;
+    }
+
+    private static function stripPathPrefix(string $path, string $prefix): string
+    {
+        if ($prefix === '' || $prefix === '/') {
+            return $path;
+        }
+
+        if ($path === $prefix) {
+            return '/';
+        }
+
+        if (str_starts_with($path, $prefix . '/')) {
+            return substr($path, strlen($prefix));
+        }
+
+        return $path;
+    }
+
+    public static function sendHeaders(int $statusCode): void
+    {
+        http_response_code($statusCode);
+        header('Content-Type: application/json');
+        header('Access-Control-Allow-Origin: *');
+        header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
+        header('Access-Control-Allow-Headers: Content-Type, X-Interface-Id, X-Session-Token');
+        header('Access-Control-Max-Age: 86400');
+    }
+}
+
 trait RequestHttpApiHelperTrait
 {
     /**
@@ -92,6 +146,7 @@ trait RequestHttpApiHelperTrait
                 $this->maintenanceInt('interface_stale_after_seconds', 15),
                 $this->maintenanceInt('batch_ttl_seconds', 86400),
             );
+            EmptyPoll::sweep($this->config);
         }
     }
 
@@ -128,6 +183,21 @@ trait RequestHttpApiHelperTrait
             $this->storage->dispatchWakes();
         } catch (\Throwable $error) {
             $this->log('error', 'Wake dispatch failed: ' . $error->getMessage());
+        }
+    }
+
+    /**
+     * The exchange or poll has been answered in full: let the client's next
+     * empty poll be answered from its idle mark if nothing waits for it (see
+     * EmptyPoll). A failure here costs only the shortcut, so it is logged and
+     * the answer still goes out.
+     */
+    private function markIdleIfNothingQueued(string $interfaceId, string $sessionToken): void
+    {
+        try {
+            $this->storage->markIdleIfNothingQueued($interfaceId, $sessionToken);
+        } catch (\Throwable $error) {
+            $this->log('error', 'Idle mark failed: ' . $error->getMessage());
         }
     }
 
@@ -170,38 +240,7 @@ trait RequestHttpApiHelperTrait
 
     private function normalizedPath(string $uri, array $server): string
     {
-        $path = parse_url($uri, PHP_URL_PATH);
-        $path = is_string($path) ? $path : '/';
-
-        $scriptName = $server['SCRIPT_NAME'] ?? $server['PHP_SELF'] ?? null;
-        if (is_string($scriptName) && $scriptName !== '') {
-            $path = $this->stripPathPrefix($path, rtrim($scriptName, '/'));
-
-            $scriptDir = dirname($scriptName);
-            if (is_string($scriptDir) && $scriptDir !== '' && $scriptDir !== '.' && $scriptDir !== DIRECTORY_SEPARATOR) {
-                $path = $this->stripPathPrefix($path, rtrim(str_replace('\\', '/', $scriptDir), '/'));
-            }
-        }
-
-        $path = rtrim($path, '/');
-        return $path === '' ? '/' : $path;
-    }
-
-    private function stripPathPrefix(string $path, string $prefix): string
-    {
-        if ($prefix === '' || $prefix === '/') {
-            return $path;
-        }
-
-        if ($path === $prefix) {
-            return '/';
-        }
-
-        if (str_starts_with($path, $prefix . '/')) {
-            return substr($path, strlen($prefix));
-        }
-
-        return $path;
+        return HttpIo::normalizedPath($uri, $server);
     }
 
     private function requirePacketArray(array $body, string $field, ?string $interfaceId = null): array
@@ -308,12 +347,7 @@ trait RequestHttpApiHelperTrait
 
     private function respond(int $statusCode, array $payload): never
     {
-        http_response_code($statusCode);
-        header('Content-Type: application/json');
-        header('Access-Control-Allow-Origin: *');
-        header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
-        header('Access-Control-Allow-Headers: Content-Type, X-Interface-Id, X-Session-Token');
-        header('Access-Control-Max-Age: 86400');
+        HttpIo::sendHeaders($statusCode);
         // Strip control characters from all string values before encoding.
         // Null bytes (\x00) are stripped first with str_replace;
         // the regex handles the remaining C0 controls (\x01-\x1f) excluding

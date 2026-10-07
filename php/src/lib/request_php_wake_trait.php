@@ -74,6 +74,11 @@ trait RequestPhpWakeTrait
      */
     public function dispatchWakes(): void
     {
+        // Removed before the look and written after it if anything is owed,
+        // so idle polls stop taking the shortcut while an epilogue is due
+        // (EmptyPoll, "THE WAKE MARK").
+        EmptyPoll::clearWakesOwed($this->config ?? []);
+
         // Collect peers with pending outbound packets.
         $peers = $this->phpPeerInterfaceIdsWithPendingOutbound();
 
@@ -87,6 +92,9 @@ trait RequestPhpWakeTrait
                 $peers[] = $p;
                 $seen[(string)$p['interface_id']] = true;
             }
+        }
+        if ($peers !== []) {
+            EmptyPoll::noteWakesOwed($this->config ?? []);
         }
 
         // Gate: don't wake the same peer more than once per min_wake_interval_ms.
@@ -738,6 +746,7 @@ trait RequestPhpWakeTrait
             $del = $this->db->prepare('DELETE FROM interfaces WHERE interface_id = :id');
             $del->bindValue(':id', (string) $existing['interface_id'], PDO::PARAM_STR);
             Database::executeWithRetry($del, 'removeDeadPeerRow');
+            EmptyPoll::clear($this->config ?? [], (string) $existing['interface_id']);
         }
 
         // Pre-generate credentials for the peer to call us.
