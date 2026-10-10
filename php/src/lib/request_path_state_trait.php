@@ -202,29 +202,41 @@ trait RequestPathStateTrait
      *   1. a copy the readers can use: parsed, an announce;
      *   2. the path's copy: the hop count the path holds (inbound_packets.hops
      *      and path_entries.hops both count this node's inbound increment);
-     *   3. the newest.
-     * With no path every copy ties on 2 and the newest wins, which is all the
-     * readers looked at until 2026-10-10.
+     *   3. received on the path's interface: the same emission can arrive at
+     *      the same hop count over a second bridge, and the cache request
+     *      replays a copy from the interface it came in on;
+     *   4. the newest.
+     * With no path every copy ties on 2 and 3 and the newest wins, which is
+     * all the readers looked at until 2026-10-10.
      */
     private function announceCopyOrderSql(string $copy, string $path): string
     {
         return "CASE WHEN {$copy}.status = 'parsed' AND {$copy}.packet_type = 1 THEN 0 ELSE 1 END, "
             . "CASE WHEN {$copy}.hops = {$path}.hops THEN 0 ELSE 1 END, "
+            . "CASE WHEN {$copy}.interface_id = {$path}.interface_id THEN 0 ELSE 1 END, "
             . "{$copy}.packet_record_id DESC";
     }
 
-    private function cachedAnnounceRecordByPacketHash(string $packetHashHex): ?array
+    /**
+     * The copy a cache request replays, and announceRawByPacketHash() answers
+     * a path request with. One packet hash: idx_inbound_packets_hash finds its
+     * few copies and idx_path_entries_packet_hash its path, if any.
+     */
+    private function cachedAnnounceByPacketHashSql(): string
     {
-        $stmt = $this->db->prepare(
-            'SELECT ip.interface_id AS received_interface_id, ip.raw_base64
+        return 'SELECT ip.interface_id AS received_interface_id, ip.raw_base64
              FROM inbound_packets ip
              LEFT JOIN path_entries pe ON pe.packet_hash_hex = ip.packet_hash_hex
              WHERE ip.packet_hash_hex = :packet_hash_hex
                AND ip.status = :status
                AND ip.packet_type = :packet_type
              ORDER BY ' . $this->announceCopyOrderSql('ip', 'pe') . '
-             LIMIT 1'
-        );
+             LIMIT 1';
+    }
+
+    private function cachedAnnounceRecordByPacketHash(string $packetHashHex): ?array
+    {
+        $stmt = $this->db->prepare($this->cachedAnnounceByPacketHashSql());
         $stmt->bindValue(':packet_hash_hex', $packetHashHex, PDO::PARAM_STR);
         $stmt->bindValue(':status', 'parsed', PDO::PARAM_STR);
         $stmt->bindValue(':packet_type', 1, PDO::PARAM_INT);

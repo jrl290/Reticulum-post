@@ -540,9 +540,10 @@ trait RequestMaintenanceTrait
      *
      * The copy kept is the first by announceCopyOrderSql(), the order the path
      * request, cache request and seeding readers pick by: the copy at the
-     * path's hop count, the newest of those. Copies younger than the TTL are
-     * left alone. They are the diagnostics the TTL exists for, and when the
-     * readers prefer one of them, it is not the copy this deletes.
+     * path's hop count, received on the path's interface if one was, the
+     * newest of those. Copies younger than the TTL are left alone. They are
+     * the diagnostics the TTL exists for, and when the readers prefer one of
+     * them, it is not the copy this deletes.
      *
      * Bounded per run, because maintenance rides web requests. The rows past
      * the TTL are walked in the order they aged, ANNOUNCE_COPY_SCAN_ROWS at a

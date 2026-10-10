@@ -18,13 +18,18 @@
  *       same-hops retry) leave one row: the path's copy, at the path's hop
  *       count, the newest of those;
  *   (b) after pruning a path request is answered at the path's hops with that
- *       announce, and a cache request replays it; while copies remain, a cache
- *       request and seeding pick the path's copy, not the newest copy;
+ *       announce, and a cache request replays it at the path's hops without
+ *       moving the path (the replay adds this node's hop, as RNS's
+ *       Transport.inbound() does); while copies remain, a cache request and
+ *       seeding pick the path's copy, not the newest copy;
  *   (c) copies younger than the TTL are untouched;
  *   (d) old rows no path points at are deleted by the TTL as before;
  *   (e) the work per run is bounded: 1,200 old copies of one announce, and 700
  *       announces with two old copies each, drain over several runs;
- *   (f) two referenced announces are each kept once.
+ *   (f) two referenced announces are each kept once, each by the copy that
+ *       came in on the path's interface when two share the path's hops;
+ *   (cost) seeding and the cache/path request reader look copies up through
+ *       the path and idx_inbound_packets_hash, never by scanning the history.
  *
  * Run: php tests/inbound_one_copy_test.php
  */
@@ -184,6 +189,32 @@ function pathOf(PDO $db, array $id): array
     return is_array($row) ? $row : [];
 }
 
+/** The interface a stored copy came in on. */
+function receivedOn(PDO $db, int $id): string
+{
+    $stmt = $db->prepare('SELECT interface_id FROM inbound_packets WHERE packet_record_id = :id');
+    $stmt->execute([':id' => $id]);
+    return (string) $stmt->fetchColumn();
+}
+
+/** Wire hops of the announces a delivery queued for relay, and where to. */
+function relayed(PDO $db): array
+{
+    $relays = array_filter(queued($db), static fn (array $q): bool => $q[1] === 'relay_announce');
+    return [
+        'hops' => array_values(array_unique(array_map(static fn (array $q): int => ord($q[2][1]), $relays))),
+        'to' => array_values(array_unique(array_map(static fn (array $q): string => $q[0], $relays))),
+    ];
+}
+
+/** A path request from BROWSER1; the hop count of the one answer, or -1. */
+function pathResponseHops(Storage $storage, PDO $db, array $id): int
+{
+    deliver($storage, $db, BROWSER1, pathRequestRaw($storage, $id['destination']));
+    $responses = array_values(array_filter(queued($db), static fn (array $q): bool => $q[0] === BROWSER1 && $q[1] === 'path_response'));
+    return count($responses) === 1 ? ord($responses[0][2][1]) : -1;
+}
+
 function maintain(Storage $storage): array
 {
     return $storage->runMaintenance(300, 86400);
@@ -208,8 +239,9 @@ $a3 = deliver($storage, $db, GATEWAY2, announceRaw($idA, $blobA, 5, $gateway2Tid
 $hashA = $a1['hash'];
 
 // F: a second referenced announce, its copies in another shape: the path is
-// 2 hops via the gateway, the same hops arrive again over the other bridge,
-// then a 3-hop copy. The copy to keep is the second.
+// 2 hops via the gateway, the same hops arrive again (newer) over the other
+// bridge, then a 3-hop copy. The copy to keep is the first: the path's hops,
+// on the path's interface.
 $idF = identity('one copy F');
 $blobF = randomBlob($now - 50);
 $f1 = deliver($storage, $db, GATEWAY, announceRaw($idF, $blobF, 1, $gatewayTid));
@@ -236,7 +268,7 @@ $d3 = deliver($storage, $db, GATEWAY, announceRaw($idD, randomBlob($now - 30), 2
 echo "(setup) the copies landed as intended\n";
 check('A: path is 4 hops via the gateway, on this announce', pathOf($db, $idA) === ['hops' => 4, 'packet_hash_hex' => $hashA, 'interface_id' => GATEWAY], json_encode(pathOf($db, $idA)));
 check('A: copies at 4, 4, 6 hops share one hash', [$a1['hops'], $a2['hops'], $a3['hops']] === [4, 4, 6] && $a2['hash'] === $hashA && $a3['hash'] === $hashA);
-check('F: path is 2 hops via the gateway; copies at 2, 2, 3 hops', (int) (pathOf($db, $idF)['hops'] ?? -1) === 2 && (pathOf($db, $idF)['packet_hash_hex'] ?? '') === $hashF && [$f1['hops'], $f2['hops'], $f3['hops']] === [2, 2, 3] && $f3['hash'] === $hashF);
+check('F: path is 2 hops via the gateway; copies at 2, 2, 3 hops', pathOf($db, $idF) === ['hops' => 2, 'packet_hash_hex' => $hashF, 'interface_id' => GATEWAY] && [$f1['hops'], $f2['hops'], $f3['hops']] === [2, 2, 3] && $f3['hash'] === $hashF, json_encode(pathOf($db, $idF)));
 check('C: path is 4 hops; copies at 4, 6, 4, 6 hops', (int) (pathOf($db, $idC)['hops'] ?? -1) === 4 && (pathOf($db, $idC)['packet_hash_hex'] ?? '') === $hashC && [$c1['hops'], $c2['hops'], $c3['hops'], $c4['hops']] === [4, 6, 4, 6]);
 check('D: the path moved to the newer emission', (pathOf($db, $idD)['packet_hash_hex'] ?? '') === $d3['hash'] && $d1['hash'] === $d2['hash'] && $d1['hash'] !== $d3['hash'], json_encode(pathOf($db, $idD)));
 
@@ -261,7 +293,8 @@ $summary = maintain($storage);
 echo "(a) three old copies of one referenced announce leave one: the path's\n";
 check('A keeps only the same-hops retry', copies($db, $hashA) === [$a2['id']], json_encode(copies($db, $hashA)));
 echo "(f) two referenced announces are each kept once\n";
-check('F keeps only the second 2-hop copy', copies($db, $hashF) === [$f2['id']], json_encode(copies($db, $hashF)));
+check('F keeps only the 2-hop copy that came in on the path\'s interface', copies($db, $hashF) === [$f1['id']], json_encode(copies($db, $hashF)));
+check('F\'s kept copy came in where its path points', receivedOn($db, $f1['id']) === (pathOf($db, $idF)['interface_id'] ?? '') && receivedOn($db, $f1['id']) === GATEWAY);
 echo "(c) copies younger than the TTL are untouched\n";
 check('C keeps its old path copy and both young copies', copies($db, $hashC) === [$c1['id'], $c3['id'], $c4['id']], json_encode(copies($db, $hashC)));
 echo "(d) old rows no path points at still expire\n";
@@ -281,14 +314,46 @@ $response = $responses[0][2] ?? '';
 check('at the path\'s 4 hops', $response !== '' && ord($response[1]) === 4, $response === '' ? 'none' : (string) ord($response[1]));
 check('carrying the announce', $response !== '' && announceBody($response) === announceBody(announceRaw($idA, $blobA, 3, $gatewayTid)) && substr($response, 18, 16) === $idA['destination']);
 
+echo "(b) a cache request replays the kept copy at the path's hops and moves no path\n";
+$pathsBefore = [pathOf($db, $idA), pathOf($db, $idF), pathOf($db, $idC)];
 $r = deliver($storage, $db, BROWSER1, cacheRequestRaw($idA, hex2bin($hashA)));
-check('a cache request for A replays the kept copy', ($r['summary']['cache_requests_replayed'] ?? -1) === 1 && queued($db) !== [], json_encode($r['summary']));
+$out = relayed($db);
+check('a cache request for A replays the kept copy at the path\'s 4 hops',
+    ($r['summary']['cache_requests_replayed'] ?? -1) === 1 && $out['hops'] === [4],
+    json_encode([$r['summary']['cache_requests_replayed'] ?? null, $out]));
+$r = deliver($storage, $db, BROWSER1, cacheRequestRaw($idF, hex2bin($hashF)));
+$out = relayed($db);
+check('a cache request for F replays the gateway\'s copy at 2 hops, not to a gateway',
+    ($r['summary']['cache_requests_replayed'] ?? -1) === 1 && $out['hops'] === [2] && !in_array(GATEWAY, $out['to'], true) && !in_array(GATEWAY2, $out['to'], true),
+    json_encode($out));
 $r = deliver($storage, $db, BROWSER1, cacheRequestRaw($idC, hex2bin($hashC)));
-$replayHops = array_values(array_unique(array_map(static fn (array $q): int => ord($q[2][1]), array_filter(queued($db), static fn (array $q): bool => $q[1] === 'relay_announce'))));
-$replayTargets = array_values(array_unique(array_map(static fn (array $q): string => $q[0], queued($db))));
-check('a cache request for C replays the gateway\'s 4-hop copy, not the newest 6-hop one',
-    ($r['summary']['cache_requests_replayed'] ?? -1) === 1 && $replayHops === [3] && !in_array(GATEWAY, $replayTargets, true),
-    json_encode(['hops' => $replayHops, 'to' => $replayTargets]));
+$out = relayed($db);
+check('a cache request for C replays the gateway\'s 4-hop copy at 4 hops, not the newest 6-hop one',
+    ($r['summary']['cache_requests_replayed'] ?? -1) === 1 && $out['hops'] === [4] && !in_array(GATEWAY, $out['to'], true),
+    json_encode($out));
+check('no cache request moved a path (hops, interface, announce)',
+    [pathOf($db, $idA), pathOf($db, $idF), pathOf($db, $idC)] === $pathsBefore,
+    json_encode([pathOf($db, $idA), pathOf($db, $idF), pathOf($db, $idC)]));
+check('a path request after the cache requests is still answered at 4 hops for A', pathResponseHops($storage, $db, $idA) === 4);
+check('and at 2 hops for F', pathResponseHops($storage, $db, $idF) === 2);
+
+// ── (cost) index-backed readers ──────────────────────────────────────────
+echo "(cost) seeding and the cache/path request reader never scan the inbound history\n";
+$plans = [
+    'seedPathAnnounceSql' => [':dest' => bin2hex($idA['destination']), ':accepted' => 'accepted'],
+    'cachedAnnounceByPacketHashSql' => [':packet_hash_hex' => $hashA, ':status' => 'parsed', ':packet_type' => 1],
+];
+foreach ($plans as $method => $params) {
+    if (!method_exists($storage, $method)) {
+        check("$method exists", false, 'no such method');
+        continue;
+    }
+    $plan = $db->prepare('EXPLAIN QUERY PLAN ' . (new ReflectionMethod($storage, $method))->invoke($storage));
+    $plan->execute($params);
+    $detail = array_map(static fn (array $row): string => (string) $row['detail'], $plan->fetchAll(PDO::FETCH_ASSOC));
+    $scans = array_filter($detail, static fn (string $line): bool => str_starts_with($line, 'SCAN'));
+    check("$method searches by index, scans no table", $scans === [] && in_array(true, array_map(static fn (string $line): bool => str_contains($line, 'idx_inbound_packets_hash'), $detail), true), implode(' | ', $detail));
+}
 
 // ── (e) bounded per run ──────────────────────────────────────────────────
 echo "(e) the work per run is bounded and drains over several runs\n";

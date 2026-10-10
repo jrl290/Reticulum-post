@@ -650,6 +650,14 @@ trait RequestRelayRoutingTrait
         }
 
         $packet = PacketParser::parseRaw($raw);
+        // The stored raw carries the hop count it arrived with. RNS replays a
+        // cached packet through Transport.inbound() (Reticulum-master
+        // Transport.py:2507), which adds its hop, as processInboundBatchRow
+        // does on arrival. Without it the replayed copy looked one hop
+        // shorter than the path that copy had taught, won
+        // 'shorter_path_replaced', and moved the path to hops - 1 (and onto
+        // the copy's interface); it also went out a hop short.
+        $packet['hops'] = ((int) ($packet['hops'] ?? 0)) + 1;
         [$announceStatus, $announceReason] = $this->processAcceptedAnnounce($sourceInterfaceId, $packet);
         $packet['announce_status'] = $announceStatus;
         $packet['announce_reason'] = $announceReason;

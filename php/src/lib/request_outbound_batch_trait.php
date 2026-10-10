@@ -639,22 +639,19 @@ trait RequestOutboundBatchTrait
 
             // The announce the path keeps, by the same rule as a path or cache
             // request and as maintenance keeps one copy of it; with no path,
-            // the newest copy.
-            $rawStmt = $this->db->prepare(
-                'SELECT ip.raw_base64 FROM inbound_packets ip
-                 LEFT JOIN path_entries pe ON pe.packet_hash_hex = ip.packet_hash_hex
-                 WHERE ip.destination_hash_hex = :dest
-                   AND ip.packet_type = 1
-                   AND ip.filter_status = :accepted
-                   AND ip.raw_base64 IS NOT NULL
-                 ORDER BY CASE WHEN pe.packet_hash_hex IS NULL THEN 1 ELSE 0 END, '
-                    . $this->announceCopyOrderSql('ip', 'pe') . '
-                 LIMIT 1'
-            );
+            // or none of its copies stored, the newest copy.
+            $rawStmt = $this->db->prepare($this->seedPathAnnounceSql());
             $rawStmt->bindValue(':dest', $destHex, PDO::PARAM_STR);
             $rawStmt->bindValue(':accepted', 'accepted', PDO::PARAM_STR);
             $rawStmt->execute();
             $rawRow = $rawStmt->fetch(PDO::FETCH_ASSOC);
+            if (!is_array($rawRow)) {
+                $rawStmt = $this->db->prepare($this->seedNewestAnnounceSql());
+                $rawStmt->bindValue(':dest', $destHex, PDO::PARAM_STR);
+                $rawStmt->bindValue(':accepted', 'accepted', PDO::PARAM_STR);
+                $rawStmt->execute();
+                $rawRow = $rawStmt->fetch(PDO::FETCH_ASSOC);
+            }
 
             if (!is_array($rawRow)) continue;
             $rawBase64 = (string) ($rawRow['raw_base64'] ?? '');
@@ -664,5 +661,45 @@ trait RequestOutboundBatchTrait
             $this->queueOutboundPacket($interfaceId, $rawBase64, 'relay_announce', null);
             $queued++;
         }
+    }
+
+    /**
+     * Seeding's pick for one destination with a path: the path's announce,
+     * ranked by announceCopyOrderSql(). Driven from the path, so it reads one
+     * path_entries row by its primary key and that announce's few copies
+     * through idx_inbound_packets_hash. It runs up to 64 times inside the
+     * exchange that registers an interface. Driven from inbound_packets, as
+     * it was briefly on 2026-10-10, no index can give the CASE order, and
+     * each destination read and sorted the whole inbound history (about 4 s
+     * for 64 destinations over 61K rows on SQLite, against 1 ms this way).
+     */
+    private function seedPathAnnounceSql(): string
+    {
+        return 'SELECT ip.raw_base64
+             FROM path_entries pe
+             JOIN inbound_packets ip ON ip.packet_hash_hex = pe.packet_hash_hex
+             WHERE pe.destination_hash_hex = :dest
+               AND ip.packet_type = 1
+               AND ip.filter_status = :accepted
+               AND ip.raw_base64 IS NOT NULL
+             ORDER BY ' . $this->announceCopyOrderSql('ip', 'pe') . '
+             LIMIT 1';
+    }
+
+    /**
+     * Seeding's pick for a destination with no path, or none of whose path's
+     * copies is stored: its newest accepted announce. The ORDER BY on the
+     * primary key with LIMIT 1 walks the history backwards and stops at the
+     * first match; the destinations come from the newest rows.
+     */
+    private function seedNewestAnnounceSql(): string
+    {
+        return 'SELECT raw_base64 FROM inbound_packets
+             WHERE destination_hash_hex = :dest
+               AND packet_type = 1
+               AND filter_status = :accepted
+               AND raw_base64 IS NOT NULL
+             ORDER BY packet_record_id DESC
+             LIMIT 1';
     }
 }
