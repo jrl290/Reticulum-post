@@ -224,7 +224,14 @@ trait RequestControlPlaneTrait
                 return true;
             }
             if ($status === 'validated') {
-                return $this->shouldRefreshAnnounceRelay((string) ($packet['destination_hash_hex'] ?? ''));
+                // Past the hop limit is never relayed, refresh or not: RNS
+                // 1.5.2 does not even consider such an announce
+                // (Transport.py:2211, hops < PATHFINDER_M+1). A private
+                // staging run relayed a looped copy at hops 129 as a refresh.
+                if ((string) ($packet['announce_reason'] ?? '') === 'announce_hops_exceeded') {
+                    return false;
+                }
+                return $this->shouldRefreshAnnounceRelay($packet);
             }
             return false;
         }
@@ -243,13 +250,28 @@ trait RequestControlPlaneTrait
         return true;
     }
 
-    private function shouldRefreshAnnounceRelay(string $destinationHashHex): bool
+    private function shouldRefreshAnnounceRelay(array $packet): bool
     {
         // Re-relay validated announces no more than once every 5 minutes
         // per destination. This keeps downstream path tables alive without
         // flooding the network.
-        $path = $this->pathEntry($destinationHashHex);
+        $path = $this->pathEntry((string) ($packet['destination_hash_hex'] ?? ''));
         if ($path === null) {
+            return false;
+        }
+
+        // The refresh re-sends THIS copy (relayPacketBase64 rebuilds it from
+        // the copy's own payload and hop count), not the announce the path
+        // keeps. So only the copy the path keeps may refresh: the same
+        // emission (packet hash, which leaves out hops and transport id) at
+        // no more hops. A copy the node chose not to use ('announce_ignored':
+        // an older emission, or the same one looped back longer) would spread
+        // a worse announce; a private staging run refreshed looped copies at
+        // hops 69-128 to browsers. RNS 1.5.2 retransmits only an announce
+        // it adds to its path table (Transport.py:2298, 2351-2373).
+        if (!hash_equals((string) ($path['packet_hash_hex'] ?? ''), (string) ($packet['packet_hash_hex'] ?? ''))
+            || $this->transportObservedHops($packet) > (int) ($path['hops'] ?? 0)
+        ) {
             return false;
         }
 

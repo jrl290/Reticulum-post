@@ -653,7 +653,8 @@ trait RequestRelayRoutingTrait
         [$announceStatus, $announceReason] = $this->processAcceptedAnnounce($sourceInterfaceId, $packet);
         $packet['announce_status'] = $announceStatus;
         $packet['announce_reason'] = $announceReason;
-        if ($announceStatus === 'invalid') {
+        // Past the hop limit is never relayed (shouldRelayAcceptedPacket).
+        if ($announceStatus === 'invalid' || $announceReason === 'announce_hops_exceeded') {
             return 0;
         }
 
