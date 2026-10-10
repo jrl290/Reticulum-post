@@ -613,6 +613,10 @@ trait RequestSchemaTrait
             // Lets the Phase 5 purge check "is this packet still a path
             // entry's cached announce?" without scanning path_entries per row.
             'CREATE INDEX idx_path_entries_packet_hash ON path_entries (packet_hash_hex)',
+            // The stored copies of one announce: what a path request, a cache
+            // request and Phase 5b's one-copy rule look up by packet hash,
+            // until 2026-10-10 by scanning the whole inbound history.
+            'CREATE INDEX idx_inbound_packets_hash ON inbound_packets (packet_hash_hex, created_at)',
             'CREATE INDEX idx_reverse_path_created ON reverse_path_entries (created_at)',
             'CREATE INDEX idx_link_transport_updated ON link_transport_entries (updated_at)',
             // Exchange hot-path indexes

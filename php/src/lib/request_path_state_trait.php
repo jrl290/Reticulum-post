@@ -182,15 +182,47 @@ trait RequestPathStateTrait
         return is_string($raw) ? $raw : null;
     }
 
+    /**
+     * Which stored copy of an announce stands for it, as ORDER BY keys, best
+     * first: $copy is the inbound_packets alias, $path the path_entries row
+     * LEFT JOINed on packet_hash_hex (NULL when no path keeps that announce).
+     *
+     * Copies of one emission that arrive over several routes, or as a
+     * transport's retry, share packet_hash_hex: the hash leaves out the hop
+     * count and the transport id. RNS keeps one packet per hash (its cache
+     * file is named by it); this node stores a row per copy. Three readers
+     * pick one of them: the path request answer (processAcceptedPathRequest,
+     * through announceRawByPacketHash), the cache request replay
+     * (replayCachedAnnouncePacket) and new-interface seeding
+     * (seedInterfaceWithCachedAnnounces). Past the inbound TTL maintenance
+     * keeps one copy per hash a path points at and deletes the rest
+     * (deleteRedundantAnnounceCopies). All four rank with these keys, so the
+     * copy maintenance keeps is the copy the readers would have used, and a
+     * younger copy they prefer is one maintenance does not touch:
+     *   1. a copy the readers can use: parsed, an announce;
+     *   2. the path's copy: the hop count the path holds (inbound_packets.hops
+     *      and path_entries.hops both count this node's inbound increment);
+     *   3. the newest.
+     * With no path every copy ties on 2 and the newest wins, which is all the
+     * readers looked at until 2026-10-10.
+     */
+    private function announceCopyOrderSql(string $copy, string $path): string
+    {
+        return "CASE WHEN {$copy}.status = 'parsed' AND {$copy}.packet_type = 1 THEN 0 ELSE 1 END, "
+            . "CASE WHEN {$copy}.hops = {$path}.hops THEN 0 ELSE 1 END, "
+            . "{$copy}.packet_record_id DESC";
+    }
+
     private function cachedAnnounceRecordByPacketHash(string $packetHashHex): ?array
     {
         $stmt = $this->db->prepare(
-            'SELECT interface_id AS received_interface_id, raw_base64
-             FROM inbound_packets
-             WHERE packet_hash_hex = :packet_hash_hex
-               AND status = :status
-               AND packet_type = :packet_type
-             ORDER BY packet_record_id DESC
+            'SELECT ip.interface_id AS received_interface_id, ip.raw_base64
+             FROM inbound_packets ip
+             LEFT JOIN path_entries pe ON pe.packet_hash_hex = ip.packet_hash_hex
+             WHERE ip.packet_hash_hex = :packet_hash_hex
+               AND ip.status = :status
+               AND ip.packet_type = :packet_type
+             ORDER BY ' . $this->announceCopyOrderSql('ip', 'pe') . '
              LIMIT 1'
         );
         $stmt->bindValue(':packet_hash_hex', $packetHashHex, PDO::PARAM_STR);

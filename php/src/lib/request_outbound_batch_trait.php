@@ -637,14 +637,18 @@ trait RequestOutboundBatchTrait
             $destHex = (string) ($row['destination_hash_hex'] ?? '');
             if ($destHex === '') continue;
 
-            // Find the cached raw announce for this destination
+            // The announce the path keeps, by the same rule as a path or cache
+            // request and as maintenance keeps one copy of it; with no path,
+            // the newest copy.
             $rawStmt = $this->db->prepare(
-                'SELECT raw_base64 FROM inbound_packets
-                 WHERE destination_hash_hex = :dest
-                   AND packet_type = 1
-                   AND filter_status = :accepted
-                   AND raw_base64 IS NOT NULL
-                 ORDER BY packet_record_id DESC
+                'SELECT ip.raw_base64 FROM inbound_packets ip
+                 LEFT JOIN path_entries pe ON pe.packet_hash_hex = ip.packet_hash_hex
+                 WHERE ip.destination_hash_hex = :dest
+                   AND ip.packet_type = 1
+                   AND ip.filter_status = :accepted
+                   AND ip.raw_base64 IS NOT NULL
+                 ORDER BY CASE WHEN pe.packet_hash_hex IS NULL THEN 1 ELSE 0 END, '
+                    . $this->announceCopyOrderSql('ip', 'pe') . '
                  LIMIT 1'
             );
             $rawStmt->bindValue(':dest', $destHex, PDO::PARAM_STR);

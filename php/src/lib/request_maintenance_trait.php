@@ -121,6 +121,7 @@ trait RequestMaintenanceTrait
             'expired_packet_hashes' => 0,
             'expired_batches' => 0,
             'expired_inbound_packets' => 0,
+            'expired_inbound_duplicate_copies' => 0,
             'expired_outbound_packets' => 0,
             'expired_path_request_tags' => 0,
             'expired_reverse_paths' => 0,
@@ -208,6 +209,20 @@ trait RequestMaintenanceTrait
                     $backend,
                     $summary
                 );
+
+            // Phase 5b: of the inbound rows the TTL spares because a path
+            // points at them, keep one copy per announce. Its failure is
+            // logged, not thrown: it must not fail the exchange that carried
+            // maintenance, or the phases after it.
+            try {
+                $summary['expired_inbound_duplicate_copies'] = $this->deleteRedundantAnnounceCopies(
+                    $now - max(0, $inboundPacketTtl),
+                    $backend
+                );
+            } catch (PDOException | RuntimeException $e) {
+                $summary['expired_inbound_duplicate_copies_error'] = $e->getMessage();
+                error_log('ReticulumPhp: Phase 5b, one stored copy per announce, failed: ' . $e->getMessage());
+            }
 
             // Phase 6: Expire path request tags
             $pathRequestTagTtl = $this->maintenanceConfigInt('path_request_tag_ttl_seconds', 86400);
@@ -498,6 +513,144 @@ trait RequestMaintenanceTrait
         return [$inboundDeleted, $outboundDeleted];
     }
 
+    // ─── Phase 5b: one stored copy of each announce a path keeps ────────
+
+    /** Inbound rows past the TTL read per run to find the announces to settle. */
+    private const ANNOUNCE_COPY_SCAN_ROWS = 500;
+
+    /** Redundant copies deleted per run, at most. */
+    private const ANNOUNCE_COPY_DELETE_ROWS = 500;
+
+    /** transport_state key holding "created_at:packet_record_id" of the last row settled. */
+    private const ANNOUNCE_COPY_CURSOR_KEY = 'inbound_copy_cursor';
+
+    /**
+     * Past the inbound TTL, keep one stored copy of each announce a path entry
+     * points at, and delete the others. Returns how many were deleted.
+     *
+     * deleteExpiredPacketHistory() spares every row whose packet_hash_hex a
+     * path entry holds, so the path can still answer path requests. Every copy
+     * of that announce carries the hash: one per route it arrived over and one
+     * per retry of the transport that sent it, since the hash leaves out the
+     * hop count and the transport id. On retichat.com on 2026-10-10 the spared
+     * rows were 61,354 copies of 26,108 announces, 206 MB of a 306 MB
+     * database, all past the TTL; the storage budget could delete none of
+     * them, every other tier was at its floor, and the node stayed over its
+     * cap. RNS caches one packet per hash.
+     *
+     * The copy kept is the first by announceCopyOrderSql(), the order the path
+     * request, cache request and seeding readers pick by: the copy at the
+     * path's hop count, the newest of those. Copies younger than the TTL are
+     * left alone. They are the diagnostics the TTL exists for, and when the
+     * readers prefer one of them, it is not the copy this deletes.
+     *
+     * Bounded per run, because maintenance rides web requests. The rows past
+     * the TTL are walked in the order they aged, ANNOUNCE_COPY_SCAN_ROWS at a
+     * time, from a cursor kept in transport_state. A run settles every hash a
+     * path points at among those rows (all of that hash's copies past the
+     * TTL, not only the ones in the slice) and deletes at most
+     * ANNOUNCE_COPY_DELETE_ROWS of them, by primary key ascending as
+     * deleteSingleBatch() does. When it deletes that many, the cursor stays
+     * where it was and the next run takes the slice again. With the backlog
+     * drained, a run reads only the rows that aged since the last one
+     * (idx_inbound_packets_created) and their copies (idx_inbound_packets_hash);
+     * it never scans the history.
+     *
+     * The cursor does not go back. A hash is settled again whenever another
+     * of its copies ages past the cursor. One that became a path's only after
+     * every copy had aged keeps its copies until the path moves on and the TTL
+     * takes them all; the readers still pick the path's copy among them.
+     */
+    private function deleteRedundantAnnounceCopies(int $cutoff, string $backend): int
+    {
+        $inbound = Database::quoteTable($backend, 'inbound_packets');
+        $paths = Database::quoteTable($backend, 'path_entries');
+        [$sinceAt, $afterId] = $this->announceCopyCursor();
+        if ($sinceAt > $cutoff) {
+            // The clock went back or the TTL grew: walk again from the start.
+            [$sinceAt, $afterId] = [0, 0];
+        }
+
+        $slice = $this->db->prepare(
+            "SELECT ip.packet_record_id, ip.created_at, ip.packet_hash_hex,
+                    pe.destination_hash_hex AS path_destination_hash_hex
+               FROM {$inbound} ip
+               LEFT JOIN {$paths} pe ON pe.packet_hash_hex = ip.packet_hash_hex
+              WHERE ip.created_at >= :since_at
+                AND ip.created_at < :cutoff
+                AND (ip.created_at > :since_at_tie OR ip.packet_record_id > :after_id)
+              ORDER BY ip.created_at, ip.packet_record_id
+              LIMIT " . self::ANNOUNCE_COPY_SCAN_ROWS
+        );
+        $slice->bindValue(':since_at', $sinceAt, PDO::PARAM_INT);
+        $slice->bindValue(':cutoff', $cutoff, PDO::PARAM_INT);
+        $slice->bindValue(':since_at_tie', $sinceAt, PDO::PARAM_INT);
+        $slice->bindValue(':after_id', $afterId, PDO::PARAM_INT);
+        $slice->execute();
+        $rows = $slice->fetchAll(PDO::FETCH_ASSOC);
+        if ($rows === []) {
+            return 0;
+        }
+
+        $hashes = [];
+        foreach ($rows as $row) {
+            if ($row['path_destination_hash_hex'] !== null && $row['packet_hash_hex'] !== null) {
+                $hashes[(string) $row['packet_hash_hex']] = true;
+            }
+        }
+
+        $ids = [];
+        if ($hashes !== []) {
+            // path_entries is keyed by destination and an announce's hash
+            // covers its destination, so each copy joins at most one path.
+            $placeholders = implode(',', array_fill(0, count($hashes), '?'));
+            $order = $this->announceCopyOrderSql('ip', 'pe');
+            $copies = $this->db->prepare(
+                "SELECT packet_record_id FROM (
+                     SELECT ip.packet_record_id,
+                            ROW_NUMBER() OVER (PARTITION BY ip.packet_hash_hex ORDER BY {$order}) AS copy_rank
+                       FROM {$inbound} ip
+                       JOIN {$paths} pe ON pe.packet_hash_hex = ip.packet_hash_hex
+                      WHERE ip.packet_hash_hex IN ({$placeholders})
+                        AND ip.created_at < ?
+                 ) ranked
+                 WHERE copy_rank > 1
+                 ORDER BY packet_record_id
+                 LIMIT " . self::ANNOUNCE_COPY_DELETE_ROWS
+            );
+            $position = 1;
+            foreach (array_keys($hashes) as $hash) {
+                $copies->bindValue($position++, (string) $hash, PDO::PARAM_STR);
+            }
+            $copies->bindValue($position, $cutoff, PDO::PARAM_INT);
+            $copies->execute();
+            $ids = array_map('intval', $copies->fetchAll(PDO::FETCH_COLUMN));
+        }
+
+        $deleted = $this->deletePacketRowsByIds($inbound, 'packet_record_id', $ids, 'deleteRedundantAnnounceCopies');
+
+        if (count($ids) < self::ANNOUNCE_COPY_DELETE_ROWS) {
+            $last = $rows[count($rows) - 1];
+            $this->storageStateSet(
+                self::ANNOUNCE_COPY_CURSOR_KEY,
+                (int) $last['created_at'] . ':' . (int) $last['packet_record_id']
+            );
+        }
+
+        return $deleted;
+    }
+
+    /** @return array{0:int,1:int} created_at and packet_record_id of the last row settled */
+    private function announceCopyCursor(): array
+    {
+        $value = $this->storageStateGet(self::ANNOUNCE_COPY_CURSOR_KEY);
+        if ($value === null || preg_match('/^(\d+):(\d+)$/', $value, $m) !== 1) {
+            return [0, 0];
+        }
+
+        return [(int) $m[1], (int) $m[2]];
+    }
+
     /**
      * One bounded DELETE.
      *
@@ -694,7 +847,7 @@ trait RequestMaintenanceTrait
         }
     }
 
-    private function deletePacketRowsByIds(string $table, string $idColumn, array $ids): int
+    private function deletePacketRowsByIds(string $table, string $idColumn, array $ids, string $label = 'trimPacketStorage'): int
     {
         if ($ids === []) {
             return 0;
@@ -705,7 +858,7 @@ trait RequestMaintenanceTrait
         foreach ($ids as $index => $id) {
             $stmt->bindValue($index + 1, $id, PDO::PARAM_INT);
         }
-        Database::executeWithRetry($stmt, 'trimPacketStorage:' . $table);
+        Database::executeWithRetry($stmt, $label . ':' . $table);
 
         return $stmt->rowCount();
     }
