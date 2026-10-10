@@ -464,6 +464,7 @@ trait RequestControlPlaneTrait
         $now = time();
         $shouldAdd = false;
         $reason = 'announce_ignored';
+        $blobSeen = false;
 
         if ($current === null) {
             $shouldAdd = true;
@@ -558,6 +559,19 @@ trait RequestControlPlaneTrait
         $nextHopHex = $packet['transport_id_hex'] === null ? $destinationHashHex : (string) $packet['transport_id_hex'];
         $expiresAt = $now + $this->pathExpirySeconds($interfaceId);
 
+        // A copy of an emission already heard (blobSeen) may replace the path
+        // ('shorter_path_replaced', 'unusable_path_replaced' above), but it is
+        // not news to relay: the first copy was relayed when it was heard.
+        // RNS 1.5.2 does not even add such a copy on hop count
+        // (Transport.py:2236-2251, 2267-2275), and so does not rebroadcast it.
+        // It is answered 'validated', which shouldRelayAcceptedPacket() puts
+        // under the announce_refresh_seconds rule, and the path keeps its
+        // updated_at: that column is the refresh clock (shouldRefreshAnnounceRelay,
+        // touchPathEntryTimestamp), and a copy that is not relayed must not
+        // restart it. Before this, such a copy answered 'path_updated' and was
+        // queued to every other interface a second time.
+        $updatedAt = $blobSeen ? (int) ($current['updated_at'] ?? $now) : $now;
+
         $sql = 'INSERT INTO path_entries (
                 destination_hash_hex,
                 next_hop_hex,
@@ -598,9 +612,9 @@ trait RequestControlPlaneTrait
         $stmt->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
         $stmt->bindValue(':packet_hash_hex', (string) $packet['packet_hash_hex'], PDO::PARAM_STR);
         $stmt->bindValue(':announce_emitted', $announceEmitted, PDO::PARAM_INT);
-        $stmt->bindValue(':updated_at', $now, PDO::PARAM_INT);
+        $stmt->bindValue(':updated_at', $updatedAt, PDO::PARAM_INT);
         $stmt->execute();
 
-        return ['path_updated', $reason];
+        return [$blobSeen ? 'validated' : 'path_updated', $reason];
     }
 }

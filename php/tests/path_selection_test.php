@@ -72,7 +72,9 @@ $announce = mkAnnounce([
 
 [$status, $reason] = $r1->test_upsertPathFromAnnounce('e06a36b2peer0000000000000000', $packet, $announce);
 
-assertEq('status = path_updated', 'path_updated', $status);
+// The path is replaced, but a copy of an emission already heard is not news
+// to relay: 'validated', not 'path_updated' (announce_relay_seen_blob_test.php).
+assertEq('status = validated (blob seen: no path-update relay)', 'validated', $status);
 assertEq('reason = shorter_path_replaced', 'shorter_path_replaced', $reason);
 
 // Verify the DB was updated: hops should now be 2, interface should be the peer.
@@ -141,7 +143,7 @@ $announce = mkAnnounce([
 
 [$status, $reason] = $r3->test_upsertPathFromAnnounce('e06a36b2peer0000000000000000', $packet, $announce);
 
-assertEq('status = path_updated', 'path_updated', $status);
+assertEq('status = validated (blob seen: no path-update relay)', 'validated', $status);
 assertEq('reason = shorter_path_replaced', 'shorter_path_replaced', $reason);
 
 // Verify the gateway path was replaced with the shorter peer path.
