@@ -36,13 +36,15 @@
  *     anonymous GET /v1/initialize changes neither node's row, and both
  *     credentials still work.
  * (d) The CLI reports a migration that failed and exits 1.
- * (e) Source: no web request can reach initializeNode() or opcache_reset().
- *     The scanner is run on samples first, so a scanner that finds nothing
- *     cannot pass.
+ * (e) Source: no web request can reach initializeNode(), and no file that
+ *     deploy.sh ships calls opcache_reset(). opcache_reset.php did, for
+ *     anyone who asked for it by URL, until 2026-10-14. The scanner is run
+ *     on samples first, so a scanner that finds nothing cannot pass.
  *
  * On a4bcdda this fails (a), (b), (c) and (d): GET /v1/initialize answers 200
  * and registers, and index.php has no `initialize` mode. (e) fails too:
- * HttpApi::handle() calls initializeNode() and opcache_reset().
+ * HttpApi::handle() calls initializeNode() and opcache_reset(), and so does
+ * opcache_reset.php at file scope.
  *
  * Run: php php/tests/initialize_is_operator_only_test.php
  * INITIALIZE_SRC_DIR points it at another php/src, for mutation checks.
@@ -356,7 +358,9 @@ foreach ($samples as $label => [$code, $expected]) {
 $httpApiSites = [];
 $initializeNodeSites = [];
 $opcacheSites = [];
-$files = array_merge([$src . '/index.php'], glob($src . '/lib/*.php') ?: []);
+// Every file deploy.sh ships: php/src's top-level and lib/ .php files.
+// opcache_reset.php was one of them until 2026-10-14, reachable by URL.
+$files = array_merge(glob($src . '/*.php') ?: [], glob($src . '/lib/*.php') ?: []);
 foreach ($files as $file) {
     $sites = callSites((string) file_get_contents($file), ['initializeNode', 'migrate', 'opcache_reset']);
     foreach ($sites as $site) {
@@ -372,12 +376,13 @@ foreach ($files as $file) {
         }
     }
 }
-check('index.php and lib/ were read', count($files) > 10 && $initializeNodeSites !== [], count($files) . ' files');
+check('index.php, the other top-level files and lib/ were read',
+    in_array($src . '/index.php', $files, true) && count($files) > 10 && $initializeNodeSites !== [], count($files) . ' files');
 check('HttpApi calls none of initializeNode(), migrate(), opcache_reset()', $httpApiSites === [], describe($httpApiSites));
 check('initializeNode() is called only by runIndexCli()',
     $initializeNodeSites !== [] && array_filter($initializeNodeSites, static fn (array $s): bool => $s['function'] !== 'runIndexCli' || $s['class'] !== '') === [],
     describe($initializeNodeSites));
-check('nothing in index.php or lib/ resets the opcache', $opcacheSites === [], describe($opcacheSites));
+check('nothing deployed from php/src resets the opcache', $opcacheSites === [], describe($opcacheSites));
 
 echo "\n$pass passed, $fail failed\n";
 exit($fail === 0 ? 0 : 1);
