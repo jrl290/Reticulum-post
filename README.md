@@ -323,6 +323,14 @@ before.
   there), the switch as loaded, `browsers_online` (`signed`, `legacy`) and
   `hash_only_challenges`. A rise in the last is a prompt to run Retichat-js's
   `verify-deploy.sh`, never a gate: anyone can ask for such a challenge.
+- **Checking a node from outside.** `.venv/bin/python
+  Reticulum-post/tools/stage1_probe.py https://<host>/reticulum` (add
+  `--enforced` once the switch is on) registers two test identities of its
+  own, kept in `~/.reticulum-post-probe/`, and checks each answer of the
+  challenge, the signed and legacy registrations, the exchange, `401`, `409`
+  and the goodbye, each within 5 s. It prints no token, and exits non-zero
+  naming the step that failed. It writes two rows to the node's database and
+  re-binds the same two on every run.
 - **The log.** `[REG-SIGNED]`, `[REG-LEGACY]`, `[REG-REFUSED]`, `[REG-RETIRE]`,
   `[REG-CLAIM-IGNORED]`, `[SESSION-SUPERSEDED]`, `[ANNOUNCE-FOREIGN]` and
   `[ANNOUNCE-LEGACY-REFUSED]` go to PHP's error log beside `index.php`, with
