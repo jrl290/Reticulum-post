@@ -1137,6 +1137,15 @@ final class HttpApi
      * /v1/maintenance/flush {"force":true} and drop every browser session.
      * They now answer only where config debug.enabled is true, the gate
      * /debug always had. Pinned by tests/operator_routes_gated_test.php.
+     *
+     * GET /v1/initialize was one more, routed ahead of this gate, and it
+     * answered everyone until 2026-10-14: migrate() in full, an opcache
+     * reset, and a registration at every configured peer whose row was not
+     * online. Phase 1 marks that row offline after a quiet spell, so one
+     * anonymous request then rotated the live peering, and a stalled peer
+     * held the request for curl's 10 s. It is the operator's
+     * `php index.php initialize` now (runIndexCli), and no route can reach
+     * initializeNode(). Pinned by tests/initialize_is_operator_only_test.php.
      */
     private const OPERATOR_PATHS = ['/v1/monitor', '/v1/monitor/data', '/v1/monitor/json', '/v1/monitor/clear', '/v1/maintenance/flush'];
 
@@ -1153,21 +1162,6 @@ final class HttpApi
             // Handle CORS preflight
             if ($method === 'OPTIONS') {
                 $this->respond(204, []);
-            }
-
-            if ($method === 'GET' && $path === '/v1/initialize') {
-                $t0 = microtime(true);
-                $summary = $this->storage->initializeNode();
-
-                // Clear opcache so the new code is picked up.
-                if (function_exists('opcache_reset')) {
-                    opcache_reset();
-                }
-
-                $elapsed = round((microtime(true) - $t0) * 1000);
-                $this->log('debug', "[perf] initialize total={$elapsed}ms");
-
-                $this->respond(200, $summary);
             }
 
             // The operator console and its buttons have no authentication, so
@@ -1490,6 +1484,22 @@ function runIndexCli(string $projectRoot, array $argv): int
         $result = $reticulumPhpStorage->reclaimStorage();
         fwrite(STDOUT, json_encode($result, JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR) . PHP_EOL);
         return 0;
+    }
+
+    if ($mode === 'initialize') {
+        // An operator on the host, never a web request: GET /v1/initialize
+        // did this for anyone until 2026-10-14 (HttpApi::OPERATOR_PATHS).
+        // migrate() in full, then a registration at each configured peer
+        // whose row is not online. Exits 1 unless the schema migrated and
+        // every peer is connected. The opcache reset went with the route:
+        // the cache it emptied was the web server's, which no CLI reaches.
+        $summary = $reticulumPhpStorage->initializeNode();
+        fwrite(STDOUT, json_encode($summary, JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR) . PHP_EOL);
+        $peersDown = array_filter(
+            $summary['peers'],
+            static fn (array $peer): bool => !in_array($peer['status'] ?? '', ['connected', 'already_connected'], true)
+        );
+        return ($summary['status'] === 'ok' && $summary['migrated'] && $peersDown === []) ? 0 : 1;
     }
 
     fwrite(STDERR, "Unsupported index mode: {$mode}\n");

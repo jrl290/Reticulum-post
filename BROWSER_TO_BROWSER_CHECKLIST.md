@@ -61,7 +61,7 @@ Use this list to confirm the exact fixes that were just made before running full
 - [ ] Bidirectional registration happens in a single `/v1/interfaces/register`: the initiator pre-generates `peer_interface_id` + `peer_session_token` and sends them in metadata (`client: "reticulum-php"`); the receiver stores them and echoes them back.
 - [ ] `dispatchWakes()` only wakes peers that have pending outbound packets, rate-limited by `min_wake_interval_ms` (default 1000ms) via `last_wake_sent_at` — wake is traffic-driven, not a heartbeat. Zero pending outbound = zero wakes (expected when idle).
 - [ ] Wake HTTP call is truly fire-and-forget: `CURLOPT_TIMEOUT_MS` short (default 500ms), response ignored — a slow/down peer must not add latency to the triggering request.
-- [ ] Stale peer credentials after a redeploy/wipe: `DELETE FROM interfaces WHERE peer_url IS NOT NULL` on both nodes, then re-run `/v1/initialize` to re-handshake fresh credentials.
+- [ ] Stale peer credentials after a redeploy/wipe: `DELETE FROM interfaces WHERE peer_url IS NOT NULL` on both nodes, then run `php index.php initialize` on the host to re-handshake fresh credentials (`GET /v1/initialize` until 2026-10-14).
 - [ ] `dispatchWakes()` is wired into the request lifecycle via `register_shutdown_function(fn() => $this->dispatchWakes())` at the top of `handle()` — NOT called inline in `respond()` (curl output leaks into the JSON response body). The shutdown function runs after the response is fully sent, so wake dispatch latency and any curl errors never corrupt client-facing JSON.
 - [ ] Verify zero output leak: `curl -sk https://host/reticulum/v1/monitor/data | python3 -c "import sys,json; json.load(sys.stdin); print('clean')"` — must parse without `JSONDecodeError: Extra data`.
 - [ ] `peer_url` in the `interfaces` table must be the remote peer's **base URL** (`https://otherhost/reticulum`), NOT the wake URL (`.../v1/wake`). The exchange protocol calls `$peerUrl . '/v1/interfaces/exchange'` — if peer_url includes `/v1/wake`, the exchange URL becomes `.../v1/wake/v1/interfaces/exchange` which routes to the wrong host. Verify: `SELECT interface_id, name, peer_url FROM interfaces WHERE peer_url IS NOT NULL;` — no `/v1/wake` suffix.
@@ -88,11 +88,11 @@ Use this list to confirm the exact fixes that were just made before running full
 
 - [ ] `.htaccess` present in the reticulum dir with the `RewriteRule ^(.*)$ index.php/$1` front-controller rule — without it every `/v1/*` route returns Apache 404.
 - [ ] `var/` directory exists and is writable (SQLite DB + router.log).
-- [ ] Run schema migration once (`$s->migrate()`), then `/v1/initialize` to connect peers.
+- [ ] Run schema migration once (`$s->migrate()`), then `php index.php initialize` on the host to connect peers.
 
-### J) `/v1/initialize` bootstrap endpoint
+### J) `php index.php initialize` bootstrap command
 
-- [ ] `GET /v1/initialize` runs `migrate()`, resets opcache, and connects to every configured peer — one browser-callable call, no separate config section.
+- [ ] `php index.php initialize` runs `migrate()` and connects to every configured peer, from a shell on the host — no separate config section. `GET /v1/initialize` did this (and reset the opcache) for any browser until 2026-10-14; it answers 404 now.
 - [ ] Peer URLs come from the existing `[[Interfaces]]` config (`node_url`, falling back to `peer_url`) — do NOT add an `[initialize]` section.
 - [ ] `connectToPeer()` is idempotent: returns `already_connected` if a row already exists for that `peer_url`; only registers when missing.
 - [ ] Requires `host_url` set in config — without it the handshake can't tell the peer where to call back (`status: no_host_url`).

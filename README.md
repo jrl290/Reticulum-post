@@ -257,20 +257,27 @@ leak too:
 
    ```bash
    test-harnesses/distro-pipeline/node.sh sql-retichat "DELETE FROM interfaces WHERE peer_url = '<peer URL>' AND peer_interface_id IS NOT NULL"
-   curl -s https://retichat.com/reticulum/v1/initialize
+   test-harnesses/distro-pipeline/node.sh retichat "cd ~/public_html/reticulum && php index.php initialize"
    ```
 
    Delete, do not mark the row dead: the peer's next exchange authenticates with
    the old token and marks a merely-offline row online again, and then
-   `/v1/initialize` answers `already_connected` and rotates nothing. With the row
+   `initialize` reports `already_connected` and rotates nothing. With the row
    gone the old token is refused at once and nothing can revive it.
-   `/v1/initialize` finds no row, makes a new id and token, and registers at the
+   `initialize` finds no row, makes a new id and token, and registers at the
    peer, which re-binds its row in place with a new session token of its own.
-   The response's `peers[]` must say `connected` (or `already_connected` with an
-   id that differs from step 1, if the node's own maintenance got there first).
-   `register_failed` means the peer did not answer: the initiator's old token is
-   already dead, but the peer's is live until a registration lands, so run the
-   `curl` again once the peer answers.
+   Its output's `peers[]` must say `connected` (or `already_connected` with an
+   id that differs from step 1, if the node's own maintenance got there first);
+   it exits 1 otherwise, or when the schema migration it runs first reports an
+   error. `register_failed` means the peer did not answer: the initiator's old
+   token is already dead, but the peer's is live until a registration lands, so
+   run `initialize` again once the peer answers.
+
+   `initialize` is a command on the host, not a URL. Until 2026-10-14
+   `GET /v1/initialize` did the same for anyone. While a node's row for its
+   peer sat offline after a quiet spell, one anonymous request rotated the
+   peering, with every cost listed below. It now answers 404
+   (`php/tests/initialize_is_operator_only_test.php`).
 
 3. **Verify.** Step 1's query again. The initiator's row has a new
    `interface_id`, and the old one is gone. The peer's row keeps its
@@ -279,7 +286,7 @@ leak too:
    within a minute their rx/tx move in `/health`, and a browser on selectiv
    receives announces and can send a DM.
 
-What breaks meanwhile: between the `DELETE` and the `curl`, nothing is queued
+What breaks meanwhile: between the `DELETE` and `initialize`, nothing is queued
 across the peering and the peer's exchanges get 401. Afterwards, on the
 initiator only, packets that were queued for the old row are lost, paths through
 it are unusable until those destinations announce again, and links relayed

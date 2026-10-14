@@ -557,6 +557,11 @@ trait RequestPhpWakeTrait
         }
     }
 
+    /**
+     * The operator's `php index.php initialize`, its only caller (runIndexCli).
+     * Until 2026-10-14 it was GET /v1/initialize, open to anyone; see
+     * HttpApi::OPERATOR_PATHS.
+     */
     public function initializeNode(): array
     {
         $summary = [
@@ -565,9 +570,11 @@ trait RequestPhpWakeTrait
             'peers' => [],
         ];
 
-        // Schema migration.
-        $this->migrate();
-        $summary['migrated'] = true;
+        // Schema migration. Until 2026-10-14 this said migrated whatever
+        // migrate() reported; its errors are the answer now.
+        $migration = $this->migrate();
+        $summary['migrated'] = $migration['errors'] === [];
+        $summary['migration'] = $migration;
 
         // Connect to configured peer interfaces.
         $interfaces = $this->config['interfaces'] ?? [];
