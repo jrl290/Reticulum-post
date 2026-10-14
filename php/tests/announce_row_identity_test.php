@@ -49,7 +49,15 @@
  *      one of an announce a live path through another row holds (a link
  *      proof set the path's hop count to that copy's), the PATH_RESPONSE is
  *      the same bytes, to the same row, and no path or known_destinations
- *      row changes, while a cache request for it is still a miss.
+ *      row changes, while a cache request for it is still a miss;
+ *  (11) a cache request whose copy's row another request removes after the
+ *      copy is looked up and before §9 reads the row (a legacy row §4.5
+ *      removes as its identity signs; a dead PHP node peering row replaced)
+ *      is refused, [ANNOUNCE-FOREIGN] ... owner=none: a miss, no announce
+ *      queued, no path, no local destination, known_destinations as it was;
+ *      with its row there the peering row's copy is replayed as today, and a
+ *      gateway row's and a browser row's (legacy, signed) own announces in a
+ *      later request are as today.
  *
  * Today (before Stage 1) the replay moves the local destination, and the
  * cache replay is relayed to every other row. On code without signed
@@ -606,6 +614,147 @@ if ($signedHere) {
     check('a cache request for that copy is still a miss (cached_announce_not_found), and queues no announce',
         verdictOf($db, AnnounceFixture::packetHash($request)) === ['miss', 'cached_announce_not_found'] && announcesQueued($db) === [],
         json_encode([verdictOf($db, AnnounceFixture::packetHash($request)), announcesQueued($db)]));
+}
+
+echo "\n(11) a cache request whose copy's row goes before §9 reads it replays nothing\n";
+
+/**
+ * A request's connection to the node's SQLite file, set up as
+ * Database::connect() sets one up, which runs $race once: after a cache
+ * request has looked up its copy (cacheRequestCopySql(), which needs the
+ * copy's row) and just before §9 reads that row (rowRegistrationFacts()), as
+ * another request would in between.
+ */
+final class RowGoesPdo extends PDO
+{
+    /** @var (\Closure(): void)|null */
+    public ?\Closure $race = null;
+    public bool $raced = false;
+    private bool $copyLookedUp = false;
+
+    public function __construct(string $path)
+    {
+        parent::__construct('sqlite:' . $path, null, null, [
+            PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+            PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+            PDO::ATTR_EMULATE_PREPARES => false,
+        ]);
+        $this->exec('PRAGMA busy_timeout = 5000');
+        $this->exec('PRAGMA journal_mode = WAL');
+        $this->exec('PRAGMA synchronous = NORMAL');
+        $this->exec('PRAGMA foreign_keys = ON');
+    }
+
+    public function prepare(string $query, array $options = []): PDOStatement|false
+    {
+        $sql = (string) preg_replace('/\s+/', ' ', trim($query));
+        if (str_contains($sql, 'FROM inbound_packets ip JOIN interfaces i ON i.interface_id = ip.interface_id')) {
+            $this->copyLookedUp = true;
+        } elseif ($this->copyLookedUp && $this->race !== null
+            && str_starts_with($sql, 'SELECT registration_proof, metadata_json, identity_hash, claimed_identity_hash FROM interfaces')) {
+            $race = $this->race;
+            $this->race = null;
+            $race();
+            $this->raced = true;
+        }
+
+        return parent::prepare($query, $options);
+    }
+}
+
+/**
+ * A CACHE_REQUEST from $from for $packetHash, in a request of its own (a
+ * Storage with an empty memo) during which $goes removes the copy's row
+ * between the copy's lookup and §9's read of the row.
+ */
+function cacheRequestWhileRowGoes(string $dbPath, string $from, string $packetHash, \Closure $goes): array
+{
+    $request = RegFixture::storage([], $dbPath);
+    $pdo = new RowGoesPdo($dbPath);
+    (new ReflectionProperty(Storage::class, 'db'))->setValue($request, $pdo);
+    $pdo->race = $goes;
+    $cacheRequest = AnnounceFixture::cacheRequest($packetHash);
+    $log = feed($request, $from, $cacheRequest);
+
+    return ['log' => $log, 'raced' => $pdo->raced, 'request_hash' => AnnounceFixture::packetHash($cacheRequest)];
+}
+
+$gone = [];
+if ($signedHere) {
+    $leaver = RegFixture::identity();
+    // The identity signs in another request: its bind's §4.5 removes the
+    // legacy row claiming it, the row's path and local destination with it.
+    $gone['a legacy row §4.5 removes'] = [$leaver, legacyRow($node, browser($leaver['hash_hex']), 'leaves'), 0,
+        static function () use ($node, $leaver): void {
+            signedRow($node, $leaver);
+        }];
+}
+$carried = RegFixture::identity();
+$deadPeerRow = legacyRow($node, RegFixture::phpPeerMetadata('https://dead-peer.example/reticulum'), 'dead peer PHP node');
+// Another request's connectToPeer() removes the peering row as dead, with the
+// statement it uses, before registering afresh.
+$gone['a dead PHP node peering row, replaced'] = [$carried, $deadPeerRow, 1,
+    static function () use ($db, $deadPeerRow): void {
+        $db->prepare('DELETE FROM interfaces WHERE interface_id = :id')->execute([':id' => $deadPeerRow]);
+    }];
+foreach ($gone as $what => [$identity, $row, $hops, $goes]) {
+    $a = AnnounceFixture::announce($identity, 'lxmf.delivery', $hops, null, 'goes', time() - 30);
+    feed($node, $row, $a['raw']);
+    check("[$what] (precondition) its announce made a path through the row",
+        (pathOf($db, $a['dest_hex'])['interface_id'] ?? null) === $row, json_encode(pathOf($db, $a['dest_hex'])));
+    if ($row === $deadPeerRow) {
+        $db->exec('DELETE FROM outbound_packets');
+        $request = AnnounceFixture::cacheRequest($a['packet_hash_hex']);
+        feed(RegFixture::storage([], $dbPath), $third, $request);
+        check("[$what] with the row there, a cache request for its copy is replayed as today",
+            verdictOf($db, AnnounceFixture::packetHash($request))[0] === 'replayed'
+            && in_array([$third, $a['packet_hash_hex']], announcesQueued($db), true),
+            json_encode([verdictOf($db, AnnounceFixture::packetHash($request)), announcesQueued($db)]));
+        // Then the row goes quiet, and the stale sweep removes its paths.
+        $db->prepare('DELETE FROM path_entries WHERE interface_id = :i')->execute([':i' => $row]);
+    }
+    // known_destinations as if written a minute ago, so that a rewrite shows.
+    $db->prepare('UPDATE known_destinations SET updated_at = updated_at - 60 WHERE destination_hash_hex = :d')
+        ->execute([':d' => $a['dest_hex']]);
+    $knownBefore = knownOf($db, $a['dest_hex']);
+    $db->exec('DELETE FROM outbound_packets');
+    $r = cacheRequestWhileRowGoes($dbPath, $third, $a['packet_hash_hex'], $goes);
+    check("[$what] (precondition) the row went after the copy was looked up, before §9 read it",
+        $r['raced'] && q($db, 'SELECT 1 FROM interfaces WHERE interface_id = :i', [':i' => $row]) === []);
+    check("[$what] the replay is refused: [ANNOUNCE-FOREIGN] interface dest identity owner=none",
+        str_contains($r['log'], foreignLine($row, $a['dest_hex'], $identity, 'none')), trim($r['log']));
+    check("[$what] ...the cache request is a miss (cached_announce_not_relayed)",
+        verdictOf($db, $r['request_hash']) === ['miss', 'cached_announce_not_relayed'], json_encode(verdictOf($db, $r['request_hash'])));
+    check("[$what] ...no announce is queued on any row", announcesQueued($db) === [], json_encode(announcesQueued($db)));
+    check("[$what] ...no path (none through the gone row), no local destination",
+        pathOf($db, $a['dest_hex']) === null && q($db, 'SELECT 1 FROM path_entries WHERE interface_id = :i', [':i' => $row]) === []
+        && localOf($db, $a['dest_hex']) === null, json_encode(pathOf($db, $a['dest_hex'])));
+    check("[$what] ...and known_destinations as it was", knownOf($db, $a['dest_hex']) === $knownBefore,
+        json_encode([$knownBefore, knownOf($db, $a['dest_hex'])]));
+}
+
+// A row that is there is read as before, in a later request of its own.
+$later = RegFixture::storage([], $dbPath);
+$db->exec('DELETE FROM outbound_packets');
+$aGw = AnnounceFixture::announce(RegFixture::identity(), 'lxmf.delivery', 1);
+$log = feed($later, $gatewayRow, $aGw['raw']);
+check("a gateway row's announce is as today: a path through it, no local destination, forwarded, no [ANNOUNCE-] line",
+    (pathOf($db, $aGw['dest_hex'])['interface_id'] ?? null) === $gatewayRow && localOf($db, $aGw['dest_hex']) === null
+    && verdictOf($db, $aGw['packet_hash_hex'])[0] === 'path_updated'
+    && in_array([$third, $aGw['packet_hash_hex']], announcesQueued($db), true) && !str_contains($log, '[ANNOUNCE-'), trim($log));
+$legacyOwner = RegFixture::identity();
+$browsers = ['a legacy browser row' => [$legacyOwner, legacyRow($node, browser($legacyOwner['hash_hex']))]];
+if ($signedHere) {
+    $signedOwner = RegFixture::identity();
+    $browsers['a signed browser row'] = [$signedOwner, (string) signedRow($node, $signedOwner)];
+}
+foreach ($browsers as $what => [$identity, $row]) {
+    $db->exec('DELETE FROM outbound_packets');
+    $a = AnnounceFixture::announce($identity, 'lxmf.delivery', 0, null, 'own');
+    $log = feed($later, $row, $a['raw']);
+    check("$what's own announce is as today: its local destination, forwarded, no [ANNOUNCE-] line",
+        localOf($db, $a['dest_hex']) === $row && in_array([$third, $a['packet_hash_hex']], announcesQueued($db), true)
+        && !str_contains($log, '[ANNOUNCE-'), trim($log));
 }
 
 echo "\n$pass passed, $fail failed\n";

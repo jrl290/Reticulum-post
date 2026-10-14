@@ -269,13 +269,15 @@ trait RequestPathStateTrait
      * The replay runs the copy through processAcceptedAnnounce() as if it had
      * just come in on that row (replayCachedAnnouncePacket()), so it can set a
      * path through the row, update known_destinations and relay to every other
-     * row, and §9 reads a row that is gone as no browser row, whose owner,
-     * seen and held rules never run. A row removed with its inbound history
-     * kept (REGISTRATION-STAGE1.md §4.5's legacy rows claiming an identity
-     * that signs) leaves its copies behind; a cache request answers them as
-     * not cached. Maintenance does not look at the row, and can keep such a
-     * copy as an announce's only one (when a link proof has set the path's
-     * hop count to that copy's); a path request still answers with it.
+     * row. A row removed with its inbound history kept
+     * (REGISTRATION-STAGE1.md §4.5's legacy rows claiming an identity that
+     * signs) leaves its copies behind; a cache request answers them as not
+     * cached. Maintenance does not look at the row, and can keep such a copy
+     * as an announce's only one (when a link proof has set the path's hop
+     * count to that copy's); a path request still answers with it.
+     *
+     * A row that goes after this read, before the replay reads it, is §9's:
+     * announceGuardRefusal() refuses an announce whose row is gone.
      */
     private function cacheRequestCopySql(): string
     {

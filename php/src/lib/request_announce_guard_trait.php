@@ -24,7 +24,8 @@ use PDO;
  * routed, cached or relayed, so both of that function's callers (an inbound
  * packet, and a cache request's replay) get it. A browser row is a signed row
  * or a row whose client is rns-js, in every mode; every other row follows
- * today's rules.
+ * today's rules. A row that is gone when the announce is read owns nothing,
+ * so its announce is refused as foreign (owner=none), whatever the row was.
  *
  * A refusal is logged ([ANNOUNCE-FOREIGN], [ANNOUNCE-LEGACY-REFUSED]), the
  * announce's inbound_packets row says 'refused', and nothing else changes:
@@ -85,13 +86,21 @@ trait RequestAnnounceGuardTrait
     private function announceGuardRefusal(string $interfaceId, array $packet, array $announce): ?string
     {
         $facts = $this->rowRegistrationFacts($interfaceId);
-        if ($facts === null || ($facts['proof'] !== 'signed' && $facts['client'] !== 'rns-js')) {
+        if ($facts !== null && $facts['proof'] !== 'signed' && $facts['client'] !== 'rns-js') {
             // Not a browser row: today's rules.
             return null;
         }
         $destinationHashHex = strtolower((string) ($packet['destination_hash_hex'] ?? ''));
         $identity = strtolower((string) ($announce['identity_hash_hex'] ?? ''));
-        $owner = $this->announceOwner($facts);
+        // A row that is gone owns nothing. An announce reaches here for one
+        // only when another request removed the row after this request had
+        // read it: a cache request's replay, whose copy cacheRequestCopy()
+        // found with its row, or an exchange still processing the row's batch
+        // (§4.5 removes a legacy row; a dead PHP node peering row is
+        // replaced). Until 2026-10-14 a gone row passed as no browser row: the
+        // replay rewrote known_destinations, could set a path through the
+        // gone row, and was relayed to every other row.
+        $owner = $facts === null ? null : $this->announceOwner($facts);
         if ($owner === null || !hash_equals($owner, $identity)) {
             error_log(sprintf('[ANNOUNCE-FOREIGN] interface=%s dest=%s identity=%s owner=%s',
                 substr($interfaceId, 0, 8), $destinationHashHex, substr($identity, 0, 8),
