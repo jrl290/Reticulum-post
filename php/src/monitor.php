@@ -77,9 +77,14 @@ $cleared = false;
 
 if ($action === 'clear' && ($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
     if (($_POST['confirm'] ?? '') === 'YES') {
+        // Stop at the first failed DELETE (REGISTRATION-STAGE1.md §12). $TABLES
+        // lists transport_state just before interfaces, so interfaces is never
+        // emptied while transport_state survives: a signed row's count would
+        // restart at 0 under the same node secret, and a body already used at
+        // a low count would work once more.
         foreach ($TABLES as $t) {
             try { $db->exec($backend === 'mysql' ? "DELETE FROM `{$t}`" : "DELETE FROM {$t}"); }
-            catch (\Throwable $e) { $message .= "{$t}: " . $e->getMessage() . "\n"; }
+            catch (\Throwable $e) { $message .= "{$t}: " . $e->getMessage() . " (stopped; later tables untouched)\n"; break; }
         }
         // The wiped interfaces must get their 401 at the next poll (EmptyPoll).
         require_once __DIR__ . '/lib/empty_poll.php';
