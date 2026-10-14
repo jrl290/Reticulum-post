@@ -162,7 +162,11 @@ deploy, not the bytes now; `verify-deploy.sh` is still the byte-for-byte check.
 `deploy.sh` refuses a dirty working tree, refuses a red test suite, deploys from
 `git archive <ref>` rather than from your filesystem, syntax-checks the code on
 each node before and after it goes live, and hash-verifies every file
-afterwards. `./deploy.sh <old-ref>` is the rollback.
+afterwards. Before anything is uploaded it reads each node's stamp over ssh and
+refuses a ref that does not descend from the commit the node runs, so a deploy
+never takes back what is live by accident; a stamp that names no commit stops
+it too, for you to find out what the node runs. `DEPLOY_ROLLBACK=1 ./deploy.sh
+<old-ref>` is the rollback; the deploy log records the override.
 
 No node ever runs a mix of two releases. Every node first receives the ref in
 `~/reticulum-incoming`, outside the web root, and lints it with its own
@@ -181,6 +185,15 @@ swap. A failure after the swap prints the command that puts the copy back. A
 commit that deletes a file under `php/src` adds it to `RETIRED`; an entry can
 go once every node has deployed past that commit, and an empty list is fine.
 `RETIRED` may never name a file the node owns (`config.php`, `_test.php`).
+
+Between the lint and the swap, every node builds the ref's schema against its
+live database: `php ~/reticulum-incoming/index.php migrate --project-root
+<live directory>` (REGISTRATION-STAGE1.md §13). It prints each object it builds
+and how long that took, records no schema version (the new code's first
+request does), and ignores a hang-up, since a dropped connection would roll an
+index build back. If it fails on any node, nothing is swapped anywhere; the
+code that is live keeps serving and ignores the new objects. A ref whose
+`index.php` has no migrate mode (any before Stage 1) skips the step.
 `php/tests/deploy_never_mixes_releases_test.php` runs `deploy.sh` against two
 stand-in nodes to hold all of this.
 
@@ -292,6 +305,58 @@ real `session_token` was never published. A wake sends only the unchecked one.
 
 `php/tests/peer_session_rotation_test.php` runs this procedure on two real
 nodes, with a peer exchange between the two commands, and pins the gate above.
+
+## Signed registration (operators)
+
+The contract is `REGISTRATION-STAGE1.md`. Browsers (`client` `rns-js`) sign
+their registration with their identity's key; every other client registers as
+before.
+
+- **The switch.** `[registration] enforce_signed_registration` in
+  `config.toml` is off by default: signed registrations are taken, and legacy
+  browser registrations still work, logged `[REG-LEGACY]`. On, every legacy
+  browser registration gets `403 signature_required`, every legacy browser row
+  `401`, and no legacy browser row may carry an announce. James turns it on,
+  on a date he sets.
+- **`/health`'s `registration` object:** `version` 1 (the node runs Stage 1),
+  `schema_migrated` (the recorded schema is this code's and its objects are
+  there), the switch as loaded, `browsers_online` (`signed`, `legacy`) and
+  `hash_only_challenges`. A rise in the last is a prompt to run Retichat-js's
+  `verify-deploy.sh`, never a gate: anyone can ask for such a challenge.
+- **The log.** `[REG-SIGNED]`, `[REG-LEGACY]`, `[REG-REFUSED]`, `[REG-RETIRE]`,
+  `[REG-CLAIM-IGNORED]`, `[SESSION-SUPERSEDED]`, `[ANNOUNCE-FOREIGN]` and
+  `[ANNOUNCE-LEGACY-REFUSED]` go to PHP's error log beside `index.php`, with
+  identity hashes in full: they say who registered here and when. **The log
+  files must not be served:** `https://<host>/reticulum/error_log` and
+  `…/reticulum/var/router.log` must not answer `200`. `deploy.sh` never
+  touches dotfiles, so this is set by hand, for example with
+  `RedirectMatch 404 ^/reticulum/(error_log|var/)` in
+  `~/public_html/reticulum/.htaccess`; both `curl`s must then answer `403` or
+  `404`.
+- **The count never goes back.** A signed row (`identity_hash IS NOT NULL`)
+  is deleted only together with a rotation of the node secret, in the same
+  session:
+
+  ```sql
+  DELETE FROM interfaces WHERE interface_id = '<id>' AND identity_hash IS NOT NULL;
+  DELETE FROM transport_state WHERE state_key = 'registration_challenge_secret_hex';
+  ```
+
+  Otherwise its `registration_seq` would restart at 0 under the same secret,
+  and a registration body already used at a low count would work once more.
+  After the rotation every outstanding challenge fails once (`409
+  stale_challenge`), and each browser asks for a new one and registers again.
+  `/v1/monitor/clear` empties `transport_state` with everything else, and
+  `monitor.php`'s clear stops at the first `DELETE` that fails, so
+  `interfaces` is never emptied while `transport_state` survives
+  (`php/tests/clear_all_data_test.php`).
+- **SQL.** Every value bound; no backslash in a SQL string literal; no named
+  placeholder twice in one statement (MySQL's native prepares fail with
+  `HY093` where SQLite accepts it: the 2026-09-23 outage); every statement
+  runs on SQLite, MySQL 8.4 and MariaDB 11.4.
+  `no_backslash_in_sql_literals_test.php` and
+  `unique_named_placeholders_test.php` hold the second and third; only a run
+  on each engine holds the last.
 
 ## Storage Budget
 
