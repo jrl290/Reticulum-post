@@ -39,7 +39,11 @@
  *      newest one the node remembers is refused; an expired path no longer
  *      counts as held;
  *  (8) past the inbound TTL, maintenance keeps an announce's accepted copy,
- *      never a refused replay of it that ties on hops and interface.
+ *      never a refused replay of it that ties on hops and interface;
+ *  (9) once §4.5 has removed a legacy row, keeping its inbound history, a
+ *      CACHE_REQUEST for its copy of an announce is a miss: no announce is
+ *      queued, no path leads to the removed row, known_destinations is as
+ *      it was.
  *
  * Today (before Stage 1) the replay moves the local destination, and the
  * cache replay is relayed to every other row. On code without signed
@@ -490,6 +494,33 @@ $left = q($db, 'SELECT announce_status FROM inbound_packets WHERE packet_hash_he
 check('past the inbound TTL one copy is left, and it is the accepted one',
     count($left) === 1 && in_array($left[0]['announce_status'], ['validated', 'path_updated'], true), json_encode($left));
 check('...so a path or cache request can still be answered with it', $cachedAnnounce->invoke($node, $aK['packet_hash_hex']) !== null);
+
+echo "\n(9) a cache request for a copy whose row §4.5 removed replays nothing\n";
+if ($signedHere) {
+    $retired = RegFixture::identity();
+    $retiredRow = legacyRow($node, browser($retired['hash_hex']));
+    $aR = AnnounceFixture::announce($retired, 'lxmf.delivery', 0, null, 'r', time() - 30);
+    feed($node, $retiredRow, $aR['raw']);
+    check("(precondition) the legacy row's own announce made its path and local destination there",
+        (pathOf($db, $aR['dest_hex'])['interface_id'] ?? null) === $retiredRow && localOf($db, $aR['dest_hex']) === $retiredRow);
+    $retiredSigned = (string) signedRow($node, $retired);
+    $copies = q($db, 'SELECT interface_id FROM inbound_packets WHERE packet_hash_hex = :h', [':h' => $aR['packet_hash_hex']]);
+    check('(precondition) the identity signs: §4.5 removes the legacy row, its path and its local destination, and its copy stays',
+        $retiredSigned !== '' && q($db, 'SELECT 1 FROM interfaces WHERE interface_id = :i', [':i' => $retiredRow]) === []
+        && pathOf($db, $aR['dest_hex']) === null && localOf($db, $aR['dest_hex']) === null
+        && array_column($copies, 'interface_id') === [$retiredRow], json_encode($copies));
+    check('that copy answers as not cached', $cachedAnnounce->invoke($node, $aR['packet_hash_hex']) === null);
+    $knownR = knownOf($db, $aR['dest_hex']);
+    $db->exec('DELETE FROM outbound_packets');
+    $request = AnnounceFixture::cacheRequest($aR['packet_hash_hex']);
+    $log = feed($node, $third, $request);
+    check('a CACHE_REQUEST for it: miss (cached_announce_not_found)',
+        verdictOf($db, AnnounceFixture::packetHash($request)) === ['miss', 'cached_announce_not_found'], json_encode(verdictOf($db, AnnounceFixture::packetHash($request))));
+    check('...no announce is queued on any row', announcesQueued($db) === [], json_encode(announcesQueued($db)));
+    check('...no path to the removed row, and known_destinations as it was',
+        pathOf($db, $aR['dest_hex']) === null && q($db, 'SELECT 1 FROM path_entries WHERE interface_id = :i', [':i' => $retiredRow]) === []
+        && knownOf($db, $aR['dest_hex']) === $knownR, trim($log));
+}
 
 echo "\n$pass passed, $fail failed\n";
 exit($fail === 0 ? 0 : 1);

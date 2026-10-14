@@ -225,11 +225,22 @@ trait RequestPathStateTrait
      * The copy a cache request replays, and announceRawByPacketHash() answers
      * a path request with. One packet hash: idx_inbound_packets_hash finds its
      * few copies and idx_path_entries_packet_hash its path, if any.
+     *
+     * Only a copy whose interface row is still there. A cache request replays
+     * a copy as if it had just come in on that row, so it can set a path
+     * through it, updates known_destinations and relays to every row, and
+     * §9 reads a row that is gone as no browser row, whose owner, seen and
+     * held rules never run. A row removed with its inbound history kept
+     * (REGISTRATION-STAGE1.md §4.5's legacy rows claiming an identity that
+     * signs) leaves its copies behind; they answer as not cached.
+     * Maintenance does not look at the row: it keeps such a copy only when
+     * none received on the path's interface at its hop count is stored.
      */
     private function cachedAnnounceByPacketHashSql(): string
     {
         return 'SELECT ip.interface_id AS received_interface_id, ip.raw_base64
              FROM inbound_packets ip
+             JOIN interfaces i ON i.interface_id = ip.interface_id
              LEFT JOIN path_entries pe ON pe.packet_hash_hex = ip.packet_hash_hex
              WHERE ip.packet_hash_hex = :packet_hash_hex
                AND ip.status = :status
