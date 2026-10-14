@@ -148,7 +148,8 @@ word: its `relay` means PHP node.
   §6's assertion would log. Stage 1 neither changes the helper nor avoids it
   (§4.4, §18).
 - **The peer-repair fix** James chose ("Fix and deploy (Recommended)") is
-  2b2ad9c, live on both nodes since 2026-10-05 (c37b08f). Stage 1 is built
+  2b2ad9c, live on both nodes since 2026-10-05 (then c37b08f; 50c870b on
+  2026-10-14). Stage 1 is built
   on it (§17.1) and never rolls back past it (§13).
 
 ## 3. Challenge
@@ -488,7 +489,7 @@ packets are reported lost; the message is shown under its status dot (§10).
 A reload or an explicit reconnect registers again, and the other side then
 gets the message.
 
-**Old pages.** An old page (Retichat-js 90640bf) never meets `409`: it
+**Old pages.** An old page (Retichat-js f54d7cd or earlier) never meets `409`: it
 registers the legacy way, and a legacy re-bind keeps today's `401`. So two
 old pages of one identity keep evicting each other with every `401`, as
 today, until each is reloaded onto a signing page after Phase 2; then newest
@@ -818,8 +819,8 @@ http://127.0.0.1:8080`.
   For example, add `RedirectMatch 404 ^/reticulum/(error_log|var/)` to
   `~/public_html/reticulum/.htaccess`; the proof is both `curl`s answering
   `403` or `404`.
-- Record the commit `/health` names (`build.commit`; c37b08f on both nodes
-  since 2026-10-05). It is that node's rollback target.
+- Record the commit `/health` names (`build.commit`; 50c870b on both nodes
+  on 2026-10-14). It is that node's rollback target.
 - For retichat.com, the MySQL 8.4 run of open question 3 must have passed;
   until then Stage 1 goes to selectiv only.
 
@@ -840,8 +841,8 @@ suite that passes is the code shipped); the switch stays off. Gates:
   within 5 s.
 - (d) Nothing else moved: in `/health` the gateway's and the other PHP node's
   rows keep advancing `last_seen_at`, `rx_packets` and `tx_packets`;
-  Retichat-js's `./verify-deploy.sh <live ref> <site>` passes (90640bf since
-  2026-10-04; on selectiv a failure means the old `app.js` is back: redeploy
+  Retichat-js's `./verify-deploy.sh <live ref> <site>` passes (f54d7cd since
+  2026-10-14; on selectiv a failure means the old `app.js` is back: redeploy
   the live ref before reading the rest, and before Phase 2); and the live
   page loads and turns green.
 
@@ -902,15 +903,15 @@ signed row's older token gets `409`.
 **The browser goes back only with its PHP nodes.** After Phase 2, a page that
 cannot sign must never be served to a site whose pages register at a PHP
 node that holds signed rows: §4.6 step 4 refuses it (step 2 with the switch
-on), signed rows survive every code and switch change, and 90640bf answers
+on), signed rows survive every code and switch change, and an old page answers
 the `403` with a red dot, no reason, and a new registration every 5 s that a
 reload does not end. Turning the switch off does not undo step 4. So a
 browser problem after Phase 2 is fixed forward, or rolled back in this order:
 first every PHP node the site's pages register at (the one in `config.json`,
 and the other host's for users who saved its URL in Settings, which the CSP
 allows), so Stage 1 pages get `404` at the challenge and register the legacy
-way; then the browser goes back to 90640bf. Forward again goes the other way,
-browser first: a node that went first would refuse every 90640bf page of an
+way; then the browser goes back to the live ref recorded before Phase 2. Forward again goes the other way,
+browser first: a node that went first would refuse every old page of an
 identity that had signed. Deleting signed rows with the node secret (§12) is
 no browser-only rollback, since a Stage 1 tab still open answers its `401` by
 signing again at count 0. A browser-only rollback would need James's
@@ -920,8 +921,9 @@ file offers none.
 ## 14. Required tests
 
 Each fails before its fix and passes after (§10 of the principles). "Today"
-is Reticulum-post main c37b08f (b6c7809's registration code with 2b2ad9c's
-logging fix) and Retichat-js 90640bf. A test that waits does so on an event,
+is the live code, read from both nodes on 2026-10-14: Reticulum-post 50c870b
+(b6c7809's registration code with 2b2ad9c's logging fix) and Retichat-js
+f54d7cd. A test that waits does so on an event,
 with a bound that only fails it.
 
 **Reticulum-post** (real traits; SQLite in memory, or `php -S`):
@@ -993,12 +995,12 @@ with a bound that only fails it.
   secret. *Today:* no challenge route.
 - **`schema_migration_marker_test.php`** (extended): §12's objects, the
   UNIQUE index enforced, the backfill (idempotent, `rns-js` only), the claim
-  filled at first authentication, a c37b08f database migrated cleanly. With
+  filled at first authentication, a 50c870b database migrated cleanly. With
   `schema_meta` holding the SHA-1 of the deployed trait file (what old cached
   code writes after a swap), `migrateIfNeeded()` still builds §12's objects;
   an older version recorded migrates, its own skips; `schema_migrated` false
   before and true after, and false after one failed statement or with the
-  UNIQUE index missing. The CLI migrate mode builds every object on a c37b08f
+  UNIQUE index missing. The CLI migrate mode builds every object on a 50c870b
   database and records nothing, and a `migrate()` after it adds nothing. The
   guard on (version, masked trait hash). *Today:* the fingerprint is the
   file's SHA-1, and the seeded case skips the migration.
@@ -1069,22 +1071,22 @@ with a bound that only fails it.
 **Harness scripts for private staging** (Phase 0):
 
 - **`stage_takeover`:** the A1, A3 and A6 probes against an identity that
-  has signed succeed on c37b08f's code and fail on Stage 1.
+  has signed succeed on today's code (50c870b) and fail on Stage 1.
 - **`stage_signed_browser`:** harness browsers register signed and exchange
   direct and propagated messages; three contexts of one identity settle on
   the newest, in any order; a superseded context shows §8's message and
   stops, and its goodbye then changes nothing; a context two registrations
   stale, woken by a `visible` event, shows §8's message and never registers.
-- **`stage_mixed`:** a 90640bf page (`staging.sh export Retichat-js 90640bf`
+- **`stage_mixed`:** an old page (`staging.sh export Retichat-js f54d7cd`
   and `HARNESS_WEB_ROOT`) beside a Stage 1 page. A stranger's legacy re-bind
   of the old page's row is undone at that page's next exchange. Once a Stage
-  1 page of identity X has signed, a 90640bf page of X gets `403
+  1 page of identity X has signed, an old page of X gets `403
   identity_requires_signature` and asks again every 5 s, logged once. With
   the switch on, an old page gets `401`, then `403 signature_required`, and
   the signed one goes on.
 - **`stage_rollback`** (`STAGING_PHP_FRESH=0 STAGING_PHP_REF=<ref>
   staging.sh up` keeps the database across refs): a signed page connects; the
-  node is served from c37b08f and the page reloads (challenge `404`, legacy
+  node is served from today's code (50c870b) and the page reloads (challenge `404`, legacy
   registration); the node is served from Stage 1 again, and the page's next
   exchange gets `401`, it signs, `[REG-RETIRE] rows=1` is logged, its
   announce makes its local destination and a direct message reaches it. Then
@@ -1265,7 +1267,7 @@ destination, its newest copy whose `announce_status` is `validated` or
 `path_updated` (today the newest accepted packet, whatever its status, so a
 refused copy would be seeded; §9); the extended placeholder scanner (§14).
 
-### 17.2 Retichat-js (no branch yet; from main 90640bf)
+### 17.2 Retichat-js (branch `stage1-sign`, from main f54d7cd)
 
 - **`lib/rns/interfaces/post_interface.js`:** the constructor takes the
   identity (an object that signs and decrypts), or only a hash from an old
@@ -1306,8 +1308,8 @@ refused copy would be seeded; §9); the extended placeholder scanner (§14).
   non-zero, naming the step, if any answer came after 5 s or any check
   failed. It re-binds the same two rows every run.
 - **`staging.sh`** (`test-harnesses/staging/`): the four harness scripts of
-  §14, and the 90640bf client served beside the working copy (`staging.sh
-  export Retichat-js 90640bf`, `HARNESS_WEB_ROOT`).
+  §14, and today's client (f54d7cd) served beside the working copy (`staging.sh
+  export Retichat-js f54d7cd`, `HARNESS_WEB_ROOT`).
 - **`deploy.sh`:** the migrate step and the ancestry refusal (§13), with
   their tests (§14).
 - **MySQL 8.4 for the suite**, before retichat.com gets Stage 1, in the way
