@@ -224,7 +224,14 @@ trait RequestControlPlaneTrait
                 return true;
             }
             if ($status === 'validated') {
-                return $this->shouldRefreshAnnounceRelay((string) ($packet['destination_hash_hex'] ?? ''));
+                // Past the hop limit is never relayed, refresh or not: RNS
+                // 1.5.2 does not even consider such an announce
+                // (Transport.py:2211, hops < PATHFINDER_M+1). A private
+                // staging run relayed a looped copy at hops 129 as a refresh.
+                if ((string) ($packet['announce_reason'] ?? '') === 'announce_hops_exceeded') {
+                    return false;
+                }
+                return $this->shouldRefreshAnnounceRelay($packet);
             }
             return false;
         }
@@ -243,13 +250,28 @@ trait RequestControlPlaneTrait
         return true;
     }
 
-    private function shouldRefreshAnnounceRelay(string $destinationHashHex): bool
+    private function shouldRefreshAnnounceRelay(array $packet): bool
     {
         // Re-relay validated announces no more than once every 5 minutes
         // per destination. This keeps downstream path tables alive without
         // flooding the network.
-        $path = $this->pathEntry($destinationHashHex);
+        $path = $this->pathEntry((string) ($packet['destination_hash_hex'] ?? ''));
         if ($path === null) {
+            return false;
+        }
+
+        // The refresh re-sends THIS copy (relayPacketBase64 rebuilds it from
+        // the copy's own payload and hop count), not the announce the path
+        // keeps. So only the copy the path keeps may refresh: the same
+        // emission (packet hash, which leaves out hops and transport id) at
+        // no more hops. A copy the node chose not to use ('announce_ignored':
+        // an older emission, or the same one looped back longer) would spread
+        // a worse announce; a private staging run refreshed looped copies at
+        // hops 69-128 to browsers. RNS 1.5.2 retransmits only an announce
+        // it adds to its path table (Transport.py:2298, 2351-2373).
+        if (!hash_equals((string) ($path['packet_hash_hex'] ?? ''), (string) ($packet['packet_hash_hex'] ?? ''))
+            || $this->transportObservedHops($packet) > (int) ($path['hops'] ?? 0)
+        ) {
             return false;
         }
 
@@ -369,12 +391,13 @@ trait RequestControlPlaneTrait
         $del->bindValue(':dest', $destinationHashHex, PDO::PARAM_STR);
         $del->bindValue(':iface', $existingIface, PDO::PARAM_STR);
         $del->execute();
-        if (method_exists($this, 'log')) {
-            $this->log(sprintf(
-                '[local_destinations] %s moved: newer announce via %s evicts local registration on %s',
-                substr($destinationHashHex, 0, 12), substr($announcingInterfaceId, 0, 8), substr($existingIface, 0, 8)
-            ));
-        }
+        // Until 2026-10-05 this line sat behind method_exists($this, 'log').
+        // This trait runs as Storage, which has no log() (HttpApi has), so it
+        // was never written. It goes where every line Storage writes goes.
+        error_log(sprintf(
+            '[local_destinations] %s moved: newer announce via %s evicts local registration on %s',
+            substr($destinationHashHex, 0, 12), substr($announcingInterfaceId, 0, 8), substr($existingIface, 0, 8)
+        ));
     }
 
     private function localDestinationRaw(string $destinationHashHex): ?array
@@ -463,6 +486,7 @@ trait RequestControlPlaneTrait
         $now = time();
         $shouldAdd = false;
         $reason = 'announce_ignored';
+        $blobSeen = false;
 
         if ($current === null) {
             $shouldAdd = true;
@@ -557,6 +581,19 @@ trait RequestControlPlaneTrait
         $nextHopHex = $packet['transport_id_hex'] === null ? $destinationHashHex : (string) $packet['transport_id_hex'];
         $expiresAt = $now + $this->pathExpirySeconds($interfaceId);
 
+        // A copy of an emission already heard (blobSeen) may replace the path
+        // ('shorter_path_replaced', 'unusable_path_replaced' above), but it is
+        // not news to relay: the first copy was relayed when it was heard.
+        // RNS 1.5.2 does not even add such a copy on hop count
+        // (Transport.py:2236-2251, 2267-2275), and so does not rebroadcast it.
+        // It is answered 'validated', which shouldRelayAcceptedPacket() puts
+        // under the announce_refresh_seconds rule, and the path keeps its
+        // updated_at: that column is the refresh clock (shouldRefreshAnnounceRelay,
+        // touchPathEntryTimestamp), and a copy that is not relayed must not
+        // restart it. Before this, such a copy answered 'path_updated' and was
+        // queued to every other interface a second time.
+        $updatedAt = $blobSeen ? (int) ($current['updated_at'] ?? $now) : $now;
+
         $sql = 'INSERT INTO path_entries (
                 destination_hash_hex,
                 next_hop_hex,
@@ -597,9 +634,9 @@ trait RequestControlPlaneTrait
         $stmt->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
         $stmt->bindValue(':packet_hash_hex', (string) $packet['packet_hash_hex'], PDO::PARAM_STR);
         $stmt->bindValue(':announce_emitted', $announceEmitted, PDO::PARAM_INT);
-        $stmt->bindValue(':updated_at', $now, PDO::PARAM_INT);
+        $stmt->bindValue(':updated_at', $updatedAt, PDO::PARAM_INT);
         $stmt->execute();
 
-        return ['path_updated', $reason];
+        return [$blobSeen ? 'validated' : 'path_updated', $reason];
     }
 }

@@ -4,6 +4,10 @@ declare(strict_types=1);
 
 namespace ReticulumPhp;
 
+// Loaded here as well as by index.php: deploy.sh renames lib/ before
+// index.php, and a request between the two runs the old index.php.
+require_once __DIR__ . '/empty_poll.php';
+
 use PDO;
 
 // Reticulum-php is request-operated. These interface/runtime helpers prepare
@@ -126,6 +130,16 @@ trait RequestInterfaceRuntimeTrait
             Database::executeWithRetry($stmt, 'queueOutboundPacket');
         }
 
+        // The packet is committed (autocommit; the node opens no
+        // transactions): the interface's next poll must take the full path.
+        EmptyPoll::clear($this->config ?? [], $interfaceId);
+        // A packet for a PHP peer is a wake owed, whether or not an epilogue
+        // follows this request (/v1/wake has none): idle polls must stop
+        // taking the shortcut until an epilogue has woken the peer.
+        if ($this->isPhpPeerInterface($interfaceId)) {
+            EmptyPoll::noteWakesOwed($this->config ?? []);
+        }
+
         // Cap pending outbound per interface at 256. Drop oldest unissued entries.
         // Python RNS caps announce_queue at MAX_QUEUED_ANNOUNCES (16384).
         // The queue cap is per interface, not per packet: check it once per
@@ -180,6 +194,47 @@ trait RequestInterfaceRuntimeTrait
                 Database::executeWithRetry($delStmt, 'capOutboundQueue');
             }
         }
+    }
+
+    /**
+     * After a full exchange or poll from $interfaceId (see EmptyPoll::markIdle).
+     * A PHP peer (another node, or a gateway) gets no mark: its credentials are
+     * revoked by deleting its row in SQL (README, rotating a leaked peer
+     * session), which no code here sees, and the old credential must be
+     * refused at the very next exchange, not when a mark runs out.
+     */
+    public function markIdleIfNothingQueued(string $interfaceId, string $sessionToken): void
+    {
+        if ($this->isPhpPeerInterface($interfaceId)) {
+            return;
+        }
+        EmptyPoll::markIdle(
+            $this->config,
+            $interfaceId,
+            $sessionToken,
+            // Read after the mark is written, like the count: a row deleted
+            // or given a new token while this request ran takes the mark away.
+            fn (): int => $this->idleMarkCredentialHolds($interfaceId, $sessionToken)
+                ? $this->pendingOutboundPacketCount($interfaceId)
+                : 1,
+            // last_seen_at was stamped at the start: the mark runs out
+            // seconds() after that, not after this request's end.
+            (int) ($_SERVER['REQUEST_TIME'] ?? time()),
+        );
+    }
+
+    /** The interface still exists, with this token, and is not a PHP peer. */
+    private function idleMarkCredentialHolds(string $interfaceId, string $sessionToken): bool
+    {
+        $stmt = $this->db->prepare(
+            'SELECT session_token, peer_url, peer_interface_id FROM interfaces WHERE interface_id = :interface_id'
+        );
+        $stmt->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
+        $stmt->execute();
+        $row = $stmt->fetch(PDO::FETCH_ASSOC);
+        return is_array($row)
+            && hash_equals((string) $row['session_token'], $sessionToken)
+            && ($row['peer_url'] === null || $row['peer_interface_id'] === null);
     }
 
     private function pendingOutboundPacketCount(string $interfaceId): int

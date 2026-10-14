@@ -4,6 +4,10 @@ declare(strict_types=1);
 
 namespace ReticulumPhp;
 
+// Loaded here as well as by index.php: deploy.sh renames lib/ before
+// index.php, and a request between the two runs the old index.php.
+require_once __DIR__ . '/empty_poll.php';
+
 use PDO;
 
 // Reticulum-php is request-operated. These interface registry helpers only
@@ -211,6 +215,8 @@ trait RequestInterfaceRegistryTrait
         $stmt->bindValue(':peer_interface_id', $peerInterfaceId, $peerInterfaceId === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
         $stmt->bindValue(':peer_session_token', $peerSessionToken, $peerSessionToken === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
         $stmt->execute();
+        // The row may now hold a new session token (EmptyPoll).
+        EmptyPoll::clear($this->config ?? [], $interfaceId);
     }
 
     public function authenticateInterface(string $interfaceId, string $sessionToken): array

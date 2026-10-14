@@ -5,7 +5,8 @@ Connects a Reticulum transport node to a remote Reticulum-php node
 via HTTP exchange (the same protocol as rns_transport.php).
 
 Supports two modes:
-  - Poll mode (no wake_url): polls the PHP node on a timer
+  - Poll mode (no wake_url): polls the PHP node on a timer, and exchanges
+    at once when it has a packet to send
   - Wake mode (wake_url set): bidirectional peer connection. The bridge
     runs a lightweight HTTP server to receive /v1/wake calls from the
     PHP node, triggering immediate exchange. Outbound packets also
@@ -420,17 +421,25 @@ class PostInterface(Interface):
 
     def process_outgoing(self, data):
         """Called by RNS when it wants to send a packet through this interface.
-        We queue it for the next exchange with the PHP node.
-        In wake mode, also signals the poll loop to trigger an immediate exchange.
+        We queue it for the next exchange with the PHP node, and signal the
+        poll loop to exchange at once, in either mode.
         """
         if self.online:
             with self._queue_lock:
                 self._outgoing_queue.append(data)
             self.txb += len(data)
-            # In wake mode, trigger immediate exchange (matches Rust behaviour).
-            if self.wake_url:
-                with self._wake_lock:
-                    self._pending_wake = True
+            # Trigger an immediate exchange in either mode, as the Rust
+            # PostInterface does (its process_outgoing signals the exchange
+            # worker). Until 2026-10-13 only wake mode did, and in poll mode
+            # a packet waited for the next poll, up to the 3 s floor. On a
+            # link a poll-mode client opened to rfed's lxmf.propagation, rfed
+            # waited one poll for the client to fetch its LRPROOF and a
+            # second for the client's RTT packet to leave, and logged
+            # "link.establish succeeded after 6.17s" (DESIGN_PRINCIPLES §1,
+            # distro-pipeline stage 4). What the node holds for a poll-mode
+            # client still waits for its next poll.
+            with self._wake_lock:
+                self._pending_wake = True
             if len(data) >= 18:
                 dest = data[2:18].hex() if len(data) >= 18 else '?'
                 pkt_type = data[0] & 0x03 if data else -1
@@ -504,7 +513,8 @@ class PostInterface(Interface):
     def _poll_loop(self):
         """Background thread that periodically exchanges packets with the PHP node.
 
-        In poll mode (no wake_url): polls at the configured interval.
+        In poll mode (no wake_url): polls at the configured interval, and
+        exchanges at once when a packet is queued via process_outgoing().
         In wake mode (wake_url set): purely event-driven.  Exchange is
         triggered by an incoming wake from the PHP node or by an outbound
         packet queued via process_outgoing().  No timer-based fallback.

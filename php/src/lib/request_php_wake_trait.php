@@ -4,6 +4,10 @@ declare(strict_types=1);
 
 namespace ReticulumPhp;
 
+// Loaded here as well as by index.php: deploy.sh renames lib/ before
+// index.php, and a request between the two runs the old index.php.
+require_once __DIR__ . '/empty_poll.php';
+
 use PDO;
 
 /**
@@ -74,6 +78,11 @@ trait RequestPhpWakeTrait
      */
     public function dispatchWakes(): void
     {
+        // Removed before the look and written after it if anything is owed,
+        // so idle polls stop taking the shortcut while an epilogue is due
+        // (EmptyPoll, "THE WAKE MARK").
+        EmptyPoll::clearWakesOwed($this->config ?? []);
+
         // Collect peers with pending outbound packets.
         $peers = $this->phpPeerInterfaceIdsWithPendingOutbound();
 
@@ -87,6 +96,9 @@ trait RequestPhpWakeTrait
                 $peers[] = $p;
                 $seen[(string)$p['interface_id']] = true;
             }
+        }
+        if ($peers !== []) {
+            EmptyPoll::noteWakesOwed($this->config ?? []);
         }
 
         // Gate: don't wake the same peer more than once per min_wake_interval_ms.
@@ -324,7 +336,7 @@ trait RequestPhpWakeTrait
                 'ack_batch_ids' => $ackBatchIds,
             ], JSON_THROW_ON_ERROR | JSON_PARTIAL_OUTPUT_ON_ERROR);
         } catch (\JsonException $e) {
-            $this->log('exchangeWithPhpPeer: json_encode failed: ' . $e->getMessage());
+            error_log('[peer] exchangeWithPhpPeer: json_encode failed: ' . $e->getMessage());
             return ['status' => 'encode_failed', 'message' => $e->getMessage(), 'peer_url' => $peerUrl];
         }
 
@@ -411,7 +423,7 @@ trait RequestPhpWakeTrait
                 $decoded = self::decodeJson($json);
                 $ids = is_array($decoded) ? $decoded : [];
             } catch (\JsonException $e) {
-                $this->log('error', 'drainPeerAckBatchIds: decodeJson failed for ' . $peerInterfaceId . ': ' . $e->getMessage());
+                error_log('[peer] drainPeerAckBatchIds: decodeJson failed for ' . $peerInterfaceId . ': ' . $e->getMessage());
                 $ids = [];
             }
         }
@@ -429,6 +441,8 @@ trait RequestPhpWakeTrait
 
     private function appendPeerAckBatchId(string $peerInterfaceId, string $batchId): void
     {
+        // An acknowledgement owed to a peer is a wake owed (EmptyPoll).
+        EmptyPoll::noteWakesOwed($this->config ?? []);
         $stmt = $this->db->prepare(
             'SELECT pending_ack_batch_ids_json FROM interfaces WHERE interface_id = :interface_id'
         );
@@ -446,7 +460,7 @@ trait RequestPhpWakeTrait
                         $ids = $decoded;
                     }
                 } catch (\JsonException $e) {
-                    $this->log('error', 'appendPeerAckBatchId: decodeJson failed for ' . $peerInterfaceId . ': ' . $e->getMessage());
+                    error_log('[peer] appendPeerAckBatchId: decodeJson failed for ' . $peerInterfaceId . ': ' . $e->getMessage());
                     $ids = [];
                 }
             }
@@ -701,7 +715,15 @@ trait RequestPhpWakeTrait
 
             $result = $this->connectToPeer($exchangeUrl, $wakeUrl, $hostUrl, (string) $ifaceName);
             $summary['peer_sessions_healed'][] = $result;
-            $this->log('warning', sprintf(
+            // error_log(), as every line Storage writes: log() is HttpApi's
+            // (RequestHttpApiHelperTrait), and this trait runs as Storage.
+            // Until 2026-10-05 this was $this->log(), so the request whose
+            // prelude had just re-registered the session died with "Call to
+            // undefined method Storage::log()" and answered 500, and no entry
+            // after this one was checked. Pinned by
+            // tests/peer_session_heal_request_test.php; the class of bug by
+            // tests/static_check_methods.php.
+            error_log(sprintf(
                 '[peer] session to %s was dead (%s) — re-registered: %s',
                 $exchangeUrl,
                 $existing === null ? 'no row' : 'row ' . ($existing['status'] ?? '?'),
@@ -730,6 +752,7 @@ trait RequestPhpWakeTrait
             $del = $this->db->prepare('DELETE FROM interfaces WHERE interface_id = :id');
             $del->bindValue(':id', (string) $existing['interface_id'], PDO::PARAM_STR);
             Database::executeWithRetry($del, 'removeDeadPeerRow');
+            EmptyPoll::clear($this->config ?? [], (string) $existing['interface_id']);
         }
 
         // Pre-generate credentials for the peer to call us.
