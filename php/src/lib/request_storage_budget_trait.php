@@ -770,20 +770,78 @@ trait RequestStorageBudgetTrait
         // retrying at once would spin without ever finishing.
         $this->storageStateSet('storage_reclaim_last_run_at', (string) $now);
 
-        foreach ($targets as $tableName) {
-            try {
-                $statement = $this->db->query('OPTIMIZE TABLE ' . Database::quoteTable($backend, $tableName));
-                if ($statement !== false) {
-                    // OPTIMIZE returns a status result set that must be drained
-                    // before the connection can be reused.
-                    $statement->fetchAll(PDO::FETCH_ASSOC);
-                    $statement->closeCursor();
+        // Each rebuild waits at most 2 s for its table's metadata lock, as
+        // migrate()'s DDL does (underDdlLockCeiling()). An OPTIMIZE queued
+        // behind a long transaction holds every later statement on its table
+        // behind it for as long as lock_wait_timeout allows: a day by default.
+        // One attempt per table, never retried; a table that gave up waits
+        // for a later reclaim.
+        $ceiling = [];
+        $ran = $this->underDdlLockCeiling($ceiling, function () use ($targets, $backend, &$summary): void {
+            foreach ($targets as $tableName) {
+                $failure = $this->optimizeTable($backend, $tableName);
+                if ($failure === null) {
+                    $summary['storage_reclaimed_tables'][] = $tableName;
+                } else {
+                    error_log('ReticulumPhp: OPTIMIZE TABLE failed on ' . $tableName . ': ' . $failure);
                 }
-                $summary['storage_reclaimed_tables'][] = $tableName;
-            } catch (PDOException $e) {
-                error_log('ReticulumPhp: OPTIMIZE TABLE failed on ' . $tableName . ': ' . $e->getMessage());
             }
+        });
+        $why = implode('; ', $ceiling['errors'] ?? []);
+        if (!$ran) {
+            // The session's lock_wait_timeout could not be read or set: no
+            // rebuild runs without the 2 s ceiling.
+            foreach ($targets as $tableName) {
+                error_log('ReticulumPhp: OPTIMIZE TABLE failed on ' . $tableName . ': not run, ' . $why);
+            }
+        } elseif ($why !== '') {
+            // The rebuilds ran; the session's value could not be put back.
+            error_log('ReticulumPhp: storage reclaim: ' . $why);
         }
+    }
+
+    /**
+     * One OPTIMIZE TABLE, run once: null when the table was rebuilt, or why
+     * it was not. MySQL answers a table's failure, a lock wait timeout among
+     * them, with rows of the result (Msg_type error, then status "Operation
+     * failed"), not with an error of the statement, so the rows are read.
+     */
+    private function optimizeTable(string $backend, string $tableName): ?string
+    {
+        $errors = [];
+        $failed = false;
+        $lockWait = false;
+        try {
+            $statement = $this->db->query('OPTIMIZE TABLE ' . Database::quoteTable($backend, $tableName));
+            if ($statement !== false) {
+                // OPTIMIZE returns a status result set that must be drained
+                // before the connection can be reused.
+                $rows = $statement->fetchAll(PDO::FETCH_ASSOC);
+                $statement->closeCursor();
+                foreach ($rows as $row) {
+                    $row = array_change_key_case($row, CASE_LOWER);
+                    $type = strtolower((string) ($row['msg_type'] ?? ''));
+                    $text = (string) ($row['msg_text'] ?? '');
+                    if ($type === 'error') {
+                        $errors[] = $text;
+                        $lockWait = $lockWait || stripos($text, 'Lock wait timeout') !== false;
+                    }
+                    $failed = $failed || $type === 'error' || ($type === 'status' && $text === 'Operation failed');
+                }
+            }
+        } catch (PDOException $e) {
+            $errors[] = $e->getMessage();
+            $failed = true;
+            $lockWait = (int) ($e->errorInfo[1] ?? 0) === 1205;
+        }
+        if (!$failed) {
+            return null;
+        }
+        $detail = $errors === [] ? 'Operation failed' : implode('; ', $errors);
+
+        return $lockWait
+            ? "it waited 2 s for the table's metadata lock and gave up, so the table was not rebuilt ({$detail})"
+            : $detail;
     }
 
     /**

@@ -407,6 +407,12 @@ fire-and-forget, at the end of an exchange. The throttle window is claimed by
 the parent before spawning, so requests arriving during a rebuild do not pile
 up more of them.
 
+Each rebuild waits at most 2 s for its table's metadata lock, as the deploy's
+schema step does: one queued behind a long transaction would hold every later
+query on that table behind it. A table that gives up is logged as any reclaim
+failure is (`OPTIMIZE TABLE failed on <table>: it waited 2 s …`), is not
+retried, and waits for a later reclaim.
+
 Every operation therefore polices its own storage:
 
 | Where | What runs | Cost |

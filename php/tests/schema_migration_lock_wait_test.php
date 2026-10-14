@@ -10,12 +10,13 @@ declare(strict_types=1);
  * The suite has no MySQL server, so migrate() runs here with backend mysql
  * on a recording connection: a SQLite file as 50c870b built it
  * (stubs/50c870b_schema.sql, the live nodes' code when Stage 1 was built),
- * behind a PDO that answers the MySQL-only statements migrate() issues
- * (@@SESSION.lock_wait_timeout, SET SESSION, information_schema, SHOW
- * INDEX, ON DUPLICATE KEY, the ENGINE, ALGORITHM and LOCK clauses, an ALTER
- * adding several columns) as MySQL would. It records every statement as
- * issued, with the session's lock_wait_timeout at that moment, and can fail
- * one statement with 1205, MySQL's lock wait timeout. It proves:
+ * behind stubs/mysql_stand_in.php's PDO, which answers the MySQL-only
+ * statements migrate() issues (@@SESSION.lock_wait_timeout, SET SESSION,
+ * information_schema, SHOW INDEX, ON DUPLICATE KEY, the ENGINE, ALGORITHM
+ * and LOCK clauses, an ALTER adding several columns) as MySQL would. It
+ * records every statement as issued, with the session's lock_wait_timeout
+ * at that moment, and can fail one statement with 1205, MySQL's lock wait
+ * timeout. It proves:
  *  (a) the session's value is read, then set to 2, before the first DDL
  *      statement; every DDL statement runs at 2, issued with exec() (none
  *      is prepared, so none can go through executeWithRetry); the value read
@@ -39,6 +40,7 @@ declare(strict_types=1);
 $root = dirname(__DIR__);
 require_once $root . '/src/lib/database.php';
 require_once $root . '/src/index.php';
+require_once __DIR__ . '/stubs/mysql_stand_in.php';
 
 $pass = 0;
 $fail = 0;
@@ -55,130 +57,6 @@ function check(string $label, bool $ok, string $detail = ''): void
     }
 }
 
-/**
- * MySQL as migrate() sees it, over a SQLite file: each statement recorded as
- * issued, then run in SQLite's form.
- */
-final class MysqlStandInPdo extends PDO
-{
-    /** @var list<array{sql: string, via: string, lock_wait: int}> */
-    public array $log = [];
-    /** The session's lock_wait_timeout. */
-    public int $lockWait = 86400;
-    /** The first statement matching this fails with 1205, as a lock wait timeout. */
-    public ?string $timeOut = null;
-    /** The session's lock_wait_timeout cannot be read (a connection gone). */
-    public bool $unreadable = false;
-
-    public function __construct(string $path)
-    {
-        parent::__construct('sqlite:' . $path);
-        $this->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-    }
-
-    public function exec(string $statement): int|false
-    {
-        $sql = $this->note($statement, 'exec');
-        if (preg_match('/\ASET SESSION lock_wait_timeout = ([0-9]+)\z/', $sql, $m) === 1) {
-            $this->lockWait = (int) $m[1];
-
-            return 0;
-        }
-        $rows = 0;
-        foreach (self::sqlite($sql) as $sqlite) {
-            $rows += (int) parent::exec($sqlite);
-        }
-
-        return $rows;
-    }
-
-    public function query(string $query, ?int $fetchMode = null, mixed ...$fetchModeArgs): PDOStatement|false
-    {
-        $sql = $this->note($query, 'query');
-        if ($sql === 'SELECT @@SESSION.lock_wait_timeout') {
-            if ($this->unreadable) {
-                throw self::error(2006, 'MySQL server has gone away');
-            }
-            $sql = 'SELECT ' . $this->lockWait;
-        }
-        [$sqlite] = self::sqlite($sql);
-
-        return $fetchMode === null ? parent::query($sqlite) : parent::query($sqlite, $fetchMode, ...$fetchModeArgs);
-    }
-
-    public function prepare(string $query, array $options = []): PDOStatement|false
-    {
-        [$sqlite] = self::sqlite($this->note($query, 'prepare'));
-
-        return parent::prepare($sqlite, $options);
-    }
-
-    private function note(string $statement, string $via): string
-    {
-        $sql = (string) preg_replace('/\s+/', ' ', trim($statement));
-        $this->log[] = ['sql' => $sql, 'via' => $via, 'lock_wait' => $this->lockWait];
-        if ($this->timeOut !== null && preg_match($this->timeOut, $sql) === 1) {
-            $this->timeOut = null;
-            throw self::error(1205, 'Lock wait timeout exceeded; try restarting transaction');
-        }
-
-        return $sql;
-    }
-
-    private static function error(int $code, string $message): PDOException
-    {
-        $e = new PDOException("SQLSTATE[HY000]: General error: {$code} {$message}");
-        $e->errorInfo = ['HY000', $code, $message];
-
-        return $e;
-    }
-
-    /** @return list<string> the statement as SQLite takes it */
-    private static function sqlite(string $sql): array
-    {
-        $answers = [
-            'SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :table'
-                => 'SELECT name AS COLUMN_NAME FROM pragma_table_info(:table)',
-            'SELECT DATA_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :t AND COLUMN_NAME = :c'
-                => 'SELECT lower(type) AS DATA_TYPE FROM pragma_table_info(:t) WHERE name = :c',
-            'SELECT TABLE_NAME, INDEX_NAME FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE()'
-                => "SELECT m.name AS TABLE_NAME, il.name AS INDEX_NAME FROM sqlite_master AS m, pragma_index_list(m.name) AS il WHERE m.type = 'table'",
-            'SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE()'
-                => "SELECT name AS TABLE_NAME FROM sqlite_master WHERE type = 'table'",
-            "SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'link_transport_entries' AND INDEX_NAME = 'PRIMARY' AND COLUMN_NAME = 'remaining_hops'"
-                => "SELECT COUNT(*) FROM pragma_table_info('link_transport_entries') WHERE name = 'remaining_hops' AND pk > 0",
-            'SHOW INDEX FROM interfaces'
-                => "SELECT il.name AS Key_name, 1 - il.\"unique\" AS Non_unique, ii.name AS Column_name FROM pragma_index_list('interfaces') AS il, pragma_index_info(il.name) AS ii",
-            'INSERT INTO schema_meta (meta_key, fingerprint, applied_at) VALUES (:k, :f, :t) ON DUPLICATE KEY UPDATE fingerprint = VALUES(fingerprint), applied_at = VALUES(applied_at)'
-                => 'INSERT INTO schema_meta (meta_key, fingerprint, applied_at) VALUES (:k, :f, :t) ON CONFLICT(meta_key) DO UPDATE SET fingerprint = excluded.fingerprint, applied_at = excluded.applied_at',
-        ];
-        if (isset($answers[$sql])) {
-            return [$answers[$sql]];
-        }
-        if (preg_match('/information_schema|\ASHOW |ON DUPLICATE KEY| MODIFY |@@/', $sql) === 1) {
-            throw new LogicException("the stand-in has no SQLite form of: {$sql}");
-        }
-        if (str_starts_with($sql, 'CREATE TABLE ')) {
-            $sql = str_replace(' ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci', '', $sql);
-
-            return [str_replace('BIGINT AUTO_INCREMENT PRIMARY KEY', 'INTEGER PRIMARY KEY AUTOINCREMENT', $sql)];
-        }
-        if (preg_match('/\A(ALTER TABLE `\w+`) (ADD COLUMN .*), ALGORITHM=INSTANT\z/', $sql, $m) === 1) {
-            $statements = [];
-            foreach (preg_split('/, (?=ADD COLUMN `)/', $m[2]) ?: [] as $clause) {
-                $statements[] = $m[1] . ' ' . preg_replace('/ AFTER `\w+`\z/', '', $clause);
-            }
-
-            return $statements;
-        }
-        if (preg_match('/\A(CREATE (?:UNIQUE )?INDEX .*) ALGORITHM=INPLACE LOCK=NONE\z/', $sql, $m) === 1) {
-            return [$m[1]];
-        }
-
-        return [$sql];
-    }
-}
-
 /** A SQLite file with the schema (and recorded version) 50c870b's code built. */
 function liveDatabase(string $path): PDO
 {
@@ -190,16 +68,6 @@ function liveDatabase(string $path): PDO
                 VALUES ('browser', 'Retichat Web', 't', '{\"client\":\"rns-js\",\"identity_hash\":\"00112233445566778899aabbccddeeff\"}')");
 
     return $pdo;
-}
-
-/** A Storage on $pdo, as the given backend. */
-function standInStorage(string $path, MysqlStandInPdo $pdo, string $backend = 'mysql'): ReticulumPhp\Storage
-{
-    $storage = new ReticulumPhp\Storage(['storage' => ['backend' => 'sqlite', 'sqlite_path' => $path, 'log_path' => dirname($path) . '/router.log']]);
-    (new ReflectionProperty(ReticulumPhp\Storage::class, 'db'))->setValue($storage, $pdo);
-    (new ReflectionProperty(ReticulumPhp\Storage::class, 'backend'))->setValue($storage, $backend);
-
-    return $storage;
 }
 
 function isDdl(string $sql): bool
