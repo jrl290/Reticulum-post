@@ -242,6 +242,28 @@ trait RequestHttpApiHelperTrait
         return $decoded;
     }
 
+    /**
+     * The fields of a challenge request (REGISTRATION-STAGE1.md §3): a GET's
+     * query, or a POST's JSON object. Anything else is an empty request,
+     * which issueChallenge() refuses with 400 bad_challenge_request.
+     */
+    private function challengeRequest(string $method, string $uri): array
+    {
+        if ($method === 'GET') {
+            $query = parse_url($uri, PHP_URL_QUERY);
+            $fields = [];
+            if (is_string($query) && $query !== '') {
+                parse_str($query, $fields);
+            }
+
+            return $fields;
+        }
+        $raw = file_get_contents('php://input');
+        $decoded = is_string($raw) && $raw !== '' ? json_decode($raw, true) : null;
+
+        return is_array($decoded) ? $decoded : [];
+    }
+
     private function normalizedPath(string $uri, array $server): string
     {
         return HttpIo::normalizedPath($uri, $server);

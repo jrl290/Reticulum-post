@@ -12,7 +12,7 @@ declare(strict_types=1);
  * index older):
  *  (e) §12's objects, the UNIQUE index enforced, the migration clean;
  *  (f) the claim backfill (rns-js only, top-level 32 lower-case hex,
- *      idempotent);
+ *      idempotent), and the claim filled at first authentication;
  *  (g) the version is a literal: with schema_meta holding the SHA-1 of the
  *      deployed trait file (what old cached code records after a swap)
  *      migrateIfNeeded() still builds §12's objects; an older version
@@ -263,6 +263,29 @@ $check(($again['errors'] ?? ['?']) === [], 'a second migration has no errors');
 $check(($again['built'] ?? ['?']) === [] && ($again['claims_backfilled'] ?? 0) === 0, 'and builds and fills nothing: ' . json_encode($again['built'] ?? null));
 $check(json_encode($live->query('SELECT * FROM interfaces ORDER BY interface_id')->fetchAll(PDO::FETCH_ASSOC)) === $snapshot, 'and changes no row');
 
+// A row old code writes after the migration (a rollback, then forward again
+// with the version already recorded) has no claim yet; its first
+// authentication fills it, before any announce it carries reaches §9.
+$late = [
+    'late-browser' => '{"client":"rns-js","mode":1,"identity_hash":"00112233445566778899aabbccddeeff"}',
+    'late-upper'   => '{"client":"rns-js","mode":1,"identity_hash":"00112233445566778899AABBCCDDEEFF"}',
+    'late-gateway' => '{"client":"rns-post-interface","mode":6,"identity_hash":"00112233445566778899aabbccddeeff"}',
+];
+foreach ($late as $id => $metadata) {
+    $live->prepare("INSERT INTO interfaces (interface_id, name, session_token, metadata_json, status) VALUES (?, ?, 'late-token', ?, 'online')")->execute([$id, $id, $metadata]);
+}
+try {
+    $migrated->authenticateInterface('late-browser', 'wrong-token');
+} catch (ReticulumPhp\ApiError $e) {
+}
+$check($live->query("SELECT claimed_identity_hash FROM interfaces WHERE interface_id = 'late-browser'")->fetchColumn() === null,
+    'a failed authentication fills nothing');
+foreach (array_keys($late) as $id) {
+    $migrated->authenticateInterface($id, 'late-token');
+}
+$lateClaims = $live->query("SELECT interface_id, claimed_identity_hash FROM interfaces WHERE interface_id LIKE 'late-%'")->fetchAll(PDO::FETCH_KEY_PAIR);
+$check($lateClaims['late-browser'] === '00112233445566778899aabbccddeeff', 'authenticateInterface fills a late rns-js row\'s claim');
+$check($lateClaims['late-upper'] === null && $lateClaims['late-gateway'] === null, 'but not a malformed claim, nor another client\'s');
 unset($migrated);
 
 // ── (g) the version is a literal ─────────────────────────────────────────

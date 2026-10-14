@@ -34,57 +34,42 @@
  * The SQL itself must also prepare on MySQL/MariaDB, which SQLite cannot show;
  * no_backslash_in_sql_literals_test.php guards that.
  *
- * This test runs against the real trait (SQLite in-memory). It asserts the
- * fixed behaviour, so on an export of 35314f4 (REG_TRAIT_PATH=/path/to/old.php)
- * the attack cases FAIL — that is the regression the fix removes.
+ * Since Stage 1 (REGISTRATION-STAGE1.md §4.6, §12) the claim lives in its own
+ * column, claimed_identity_hash, matched exactly, and never in metadata_json;
+ * interfaceByIdentityHash() and its LIKE are gone. The attacks below still
+ * must not capture a row, and a legitimate legacy browser still re-binds its
+ * own `none` row. registration_rebind_rules_test.php covers the rest of §4.6
+ * and §7.
+ *
+ * This test runs against the real Storage (SQLite in memory, migrated).
  *
  * Run: php tests/interface_identity_rebind_test.php
- *      REG_TRAIT_PATH=/tmp/old_trait_35314f4.php php tests/interface_identity_rebind_test.php  # attacks FAIL (bug present)
  */
 declare(strict_types=1);
 
 namespace ReticulumPhp;
 
 $root = dirname(__DIR__);
-require_once $root . '/src/lib/database.php';
-require_once $root . '/src/lib/request_json_codec_trait.php';
-$traitPath = getenv('REG_TRAIT_PATH');
-require_once ($traitPath !== false && $traitPath !== '')
-    ? $traitPath
-    : $root . '/src/lib/request_interface_registry_trait.php';
-
-// authenticateInterface() throws ReticulumPhp\ApiError on a bad token. The real
-// class lives in index.php; a stand-in keeps the test from booting the app.
-if (!class_exists(ApiError::class)) {
-    class ApiError extends \RuntimeException
-    {
-        public function __construct(public readonly int $statusCode, string $message, public readonly array $payload = [])
-        {
-            parent::__construct($message);
-        }
-    }
-}
+require_once $root . '/src/index.php';
 
 final class RebindHarness
 {
-    use RequestInterfaceRegistryTrait;
-    use RequestJsonCodecTrait;
-
+    public Storage $storage;
     public \PDO $db;
-    public string $backend = 'sqlite';
 
     public function __construct()
     {
-        $this->db = new \PDO('sqlite::memory:', options: [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
-        $this->db->exec(
-            'CREATE TABLE interfaces (
-                interface_id TEXT PRIMARY KEY, name TEXT, session_token TEXT,
-                bitrate INTEGER, mtu INTEGER, status TEXT, metadata_json TEXT,
-                created_at INTEGER, last_seen_at INTEGER, updated_at INTEGER,
-                peer_url TEXT, peer_interface_id TEXT, peer_session_token TEXT,
-                last_wake_sent_at INTEGER, pending_ack_batch_ids_json TEXT
-            )'
-        );
+        $this->storage = new Storage([
+            'storage' => ['backend' => 'sqlite', 'sqlite_path' => ':memory:'],
+            'http' => ['max_batch_packets' => 64, 'max_packet_bytes' => 512, 'idle_exchange_interval_ms' => 1000],
+        ]);
+        $this->storage->migrateIfNeeded();
+        $this->db = (new \ReflectionProperty($this->storage, 'db'))->getValue($this->storage);
+    }
+
+    public function registerInterface(string $name, int $bitrate, int $mtu, array $metadata): array
+    {
+        return $this->storage->registerInterface($name, $bitrate, $mtu, $metadata);
     }
 
     /** Register as the Retichat web client does, with a given identity_hash claim. */
@@ -105,7 +90,7 @@ final class RebindHarness
             "INSERT INTO interfaces (interface_id, name, session_token, bitrate, mtu, status, metadata_json, created_at, last_seen_at)
              VALUES (?, 'planted', ?, 1000000, 500, 'online', ?, ?, ?)"
         );
-        $st->execute([$interfaceId, $token, self::encodeJson($metadata), time(), time()]);
+        $st->execute([$interfaceId, $token, json_encode($metadata), time(), time()]);
     }
 
     public function metaFor(string $interfaceId): array
@@ -114,7 +99,16 @@ final class RebindHarness
         $st->execute([$interfaceId]);
         $row = $st->fetch(\PDO::FETCH_ASSOC);
 
-        return is_array($row) ? self::decodeJson((string) $row['metadata_json']) : [];
+        return is_array($row) ? (json_decode((string) $row['metadata_json'], true) ?: []) : [];
+    }
+
+    public function claimFor(string $interfaceId): ?string
+    {
+        $st = $this->db->prepare('SELECT claimed_identity_hash FROM interfaces WHERE interface_id = ?');
+        $st->execute([$interfaceId]);
+        $value = $st->fetchColumn();
+
+        return is_string($value) ? $value : null;
     }
 
     public function rowCount(): int
@@ -125,7 +119,7 @@ final class RebindHarness
     public function authOk(string $interfaceId, string $token): bool
     {
         try {
-            $this->authenticateInterface($interfaceId, $token);
+            $this->storage->authenticateInterface($interfaceId, $token);
             return true;
         } catch (\Throwable $e) {
             return false;
@@ -192,7 +186,7 @@ foreach ($attacks as $label => $claim) {
     $res = $h->registerBrowser($claim);
     check("[$label] does not return the victim's interface_id", $res['interface_id'] !== $victim['interface_id']);
     check("[$label] the victim's token still authenticates", $h->authOk($victim['interface_id'], $victimToken));
-    check("[$label] the victim's metadata is untouched", ($h->metaFor($victim['interface_id'])['identity_hash'] ?? null) === $victimHash);
+    check("[$label] the victim's claim is untouched", $h->claimFor($victim['interface_id']) === $victimHash);
     check("[$label] a fresh row was created", $h->rowCount() === $before + 1);
 }
 

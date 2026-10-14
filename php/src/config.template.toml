@@ -52,6 +52,9 @@ path_expiry_access_point_seconds = 86400
 path_expiry_roaming_seconds = 21600
 max_random_blobs = 64
 
+[registration]
+enforce_signed_registration = false   # browsers only. James turns it on, on a date he sets.
+
 [interfaces]
 
 [[YourPeerName]]

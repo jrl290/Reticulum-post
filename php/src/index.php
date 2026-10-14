@@ -26,6 +26,8 @@ require_once __DIR__ . '/lib/request_schema_trait.php';
 require_once __DIR__ . '/lib/request_storage_budget_trait.php';
 require_once __DIR__ . '/lib/request_php_wake_trait.php';
 require_once __DIR__ . '/lib/empty_poll.php';
+require_once __DIR__ . '/lib/registration_protocol.php';
+require_once __DIR__ . '/lib/request_registration_trait.php';
 
 // Reticulum-php is request-operated. Queued transport bytes only move during
 // authenticated request/response exchanges. Wake helpers exist to prompt the
@@ -496,6 +498,17 @@ final class Config
         $debugConfig['enabled'] = self::configBoolOrDefault($debugConfig, 'enabled', 'debug.enabled', false);
         $debugConfig['max_rows'] = self::positiveConfigIntOrDefault($debugConfig, 'max_rows', 'debug.max_rows', 20);
         $config['debug'] = $debugConfig;
+
+        // REGISTRATION-STAGE1.md §13: browsers only, off by default. James
+        // turns it on, on a date he sets; off takes effect at once.
+        $registrationConfig = $config['registration'] ?? [];
+        if (!is_array($registrationConfig)) {
+            throw new RuntimeException('registration configuration must be an object');
+        }
+        $registrationConfig['enforce_signed_registration'] = self::configBoolOrDefault(
+            $registrationConfig, 'enforce_signed_registration', 'registration.enforce_signed_registration', false
+        );
+        $config['registration'] = $registrationConfig;
 
         // [interfaces] is the PHP peering (one [[Name]] per peer: type =
         // PostInterface, node_url, wake_url), read by initializeNode() and
@@ -1085,6 +1098,7 @@ final class Storage
     use RequestSchemaTrait;
     use RequestStorageBudgetTrait;
     use RequestPhpWakeTrait;
+    use RequestRegistrationTrait;
 
     private PDO $db;
     private string $backend;
@@ -1113,7 +1127,9 @@ final class HttpApi
      * nodes and gateways only (browsers are counted, not listed) and go
      * through Storage::publicInterfaceView(), an allowlist. 'build' is the
      * commit deploy.sh installed and verified (verify-live-stamp.sh compares
-     * it with a ref, no credentials needed). Pinned by
+     * it with a ref, no credentials needed). 'registration' is
+     * REGISTRATION-STAGE1.md §12's object: counts and switches, never an
+     * identity hash, token, key or browser row. Pinned by
      * tests/health_allowlist_test.php.
      */
     private function healthBody(): array
@@ -1125,6 +1141,7 @@ final class HttpApi
             'build' => BuildStamp::read($this->buildStampDir),
             'queues' => $this->storage->healthSummary(),
             'php_interface_registry' => $this->storage->healthInterfaceRegistry(5),
+            'registration' => $this->storage->registrationHealth(),
         ];
     }
 
@@ -1240,44 +1257,28 @@ final class HttpApi
                 ]);
             }
 
+            // REGISTRATION-STAGE1.md §3: stateless, and no-store, since a
+            // cached challenge would turn into two 409s. The browser POSTs;
+            // GET is for operators.
+            if (($method === 'POST' || $method === 'GET') && $path === '/v1/interfaces/challenge') {
+                header('Cache-Control: no-store');
+                $this->respond(200, $this->storage->issueChallenge($this->challengeRequest($method, $uri), $method === 'POST'));
+            }
+
+            // REGISTRATION-STAGE1.md §4: signed or legacy, by the body. Never
+            // 401, never session_superseded (§7).
             if ($method === 'POST' && $path === '/v1/interfaces/register') {
-                $body = $this->readJsonBody();
-                $name = $this->requireNonEmptyString($body, 'name');
-                $bitrate = $this->requirePositiveInt($body, 'bitrate');
-                $mtu = $this->requirePositiveInt($body, 'mtu');
-                $metadata = $this->optionalArray($body, 'metadata');
-                $isPhpPeer = ($metadata['client'] ?? null) === 'reticulum-php';
-
-                if (!$isPhpPeer) {
-                    try {
-                        $maxPacketBytes = $this->storage->maxPacketBytesForMetadata($metadata);
-                    } catch (RuntimeException $error) {
-                        throw new ApiError(400, $error->getMessage(), ['error' => $error->getMessage()]);
-                    }
-                } else {
-                    $maxPacketBytes = $this->storage->maxPacketBytesForMetadata($metadata);
+                try {
+                    $body = $this->readJsonBody();
+                } catch (ApiError $error) {
+                    $code = (string) ($error->payload['error'] ?? 'invalid json');
+                    error_log(sprintf('[REG-REFUSED] %d %s client=-', $error->statusCode, RegistrationProtocol::logValue($code)));
+                    throw $error;
                 }
-
-                $registration = $this->storage->registerInterface($name, $bitrate, $mtu, $metadata);
+                $answer = $this->storage->registerFromBody($body);
                 // A re-registration can give an existing interface a new token.
-                EmptyPoll::clear($this->config, (string) $registration['interface_id']);
-                $response = [
-                    'status' => 'registered',
-                    'interface_id' => $registration['interface_id'],
-                    'session_token' => $registration['session_token'],
-                    'idle_exchange_interval_ms' => $this->idleExchangeIntervalMs(),
-                    'max_batch_packets' => (int) $this->config['http']['max_batch_packets'],
-                    'max_packet_bytes' => $maxPacketBytes,
-                ];
-
-                if (isset($registration['peer_interface_id'])) {
-                    $response['peer_interface_id'] = $registration['peer_interface_id'];
-                }
-                if (isset($registration['peer_session_token'])) {
-                    $response['peer_session_token'] = $registration['peer_session_token'];
-                }
-
-                $this->respond(200, $response);
+                EmptyPoll::clear($this->config, (string) $answer['interface_id']);
+                $this->respond(200, $answer);
             }
 
             if ($method === 'POST' && $path === '/v1/interfaces/goodbye') {
@@ -1410,10 +1411,15 @@ final class HttpApi
             if ($payload === []) {
                 $payload = ['error' => $error->getMessage()];
             }
+            // REGISTRATION-STAGE1.md §10: every 4xx and 5xx body that carries
+            // an error is {"error": "<code>", "message": "<one line>"}.
+            if (isset($payload['error']) && !isset($payload['message'])) {
+                $payload['message'] = $error->getMessage();
+            }
             $this->respond($error->statusCode, $payload);
         } catch (\Throwable $error) {
             $this->log('error', 'Unhandled HTTP exception: ' . $error->getMessage());
-            $this->respond(500, ['error' => 'internal error']);
+            $this->respond(500, ['error' => 'internal error', 'message' => 'The PHP node failed to answer this request.']);
         }
     }
 }
@@ -1596,7 +1602,7 @@ if (realpath($_SERVER['SCRIPT_FILENAME'] ?? '') === __FILE__) {
         header('Access-Control-Allow-Origin: *');
         header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
         header('Access-Control-Allow-Headers: Content-Type, X-Interface-Id, X-Session-Token');
-        echo json_encode(['error' => 'internal error'], JSON_THROW_ON_ERROR);
+        echo json_encode(['error' => 'internal error', 'message' => 'The PHP node failed to answer this request.'], JSON_THROW_ON_ERROR);
         exit;
     }
 }

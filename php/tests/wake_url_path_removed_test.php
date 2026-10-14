@@ -23,7 +23,9 @@
  * (a) registration strips metadata.wake_url on all three of
  *     registerInterface()'s paths (new row, identity re-bind, PHP-peer
  *     re-bind), says [REG-WAKE-URL-IGNORED] once per registration, and still
- *     stores what the live peering needs (peer_url and its credentials);
+ *     stores what the live peering needs (peer_url and its credentials).
+ *     Since Stage 1 the identity re-bind is a legacy browser's, by its
+ *     claimed_identity_hash (REGISTRATION-STAGE1.md §4.6);
  * (b) packets queued for such a row leave no wake_events row, and the request
  *     epilogue starts no process and connects to nothing but the PHP peer's
  *     own peer_url (the live wake, which must keep working);
@@ -179,6 +181,15 @@ function storedMetadata(\PDO $pdo, string $interfaceId): array
     return \is_array($decoded) ? $decoded : [];
 }
 
+/** A legacy browser row's claim: its own column since Stage 1 (REGISTRATION-STAGE1.md §4.6). */
+function storedClaim(\PDO $pdo, string $interfaceId): ?string
+{
+    $stmt = $pdo->prepare('SELECT claimed_identity_hash FROM interfaces WHERE interface_id = :i');
+    $stmt->execute([':i' => $interfaceId]);
+    $claim = $stmt->fetchColumn();
+    return \is_string($claim) ? $claim : null;
+}
+
 /** A path request a browser sends for a destination nobody has a path to. */
 function pathRequestBase64(): string
 {
@@ -217,9 +228,12 @@ $browser = $storage->registerInterface('Retichat Web', 1000000, 500, [
 ]);
 check('an ordinary registration logs nothing', $ignoredLines() === 0, (string) $ignoredLines());
 
+// A legacy browser: since Stage 1 only a browser row re-binds by its claim
+// (REGISTRATION-STAGE1.md §4.6), so it is the registrant that takes the
+// identity re-bind path.
 $identity = \bin2hex(\random_bytes(16));
 $registrantMetadata = [
-    'client' => 'rns-post-interface', 'implementation' => 'PostInterface', 'mode' => 6,
+    'client' => 'rns-js', 'implementation' => 'PostInterface', 'mode' => 1,
     'identity_hash' => $identity, 'wake_url' => $trapUrl,
 ];
 $registrant = $storage->registerInterface('Wake URL registrant', 1000000, 500, $registrantMetadata);
@@ -227,13 +241,15 @@ check('a registration carrying wake_url is still registered',
     \is_string($registrant['interface_id'] ?? null) && \is_string($registrant['session_token'] ?? null));
 $stored = storedMetadata($pdo, $registrant['interface_id']);
 check('its row stores no wake_url', !\array_key_exists('wake_url', $stored), (string) \json_encode($stored));
-check('and keeps the rest of its metadata', ($stored['client'] ?? null) === 'rns-post-interface'
-    && ($stored['identity_hash'] ?? null) === $identity, (string) \json_encode($stored));
+check('and keeps the rest of its metadata, the claim in claimed_identity_hash',
+    ($stored['client'] ?? null) === 'rns-js' && ($stored['mode'] ?? null) === 1
+        && storedClaim($pdo, $registrant['interface_id']) === $identity, (string) \json_encode($stored));
 check('[REG-WAKE-URL-IGNORED] is logged once for it', $ignoredLines() === 1, (string) $ignoredLines());
 check('the log line does not carry the URL', !\str_contains((string) @\file_get_contents($errorLog), $trapUrl));
 
 $rebound = $storage->registerInterface('Wake URL registrant', 1000000, 500, $registrantMetadata);
-check('re-binding by identity_hash keeps the same row', ($rebound['interface_id'] ?? null) === $registrant['interface_id']);
+check('re-binding by its claim keeps the same row', ($rebound['interface_id'] ?? null) === $registrant['interface_id']
+    && storedClaim($pdo, $registrant['interface_id']) === $identity);
 check('and still stores no wake_url', !\array_key_exists('wake_url', storedMetadata($pdo, $registrant['interface_id'])));
 check('and logs once more, once per registration', $ignoredLines() === 2, (string) $ignoredLines());
 

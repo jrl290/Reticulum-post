@@ -28,6 +28,11 @@
  *   OPNS-RNS-Post-Bridge/rnsd-redeploy.sh + RNSD_REDEPLOY.md, the storage
  *   budget notes (queues.storage_*), and verify-live-stamp.sh (build.commit).
  *
+ * Stage 1 (REGISTRATION-STAGE1.md §12) adds one object, `registration`, with
+ * exactly version, schema_migrated, enforce_signed_registration,
+ * browsers_online {signed, legacy} and hash_only_challenges, and still no
+ * identity hash, token, key or browser row, a signed browser's included (e).
+ *
  * Run: php tests/health_allowlist_test.php
  */
 declare(strict_types=1);
@@ -177,8 +182,8 @@ foreach ($rows as $row) {
 }
 $topKeys = array_keys($decoded);
 sort($topKeys);
-check('top level is status, transport_basis, environment, build, queues, php_interface_registry',
-    $topKeys === ['build', 'environment', 'php_interface_registry', 'queues', 'status', 'transport_basis'], implode(',', $topKeys));
+check('top level is status, transport_basis, environment, build, queues, php_interface_registry, registration',
+    $topKeys === ['build', 'environment', 'php_interface_registry', 'queues', 'registration', 'status', 'transport_basis'], implode(',', $topKeys));
 check('build is exactly commit and stamped_at (tests/build_stamp_test.php covers the stamp)',
     array_keys($decoded['build'] ?? []) === ['commit', 'stamped_at'], json_encode($decoded['build'] ?? null));
 
@@ -235,6 +240,46 @@ check('monitor rows keep name, status, rx/tx, last_seen_at, interface_id',
 $debugJson = json_encode($storage->debugReport(20), JSON_THROW_ON_ERROR);
 foreach ($secrets as $what => $value) {
     check("/debug omits the $what", !str_contains($debugJson, $value));
+}
+
+// ── (e) Stage 1's registration object ───────────────────────────────────
+echo "(e) registration: exactly §12's fields, and no identity, token, key or browser row\n";
+require_once __DIR__ . '/stubs/registration_fixture.php';
+$registration = $decoded['registration'] ?? null;
+check('registration is exactly version, schema_migrated, enforce_signed_registration, browsers_online, hash_only_challenges',
+    is_array($registration) && array_keys($registration) === ['version', 'schema_migrated', 'enforce_signed_registration', 'browsers_online', 'hash_only_challenges'],
+    json_encode($registration));
+check('version 1, the schema migrated, the switch off as loaded',
+    ($registration['version'] ?? null) === 1 && ($registration['schema_migrated'] ?? null) === true
+    && ($registration['enforce_signed_registration'] ?? null) === false, json_encode($registration));
+check('browsers_online is exactly signed and legacy: no signed row yet, the 9 online legacy browsers with a claim',
+    ($registration['browsers_online'] ?? null) === ['signed' => 0, 'legacy' => 9], json_encode($registration['browsers_online'] ?? null));
+check('hash_only_challenges starts at 0', ($registration['hash_only_challenges'] ?? null) === 0);
+
+$signer = RegFixture::identity();
+[$signedAnswer, $signedToken] = RegFixture::connect($storage, $signer);
+$storage->issueChallenge(['identity_hash' => $hex(16)]);                 // POST by hash: counted
+$storage->issueChallenge(['identity_hash' => $hex(16)], false);          // GET by hash: not counted
+$storage->issueChallenge(['public_key' => $signer['public_key_hex']]);   // by key: not counted
+$signedJson = json_encode(call(new HttpApi($config, $storage), 'healthBody'), JSON_THROW_ON_ERROR);
+$after = json_decode($signedJson, true, flags: JSON_THROW_ON_ERROR)['registration'] ?? [];
+check('a signed browser is counted, not listed', ($after['browsers_online'] ?? null) === ['signed' => 1, 'legacy' => 9], json_encode($after));
+check('hash_only_challenges counts the POST by identity_hash only', ($after['hash_only_challenges'] ?? null) === 1, json_encode($after));
+$signedSecrets = $secrets + [
+    'signed identity hash' => $signer['hash_hex'],
+    'signed public key' => $signer['public_key_hex'],
+    'signed interface_id' => (string) ($signedAnswer['interface_id'] ?? '-'),
+    'signed session token' => $signedToken !== '' ? $signedToken : '-',
+    'signed encrypted token' => (string) ($signedAnswer['session_token_encrypted'] ?? '-'),
+    'node secret' => bin2hex(RegFixture::secret($storage)),
+];
+foreach ($signedSecrets as $what => $value) {
+    check("/health omits the $what", !str_contains($signedJson, $value));
+}
+check('/health still has no row with client rns-js', !str_contains($signedJson, '"rns-js"'));
+foreach (['signed identity hash', 'signed public key', 'signed session token', 'node secret'] as $what) {
+    check("monitor and /debug omit the $what", !str_contains(json_encode($storage->monitorData(), JSON_THROW_ON_ERROR), $signedSecrets[$what])
+        && !str_contains(json_encode($storage->debugReport(20), JSON_THROW_ON_ERROR), $signedSecrets[$what]));
 }
 
 echo "\n$pass passed, $fail failed\n";
