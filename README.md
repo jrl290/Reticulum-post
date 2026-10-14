@@ -191,9 +191,16 @@ live database: `php ~/reticulum-incoming/index.php migrate --project-root
 <live directory>` (REGISTRATION-STAGE1.md §13). It prints each object it builds
 and how long that took, records no schema version (the new code's first
 request does), and ignores a hang-up, since a dropped connection would roll an
-index build back. If it fails on any node, nothing is swapped anywhere; the
-code that is live keeps serving and ignores the new objects. A ref whose
-`index.php` has no migrate mode (any before Stage 1) skips the step.
+index build back. On MySQL and MariaDB each statement waits at most 2 s for its
+table's lock (`lock_wait_timeout`, a day by default), so a busy table cannot
+queue the live node's requests behind it for long, and asks for the online
+algorithm (`ALGORITHM=INSTANT` to add columns, `ALGORITHM=INPLACE LOCK=NONE`
+for an index), so a server that cannot do one refuses at once instead of
+copying or locking the table. A statement that waits out the 2 s is not tried
+again: the step stops and fails, saying so, and the deploy can be run again.
+If it fails on any node, nothing is swapped anywhere; the code that is live
+keeps serving and ignores the new objects. A ref whose `index.php` has no
+migrate mode (any before Stage 1) skips the step.
 `php/tests/deploy_never_mixes_releases_test.php` runs `deploy.sh` against two
 stand-in nodes to hold all of this.
 

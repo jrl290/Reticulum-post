@@ -35,7 +35,7 @@ require_once $root . '/src/index.php';
 // every database that recorded the old version migrates again; then pin the
 // new pair here.
 const PINNED_SCHEMA_VERSION = 'stage1-1';
-const PINNED_SCHEMA_TRAIT_MASKED_SHA1 = 'bbf57ccac703771695c0cbf3414f389fb022a163';
+const PINNED_SCHEMA_TRAIT_MASKED_SHA1 = '353234e5443ff8a14ce66bbadde7e83b8327ddf2';
 
 $dir = sys_get_temp_dir() . '/reticulum-php-marker-test-' . bin2hex(random_bytes(4));
 mkdir($dir, 0775, true);

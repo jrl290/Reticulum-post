@@ -1544,28 +1544,47 @@ function runIndexMigrate(string $projectRoot, array $args): int
     }
 
     $reticulumPhpConfig = loadRuntimeConfig($projectRoot);
-    $reticulumPhpStorage = new Storage($reticulumPhpConfig);
+
+    return runIndexMigrateOn(new Storage($reticulumPhpConfig), STDOUT, STDERR);
+}
+
+/**
+ * runIndexMigrate()'s migration and its report, on $storage, to $out and
+ * $err (a test passes a Storage on a recording connection, and memory
+ * streams). A statement that waited out migrate()'s 2 s lock wait ceiling
+ * adds a line saying so: the live node keeps its code, and the deploy can
+ * be run again.
+ *
+ * @param resource $out
+ * @param resource $err
+ */
+function runIndexMigrateOn(Storage $storage, $out, $err): int
+{
     $startedAt = microtime(true);
-    $summary = $reticulumPhpStorage->migrate();
+    $summary = $storage->migrate();
     $elapsedMs = (microtime(true) - $startedAt) * 1000;
     foreach ($summary['built'] as $built) {
-        fwrite(STDOUT, sprintf("built %s in %.1f ms\n", $built['object'], $built['ms']));
+        fwrite($out, sprintf("built %s in %.1f ms\n", $built['object'], $built['ms']));
     }
     if (($summary['claims_backfilled'] ?? 0) > 0) {
-        fwrite(STDOUT, sprintf("backfilled claimed_identity_hash on %d row(s)\n", $summary['claims_backfilled']));
+        fwrite($out, sprintf("backfilled claimed_identity_hash on %d row(s)\n", $summary['claims_backfilled']));
     }
     if ($summary['errors'] !== []) {
         foreach ($summary['errors'] as $error) {
-            fwrite(STDERR, "migrate error: {$error}\n");
+            fwrite($err, "migrate error: {$error}\n");
         }
-        fwrite(STDERR, "migrate: FAILED with " . count($summary['errors']) . " error(s); no version recorded\n");
+        fwrite($err, "migrate: FAILED with " . count($summary['errors']) . " error(s); no version recorded\n");
+        if (isset($summary['lock_wait_timeout'])) {
+            fwrite($err, "migrate: stopped at {$summary['lock_wait_timeout']}, which waited 2 s for its table's lock and gave up;"
+                . " the live node keeps its code, and the deploy can be run again\n");
+        }
         return 1;
     }
-    if (!$reticulumPhpStorage->schemaObjectsPresent()) {
-        fwrite(STDERR, "migrate: FAILED the schema probe (a new column of interfaces, or the UNIQUE index idx_interfaces_identity_hash, is missing); no version recorded\n");
+    if (!$storage->schemaObjectsPresent()) {
+        fwrite($err, "migrate: FAILED the schema probe (a new column of interfaces, or the UNIQUE index idx_interfaces_identity_hash, is missing); no version recorded\n");
         return 1;
     }
-    fwrite(STDOUT, sprintf("migrate: ok, %d object(s) built in %.1f ms, probe passed; no version recorded\n", count($summary['built']), $elapsedMs));
+    fwrite($out, sprintf("migrate: ok, %d object(s) built in %.1f ms, probe passed; no version recorded\n", count($summary['built']), $elapsedMs));
 
     return 0;
 }

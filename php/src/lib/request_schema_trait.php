@@ -17,7 +17,8 @@ use PDOException;
  *   3. CREATE INDEX for deadlock-prevention covering indexes
  *
  * Every step is wrapped in try/catch so a partially-migrated database
- * doesn't block the rest of the migration.
+ * doesn't block the rest of the migration, except a statement that waits
+ * out the lock wait ceiling, which stops it (migrate()).
  */
 
 trait RequestSchemaTrait
@@ -83,10 +84,10 @@ trait RequestSchemaTrait
         }
     }
 
+    /** After a clean migrate(), which built schema_meta: no DDL here. */
     private function recordSchemaFingerprint(string $fingerprint): void
     {
         try {
-            $this->db->exec('CREATE TABLE IF NOT EXISTS schema_meta (meta_key VARCHAR(32) NOT NULL, fingerprint VARCHAR(64) NOT NULL, applied_at INT NOT NULL, PRIMARY KEY (meta_key))');
             $sql = $this->backend === 'mysql'
                 ? 'INSERT INTO schema_meta (meta_key, fingerprint, applied_at) VALUES (:k, :f, :t) ON DUPLICATE KEY UPDATE fingerprint = VALUES(fingerprint), applied_at = VALUES(applied_at)'
                 : 'INSERT INTO schema_meta (meta_key, fingerprint, applied_at) VALUES (:k, :f, :t) ON CONFLICT(meta_key) DO UPDATE SET fingerprint = excluded.fingerprint, applied_at = excluded.applied_at';
@@ -104,6 +105,19 @@ trait RequestSchemaTrait
      * Build every missing object, idempotently. 'built' lists each table,
      * column and index this run created, with how long it took, for the
      * deploy step that runs this before the swap (index.php migrate).
+     *
+     * On MySQL and MariaDB every DDL statement runs with the session's
+     * lock_wait_timeout at 2 s, read first and put back after, since a
+     * request's connection gets here too (migrateIfNeeded(), and
+     * /v1/initialize). The servers' default is a day. A DDL statement
+     * waiting for its table's exclusive metadata lock queues every later
+     * statement on that table behind it, so an ALTER waiting behind a DML
+     * statement in its 50 s row lock wait would hang the live node's
+     * registrations, exchanges and polls that long. Each statement is issued
+     * once, never through executeWithRetry, and the first that waits out the
+     * 2 s (1205) stops the migration: 'lock_wait_timeout' names it, it is
+     * among the errors, so no version is recorded, and `index.php migrate`
+     * exits non-zero, so deploy.sh stops before the swap.
      */
     public function migrate(): array
     {
@@ -115,14 +129,88 @@ trait RequestSchemaTrait
             'errors'         => [],
         ];
 
-        $this->ensureTables($summary);
-        $this->ensureColumns($summary);
-        $this->ensureColumnTypes($summary);
-        $this->ensurePrimaryKeys($summary);
-        $this->ensureIndexes($summary);
-        $this->backfillClaimedIdentityHashes($summary);
+        $ceiling = $this->underDdlLockCeiling($summary, function () use (&$summary): void {
+            $steps = [
+                $this->ensureTables(...),
+                $this->ensureColumns(...),
+                $this->ensureColumnTypes(...),
+                $this->ensurePrimaryKeys(...),
+                $this->ensureIndexes(...),
+            ];
+            foreach ($steps as $step) {
+                if (isset($summary['lock_wait_timeout'])) {
+                    break;
+                }
+                $step($summary);
+            }
+        });
+        if ($ceiling && !isset($summary['lock_wait_timeout'])) {
+            $this->backfillClaimedIdentityHashes($summary);
+        }
 
         return $summary;
+    }
+
+    /**
+     * Run $ddl, on MySQL and MariaDB with the session's lock_wait_timeout at
+     * 2 s, and put the value it had back after, also when $ddl throws. When
+     * that value cannot be read or set, $ddl does not run: false, with the
+     * reason in $summary['errors']. SQLite has no metadata locks; its
+     * busy_timeout bounds a wait for the file.
+     */
+    private function underDdlLockCeiling(array &$summary, callable $ddl): bool
+    {
+        if ($this->backend !== 'mysql') {
+            $ddl();
+
+            return true;
+        }
+        try {
+            $read = $this->db->query('SELECT @@SESSION.lock_wait_timeout');
+            $previous = $read === false ? false : $read->fetchColumn();
+            if ($read !== false) {
+                $read->closeCursor();
+            }
+            if (!is_numeric($previous) || (int) $previous < 1) {
+                $summary['errors'][] = 'lock_wait_timeout: could not read the session value';
+
+                return false;
+            }
+            $previous = (int) $previous;
+            $this->db->exec('SET SESSION lock_wait_timeout = 2');
+        } catch (PDOException $e) {
+            $summary['errors'][] = 'lock_wait_timeout: ' . $e->getMessage();
+
+            return false;
+        }
+        try {
+            $ddl();
+        } finally {
+            try {
+                $this->db->exec('SET SESSION lock_wait_timeout = ' . $previous);
+            } catch (PDOException $e) {
+                $summary['errors'][] = "lock_wait_timeout: could not put back {$previous}: " . $e->getMessage();
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * True when $e is a DDL statement that waited out the 2 s for its
+     * table's metadata lock (1205), after recording it as $what in the
+     * errors and as 'lock_wait_timeout': its caller issues nothing more, and
+     * migrate() stops.
+     */
+    private static function lockWaitTimedOut(array &$summary, PDOException $e, string $what): bool
+    {
+        if ((int) ($e->errorInfo[1] ?? 0) !== 1205) {
+            return false;
+        }
+        $summary['errors'][] = "{$what}: " . $e->getMessage();
+        $summary['lock_wait_timeout'] = $what;
+
+        return true;
     }
 
     /** One object this run built, for $summary['built']. */
@@ -358,6 +446,17 @@ trait RequestSchemaTrait
                     updated_at INT NOT NULL DEFAULT 0,
                     PRIMARY KEY (state_key)
                 ){$engine}",
+
+            // migrateIfNeeded()'s version, recorded after a clean run. Built
+            // here, not when the version is recorded, so that every DDL
+            // statement runs under migrate()'s lock wait ceiling.
+            'schema_meta' => "
+                CREATE TABLE IF NOT EXISTS schema_meta (
+                    meta_key VARCHAR(32) NOT NULL,
+                    fingerprint VARCHAR(64) NOT NULL,
+                    applied_at INT NOT NULL,
+                    PRIMARY KEY (meta_key)
+                ){$engine}",
         ];
 
         $existingTables = $this->existingTables();
@@ -370,6 +469,9 @@ trait RequestSchemaTrait
                     self::noteBuilt($summary, 'table ' . $name, $startedAt);
                 }
             } catch (PDOException $e) {
+                if (self::lockWaitTimedOut($summary, $e, "create_table {$name}")) {
+                    return;
+                }
                 $code = (int) ($e->errorInfo[1] ?? 0);
                 if ($code !== 1050 && !str_contains($e->getMessage(), 'already exists')) {
                     $summary['errors'][] = "create_table {$name}: " . $e->getMessage();
@@ -409,10 +511,15 @@ trait RequestSchemaTrait
             ['interfaces', 'refusal_logged_seq', 'BIGINT NOT NULL DEFAULT -1', null],
         ];
 
-        // Ask each table for its columns once instead of issuing an ALTER per
-        // column and catching "duplicate column"; on SQLite the MySQL-only
-        // AFTER clause was also a syntax error that counted as a failure.
+        // Ask each table for its columns once and add only the missing ones,
+        // so a re-run takes no lock; on SQLite the MySQL-only AFTER clause
+        // was also a syntax error that counted as a failure. On MySQL and
+        // MariaDB one ALTER adds a table's missing columns, so it takes one
+        // metadata lock, not one per column, and asks for ALGORITHM=INSTANT,
+        // so a server that cannot add them in place refuses at once instead
+        // of copying the table. SQLite adds one column per statement.
         $existing = [];
+        $missing = [];
         foreach ($additions as [$table, $column, $definition, $after]) {
             if (!isset($existing[$table])) {
                 $existing[$table] = $this->existingColumns($table);
@@ -420,22 +527,42 @@ trait RequestSchemaTrait
             if (isset($existing[$table][$column])) {
                 continue;
             }
-            try {
-                $sql = "ALTER TABLE `{$table}` ADD COLUMN `{$column}` {$definition}";
-                if ($this->backend === 'mysql' && $after !== null && $after !== '') {
-                    $sql .= " AFTER `{$after}`";
+            $clause = "ADD COLUMN `{$column}` {$definition}";
+            if ($this->backend === 'mysql' && $after !== null && $after !== '') {
+                $clause .= " AFTER `{$after}`";
+            }
+            $missing[$table][$column] = $clause;
+        }
+
+        foreach ($missing as $table => $clauses) {
+            $statements = [];
+            if ($this->backend === 'mysql') {
+                $statements[] = [array_keys($clauses), "ALTER TABLE `{$table}` " . implode(', ', $clauses) . ', ALGORITHM=INSTANT'];
+            } else {
+                foreach ($clauses as $column => $clause) {
+                    $statements[] = [[$column], "ALTER TABLE `{$table}` {$clause}"];
                 }
-                $startedAt = microtime(true);
-                $this->db->exec($sql);
-                $existing[$table][$column] = true;
-                $summary['columns_added']++;
-                self::noteBuilt($summary, "column {$table}.{$column}", $startedAt);
-            } catch (PDOException $e) {
-                $code = (int) ($e->errorInfo[1] ?? 0);
-                // 1060 = MySQL duplicate column; SQLite reports the same
-                // condition as "duplicate column name" with code 1.
-                if ($code !== 1060 && $code !== 1146 && !str_contains($e->getMessage(), 'duplicate column name')) {
-                    $summary['errors'][] = "add_column {$table}.{$column}: " . $e->getMessage();
+            }
+            foreach ($statements as [$columns, $sql]) {
+                $what = "add_column {$table}." . implode(', ', $columns);
+                try {
+                    $startedAt = microtime(true);
+                    $this->db->exec($sql);
+                    $summary['columns_added'] += count($columns);
+                    self::noteBuilt($summary, (count($columns) === 1 ? 'column ' : 'columns ') . "{$table}." . implode(', ', $columns), $startedAt);
+                } catch (PDOException $e) {
+                    if (self::lockWaitTimedOut($summary, $e, $what)) {
+                        return;
+                    }
+                    $code = (int) ($e->errorInfo[1] ?? 0);
+                    // 1060 = MySQL duplicate column; SQLite reports the same
+                    // condition as "duplicate column name" with code 1. An
+                    // ALTER adds all its columns or none, so that is
+                    // harmless only when every one of them is there now.
+                    $duplicate = $code === 1060 || str_contains($e->getMessage(), 'duplicate column name');
+                    if ($code !== 1146 && !($duplicate && array_diff($columns, array_keys($this->existingColumns($table))) === [])) {
+                        $summary['errors'][] = "{$what}: " . $e->getMessage();
+                    }
                 }
             }
         }
@@ -509,6 +636,9 @@ trait RequestSchemaTrait
                     $this->db->exec("ALTER TABLE `{$table}` MODIFY `{$column}` BIGINT NOT NULL DEFAULT 0");
                     $summary['columns_widened'] = ($summary['columns_widened'] ?? 0) + 1;
                 } catch (PDOException $e) {
+                    if (self::lockWaitTimedOut($summary, $e, "widen_column {$table}.{$column}")) {
+                        return;
+                    }
                     $summary['errors'][] = "widen_column {$table}.{$column}: " . $e->getMessage();
                 }
             }
@@ -556,6 +686,9 @@ trait RequestSchemaTrait
             );
             $summary['indexes_added']++;
         } catch (PDOException $e) {
+            if (self::lockWaitTimedOut($summary, $e, 'primary_key link_transport_entries')) {
+                return;
+            }
             $code = (int) ($e->errorInfo[1] ?? 0);
             if ($code !== 1146) {
                 $summary['errors'][] = 'primary_key link_transport_entries: ' . $e->getMessage();
@@ -710,6 +843,10 @@ trait RequestSchemaTrait
         }
         $existing = $this->existingIndexes(array_keys($tables));
 
+        // MySQL and MariaDB are asked to build each one in place while the
+        // table takes writes, so a server that cannot refuses at once instead
+        // of copying or locking the table.
+        $online = $this->backend === 'mysql' ? ' ALGORITHM=INPLACE LOCK=NONE' : '';
         foreach ($indexes as $sql) {
             $name = preg_match('/\ACREATE (?:UNIQUE )?INDEX (\w+) ON (\w+) /', $sql, $m) === 1 ? $m[1] : $sql;
             if ($existing !== null && isset($m[2]) && isset($existing[$m[2] . '.' . $name])) {
@@ -717,14 +854,17 @@ trait RequestSchemaTrait
             }
             try {
                 $startedAt = microtime(true);
-                $this->db->exec($sql);
+                $this->db->exec($sql . $online);
                 $summary['indexes_added']++;
                 self::noteBuilt($summary, 'index ' . $name, $startedAt);
             } catch (PDOException $e) {
+                if (self::lockWaitTimedOut($summary, $e, "create_index {$name}")) {
+                    return;
+                }
                 $code = (int) ($e->errorInfo[1] ?? 0);
                 if (!in_array($code, [1061, 1072, 1146], true)
                     && !str_contains($e->getMessage(), 'already exists')) {
-                    $summary['errors'][] = "create_index: " . $e->getMessage();
+                    $summary['errors'][] = "create_index {$name}: " . $e->getMessage();
                 }
             }
         }
