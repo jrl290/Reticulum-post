@@ -50,7 +50,19 @@
  *       whatever RETIRED lists, nothing included;
  *   (k) the guards: the shims refuse a host outside .invalid and a password
  *       other than the fake one, and the wrapper refuses a deploy.env that
- *       names a real host or lies outside the sandbox.
+ *       names a real host or lies outside the sandbox;
+ *   (l) the schema before the swap (REGISTRATION-STAGE1.md §13): (a) runs
+ *       `php ~/reticulum-incoming/index.php migrate --project-root <live>` on
+ *       every node after both linted and before any swap; one that fails
+ *       stops the deploy with nothing swapped, stamps and rollback copies
+ *       unchanged;
+ *   (m) a ref whose index.php has no migrate mode (before Stage 1) skips that
+ *       step; a ref that does not descend from the commit a node's stamp
+ *       names (that one, or one not in the repository) is refused before
+ *       anything is uploaded, unless DEPLOY_ROLLBACK=1, which the deploy log
+ *       records;
+ *   (n) a stamp that names no commit stops the deploy before anything is
+ *       uploaded, unless DEPLOY_ROLLBACK=1.
  *
  * Run: php tests/deploy_never_mixes_releases_test.php
  * Against another deploy.sh (to see what it would fail):
@@ -517,6 +529,28 @@ if [[ $# -eq 2 && "$1" == "-l" ]]; then
   printf '%s\n' "$out"
   exit $rc
 fi
+# `php <index.php> migrate --project-root <dir>`: the schema step before the
+# swap, logged with where it ran and what the stamp said then. The node's
+# config is the test's, so nothing is migrated: the stand-in answers as
+# index.php's migrate mode does (tests/schema_migration_marker_test.php runs
+# the real one), and as an index.php without it does.
+# STUB_MIGRATE_FAIL_NODE=<node> fails it on that node.
+if [[ $# -eq 4 && "$2" == "migrate" && "$3" == "--project-root" ]]; then
+  . "$STUB_LIB"
+  printf 'MIGRATE\t%s\t%s\t%s\t%s\t%s\n' "${STUB_OP:-?}" "${STUB_NODE:-?}" "$(abs_path "$1")" "$4" "$(stamp "$HOME")" >> "$STUB_LOG"
+  if ! grep -qF 'function runIndexMigrate(' "$1" 2>/dev/null; then
+    echo "Unsupported index mode: migrate" >&2
+    exit 1
+  fi
+  if [[ -n "${STUB_MIGRATE_FAIL_NODE:-}" && "$STUB_MIGRATE_FAIL_NODE" == "${STUB_NODE:-}" ]]; then
+    echo "migrate error: create_index: stand-in: Duplicate key name 'idx_interfaces_identity_hash'" >&2
+    echo "migrate: FAILED with 1 error(s); no version recorded" >&2
+    exit 1
+  fi
+  echo "built index idx_stand_in in 0.1 ms"
+  echo "migrate: ok, 1 object(s) built in 0.1 ms, probe passed; no version recorded"
+  exit 0
+fi
 exec "$STUB_REAL_PHP" "$@"
 SH,
     $wrapper => <<<'SH'
@@ -588,9 +622,9 @@ $isolated = static function (string $command, array $extraEnv = []) use ($baseEn
     return sh($prefix . ' ' . $command . ' < /dev/null');
 };
 
-/** @return array{ops: list<array>, mvs: list<array>, rms: list<array>, lints: list<array>, refused: list<string>} */
+/** @return array{ops: list<array>, mvs: list<array>, rms: list<array>, lints: list<array>, migrates: list<array>, refused: list<string>} */
 $readLog = static function () use ($stubLog): array {
-    $log = ['ops' => [], 'mvs' => [], 'rms' => [], 'lints' => [], 'refused' => []];
+    $log = ['ops' => [], 'mvs' => [], 'rms' => [], 'lints' => [], 'migrates' => [], 'refused' => []];
     foreach (is_file($stubLog) ? file($stubLog, FILE_IGNORE_NEW_LINES) : [] as $line) {
         $f = explode("\t", $line);
         switch ($f[0]) {
@@ -606,6 +640,9 @@ $readLog = static function () use ($stubLog): array {
                 break;
             case 'LINT':
                 $log['lints'][] = ['op' => (int) $f[1], 'node' => $f[2], 'pwd' => $f[3], 'file' => $f[4], 'result' => $f[5]];
+                break;
+            case 'MIGRATE':
+                $log['migrates'][] = ['op' => (int) $f[1], 'node' => $f[2], 'script' => normPath($f[3]), 'root' => $f[4], 'stamp' => $f[5]];
                 break;
             case 'REFUSED':
                 $log['refused'][] = $line;
@@ -760,6 +797,25 @@ check('nothing went live on any node until both had linted the ref in ~/reticulu
     count($incomingLintOps) === count($nodes) && $firstLive !== null
     && max(array_merge(...array_values(array_map('array_values', $incomingLintOps)))) < $firstLive,
     'first live change: #' . ($firstLive ?? '-') . ', incoming lints: ' . json_encode(array_map('array_values', $incomingLintOps)));
+
+// §13: each node's stamp was read before anything was uploaded, and the
+// schema step ran on each, the release's index.php against the live
+// directory, after both nodes had linted the ref and before anything went live.
+$firstUpload = min(array_column(array_filter($log['ops'], static fn (array $o): bool => $o['kind'] === 'scp'), 'op') ?: [PHP_INT_MAX]);
+$stampReads = array_values(array_filter($log['ops'], static fn (array $o): bool => $o['kind'] === 'ssh' && str_contains($o['detail'], 'stamp-read')));
+check('each node\'s stamp was read, to check the ref carries what it runs, before anything was uploaded',
+    count($stampReads) === count($nodes) && max(array_column($stampReads, 'op') ?: [PHP_INT_MAX]) < $firstUpload, $describeOps($stampReads));
+$lastIncomingLint = max(array_merge(...array_values(array_map('array_values', $incomingLintOps))) ?: [PHP_INT_MAX]);
+foreach ($nodes as $name => $home) {
+    $migrates = array_values(array_filter($log['migrates'], static fn (array $m): bool => $m['node'] === $name));
+    check("$name: the schema step ran once, the release's index.php against the live directory",
+        count($migrates) === 1 && $migrates[0]['script'] === "$home/reticulum-incoming/index.php"
+        && $migrates[0]['root'] === "$home/public_html/reticulum", json_encode($migrates));
+    check("$name: ...after both nodes had linted the ref and before anything went live, the old stamp still in place",
+        count($migrates) === 1 && $migrates[0]['op'] > $lastIncomingLint && $firstLive !== null && $migrates[0]['op'] < $firstLive
+        && $migrates[0]['stamp'] === $oldStampJson, json_encode($migrates) . ', first live change #' . ($firstLive ?? '-'));
+}
+check('the deploy printed what the schema step built, and how long it took', str_contains($out, 'built index idx_stand_in in 0.1 ms'), $out);
 
 foreach ($nodes as $name => $home) {
     $live = "$home/public_html/reticulum";
@@ -1006,6 +1062,90 @@ check('...the node, hung up on, finished the swap: the live code is the ref\'s, 
 $stillThere = array_values(array_filter($removeSet, static fn (string $rel): bool => file_exists("$live/$rel")));
 check('...the RETIRED files are gone', $stillThere === [], implode(', ', $stillThere));
 check('...and the stamp says "unknown"', stampCommit($live) === null, (string) stampCommit($live));
+
+// ── (l) the schema step fails on one node ───────────────────────────────
+echo "(l) a schema step that fails on one node stops the deploy with nothing swapped on any node\n";
+foreach ($nodes as $name => $nodeHome) {
+    $resetNode($nodeHome);
+    $before[$name] = snapshot($nodeHome);
+}
+[$code, $out, $log] = $deploy('HEAD', '', ['STUB_MIGRATE_FAIL_NODE' => 'selectiv']);
+check('the deploy exits non-zero, saying the schema step failed and nothing went live, before any swap or verification',
+    $code !== 0 && preg_match('/selectivesubconscious\.com: the schema step failed — nothing went live on any node/', $out) === 1
+    && !str_contains($out, 'Going live on') && !str_contains($out, 'Verifying deployed bytes'), $out);
+check('...it shows the node\'s own error', str_contains($out, "Duplicate key name 'idx_interfaces_identity_hash'"), $out);
+check('...retichat\'s schema step ran and passed first, then selectiv\'s failed',
+    array_column($log['migrates'], 'node') === ['retichat', 'selectiv'], json_encode(array_column($log['migrates'], 'node')));
+check('...no file was renamed on any node', $log['mvs'] === [], count($log['mvs']) . ' renames');
+foreach ($nodes as $name => $nodeHome) {
+    check("$name: nothing outside ~/reticulum-incoming changed: live code, stamp, rollback copy",
+        $withoutIncoming(snapshot($nodeHome)) === $withoutIncoming($before[$name]),
+        snapshotDiff($withoutIncoming($before[$name]), $withoutIncoming(snapshot($nodeHome))));
+    check("$name: ...the node still names the commit it runs", stampCommit("$nodeHome/public_html/reticulum") === $parent,
+        (string) stampCommit("$nodeHome/public_html/reticulum"));
+}
+
+// ── (m) the ancestry gate, and a ref before the migrate mode ────────────
+echo "(m) a ref that does not carry what a node runs is refused unless DEPLOY_ROLLBACK=1; one without the migrate mode skips it\n";
+$preStage1 = null;
+[, $revs] = sh('git -C ' . esc($clone) . ' rev-list --first-parent HEAD');
+foreach (explode("\n", trim($revs)) as $rev) {
+    $index = (string) shell_exec('git -C ' . esc($clone) . ' cat-file blob ' . esc($rev . ':php/src/index.php') . ' 2>/dev/null');
+    if ($index !== '' && !str_contains($index, 'function runIndexMigrate(')) {
+        $preStage1 = $rev;
+        break;
+    }
+}
+check('the history has a commit whose index.php has no migrate mode (the precondition)', $preStage1 !== null);
+$resetNode($home);
+put("$live/build.json", '{"commit":"' . $head . '","stamped_at":"2026-10-14T00:00:00Z"}' . "\n");
+$beforeM = snapshot($home);
+[$code, $out, $log] = $deploy((string) $preStage1, 'retichat');
+check('a ref older than the commit the node runs is refused, naming that commit and the override',
+    $code !== 0 && str_contains($out, 'does not carry the commit it runs') && str_contains($out, 'runs ' . substr($head, 0, 7))
+    && str_contains($out, 'DEPLOY_ROLLBACK=1'), $out);
+check('...before anything was uploaded, and nothing on the node changed',
+    array_filter($log['ops'], static fn (array $o): bool => $o['kind'] === 'scp') === [] && snapshot($home) === $beforeM,
+    $describeOps($log['ops']));
+$deployLog = $clone . '/.deploy.log';
+$deployLogBefore = (string) @file_get_contents($deployLog);
+[$code, $out, $log] = $deploy((string) $preStage1, 'retichat', ['DEPLOY_ROLLBACK' => '1']);
+check('with DEPLOY_ROLLBACK=1 it deploys, warning, and verifies',
+    $code === 0 && str_contains($out, 'DEPLOY_ROLLBACK=1, deploying') && str_contains($out, 'every node matches'), $out);
+check('...skipping the schema step: that index.php has no migrate mode',
+    $log['migrates'] === [] && str_contains($out, 'has no migrate mode'), json_encode($log['migrates']));
+check('...the node then names that ref', stampCommit($live) === $preStage1, (string) stampCommit($live));
+$deployLogNew = substr((string) @file_get_contents($deployLog), strlen($deployLogBefore));
+check('...and the deploy log records the override', str_contains($deployLogNew, 'rollback_override=1'), $deployLogNew);
+$resetNode($home);
+put("$live/build.json", '{"commit":"' . str_repeat('f', 40) . '","stamped_at":"2026-10-14T00:00:00Z"}' . "\n");
+[$code, $out, $log] = $deploy('HEAD', 'retichat');
+check('a node that runs a commit this repository lacks is refused too',
+    $code !== 0 && str_contains($out, 'not in this repository') && array_filter($log['ops'], static fn (array $o): bool => $o['kind'] === 'scp') === [], $out);
+
+// ── (n) a stamp that names no commit ────────────────────────────────────
+echo "(n) a node whose stamp names no commit stops the deploy before anything is uploaded, unless DEPLOY_ROLLBACK=1\n";
+foreach ($nodes as $name => $nodeHome) {
+    $resetNode($nodeHome);
+}
+put($nodes['selectiv'] . '/public_html/reticulum/build.json', NULL_STAMP . "\n");
+foreach ($nodes as $name => $nodeHome) {
+    $before[$name] = snapshot($nodeHome);
+}
+[$code, $out, $log] = $deploy('HEAD');
+check('the deploy exits non-zero: the commit selectiv runs is unknown',
+    $code !== 0 && preg_match('/selectivesubconscious\.com: the commit it runs is unknown — nothing changed on any node/', $out) === 1, $out);
+check('...before anything was uploaded to any node',
+    array_filter($log['ops'], static fn (array $o): bool => $o['kind'] === 'scp') === [], $describeOps($log['ops']));
+foreach ($nodes as $name => $nodeHome) {
+    check("$name: nothing on it changed", snapshot($nodeHome) === $before[$name], snapshotDiff($before[$name], snapshot($nodeHome)));
+}
+unlink($nodes['selectiv'] . '/public_html/reticulum/build.json');
+[$code, $out, $log] = $deploy('HEAD', 'selectiv', ['DEPLOY_ROLLBACK' => '1']);
+check('a node with no stamp at all deploys with DEPLOY_ROLLBACK=1, warning, and verifies',
+    $code === 0 && str_contains($out, 'names no commit and DEPLOY_ROLLBACK=1') && str_contains($out, 'every node matches'), $out);
+check('...and then names HEAD', stampCommit($nodes['selectiv'] . '/public_html/reticulum') === $head,
+    (string) stampCommit($nodes['selectiv'] . '/public_html/reticulum'));
 
 // ── (j) a RETIRED list naming a file the node owns ───────────────────────
 echo "(j) deploy.sh refuses a RETIRED list that names a file the node owns\n";

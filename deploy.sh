@@ -21,7 +21,9 @@
 #   1. refuse a dirty working tree      — you cannot ship what isn't committed
 #   2. run the test suite               — and refuse on any failure
 #   3. deploy from `git archive <ref>`  — never from the working directory
-#   4. lint on every node, then swap    — never a half-uploaded release live
+#   4. lint on every node, then swap    — never a half-uploaded release live;
+#      never onto a node that runs a commit the ref lacks, and with the
+#      release's schema built on every node before any swap
 #   5. hash-verify every node afterward — proof, not hope
 #   6. only then stamp each node with the commit it runs
 #
@@ -65,14 +67,43 @@
 # an explicit unknown one), so restoring it does not leave the new commit's
 # name on old code either.
 #
+# NEVER BACKWARDS BY ACCIDENT
+# ===========================
+# A ref that does not descend from the commit a node runs would take back what
+# is live there (REGISTRATION-STAGE1.md §13: a node never goes back past
+# 2b2ad9c's fix). Before anything is uploaded, the deploy reads each node's
+# stamp over ssh (build.json, what GET /health publishes as build.commit) and
+# refuses such a ref. A stamp that names no commit (a deploy that stopped after
+# its swap, or a node deployed before stamps) stops it too: what the node runs
+# is then unknown, and a person decides. DEPLOY_ROLLBACK=1 deploys anyway, for
+# a rollback on purpose; it prints a loud warning and is recorded in the
+# deploy log.
+#
+# THE SCHEMA BEFORE THE SWAP
+# ==========================
+# Once every node has linted the ref, and before any node swaps, each node runs
+# the uploaded release's migrate() against its live database (§13):
+# `php ~/reticulum-incoming/index.php migrate --project-root <live directory>`,
+# the node's own config read from the live directory (the upload holds none).
+# It prints each object it built and how long that took, records no schema
+# version (the new code's first request does, and finds everything built), and
+# exits non-zero on any error or a failed probe of §12's objects; the deploy
+# then stops with nothing swapped on any node. The code that is live keeps
+# serving meanwhile and ignores the new objects. It ignores a hang-up and a
+# closed output, like the swap, since a dropped connection would roll an index
+# build back. A ref whose index.php has no migrate mode (any before Stage 1, on
+# a rollback) skips the step.
+#
 # Credentials come from the environment. Keep them in a gitignored deploy.env:
 #
 #   export RETICHAT_SSH_PASS=...   RETICHAT_SSH_HOST=retichat@retichat.com
 #   export SELECTIV_SSH_PASS=...   SELECTIV_SSH_HOST=selectiv@selectivesubconscious.com
 #
 # Bypass for a genuine emergency: DEPLOY_ALLOW_DIRTY=1 (tree check) and
-# DEPLOY_SKIP_TESTS=1 (suite). Both print a loud warning and are recorded in
-# the deploy log. If you find yourself using them routinely, fix the cause.
+# DEPLOY_SKIP_TESTS=1 (suite); DEPLOY_ROLLBACK=1 to deploy a ref that does not
+# carry what a node runs (a rollback on purpose). Each prints a loud warning
+# and is recorded in the deploy log. If you find yourself using them
+# routinely, fix the cause.
 
 set -uo pipefail
 
@@ -162,6 +193,7 @@ else
 fi
 
 REF_SHA="$(git -C "$REPO_DIR" rev-parse --short "$REF")"
+REF_FULL="$(git -C "$REPO_DIR" rev-parse --verify "${REF}^{commit}")"
 REF_SUBJECT="$(git -C "$REPO_DIR" log -1 --format=%s "$REF")"
 echo "  ${GREEN}✓${NC} deploying ${REF_SHA} — ${REF_SUBJECT}"
 
@@ -292,6 +324,79 @@ rollback_hint() {
     via="ssh ${SSH_OPTS[*]} -o BatchMode=yes"
   fi
   echo "${YELLOW}  roll back with: ${via} ${host} 'cp -r ~/${ROLLBACK_DIR}/* ~/${REMOTE_DIR}/'${NC}"
+}
+
+# Step 4a, NEVER BACKWARDS BY ACCIDENT (above): the commit a node runs, read
+# from its stamp as GET /health reads it (BuildStamp::read: a 40-hex commit or
+# nothing), must be an ancestor of the ref. Nothing is uploaded before every
+# node has passed. The sentinel tells a stamp that names no commit from a
+# node that did not answer.
+STAMP_READ="stamp-read"
+
+check_node_ancestry() {
+  local label="$1" host_var="$2" pass_var="$3"
+  local host answer live
+  local -a scp_cmd ssh_cmd
+
+  if ! node_commands "$host_var" "$pass_var"; then
+    echo "  ${DIM}skipped — ${host_var} not set${NC}"
+    return 0
+  fi
+  answer="$("${ssh_cmd[@]}" "$host" "cat ~/${REMOTE_DIR}/build.json 2>/dev/null; echo; echo ${STAMP_READ}")"
+  [[ "${answer##*$'\n'}" == "$STAMP_READ" ]] \
+    || die "${label}: could not read the commit it runs (no answer from the node; nothing changed on any node)"
+  live="$(php -r '
+    $d = json_decode(stream_get_contents(STDIN), true);
+    $c = is_array($d) && is_string($d["commit"] ?? null) ? $d["commit"] : "";
+    echo preg_match("/^[0-9a-f]{40}$/", $c) === 1 ? $c : "";
+  ' <<< "${answer%$'\n'*}")"
+
+  if [[ -z "$live" ]]; then
+    if [[ "${DEPLOY_ROLLBACK:-0}" == "1" ]]; then
+      echo "  ${YELLOW}⚠ ${label} names no commit and DEPLOY_ROLLBACK=1 — deploying ${REF_SHA} anyway${NC}"
+      return 0
+    fi
+    echo "${RED}  ${label}'s stamp names no commit: a deploy stopped after its swap, or the node predates stamps.${NC}"
+    echo "${DIM}  Find out what it runs (./verify-deploy.sh <ref> <node> compares its bytes), then deploy"
+    echo "  with DEPLOY_ROLLBACK=1 if ${REF_SHA} is what it should run.${NC}"
+    die "${label}: the commit it runs is unknown — nothing changed on any node"
+  fi
+  if git -C "$REPO_DIR" merge-base --is-ancestor "$live" "$REF_FULL" 2>/dev/null; then
+    echo "  ${GREEN}✓${NC} ${label} runs ${live:0:7}, which ${REF_SHA} carries"
+    return 0
+  fi
+  local why="${REF_SHA} does not descend from it"
+  git -C "$REPO_DIR" cat-file -e "${live}^{commit}" 2>/dev/null \
+    || why="it is not in this repository (fetch, or it was deployed from elsewhere)"
+  if [[ "${DEPLOY_ROLLBACK:-0}" == "1" ]]; then
+    echo "  ${YELLOW}⚠ ${label} runs ${live:0:7} and ${why} — DEPLOY_ROLLBACK=1, deploying ${REF_SHA} anyway${NC}"
+    return 0
+  fi
+  echo "${RED}  ${label} runs ${live:0:7}, and ${why}: this deploy would take back what is live there.${NC}"
+  echo "${DIM}  For a rollback on purpose, run it again with DEPLOY_ROLLBACK=1.${NC}"
+  die "${label}: ${REF_SHA} does not carry the commit it runs — nothing changed on any node"
+}
+
+# Step 4b, THE SCHEMA BEFORE THE SWAP (above), on one staged node. The live
+# directory's real path is the project root, so the node's own config is read.
+MIGRATE_OK="migrate-ok"
+# index.php's migrate mode; a ref without it (before Stage 1) skips step 4b.
+MIGRATE_MARKER='function runIndexMigrate('
+
+migrate_node() {
+  local label="$1" host_var="$2" pass_var="$3"
+  local host migrated
+  local -a scp_cmd ssh_cmd
+  node_commands "$host_var" "$pass_var" || die "${label}: ${host_var} vanished between upload and schema"
+
+  local migrate="cd ~/${REMOTE_DIR} || exit 1; root=\$(pwd -P) || exit 1; trap '' HUP PIPE"
+  migrate+="; php ~/${INCOMING_DIR}/index.php migrate --project-root \"\$root\" 2>&1 && echo ${MIGRATE_OK}"
+  migrated="$("${ssh_cmd[@]}" "$host" "$migrate")"
+  sed -e "/^${MIGRATE_OK}\$/d" -e 's/^/    /' <<< "${migrated:-(no answer from the node)}"
+  if [[ "${migrated##*$'\n'}" != "$MIGRATE_OK" ]]; then
+    die "${label}: the schema step failed — nothing went live on any node (what it built stays; the live code ignores it)"
+  fi
+  echo "  ${GREEN}✓${NC} ${label} — schema ready for ${REF_SHA} (no version recorded; its first request records it)"
 }
 
 # Nodes holding this ref, linted, in ~/reticulum-incoming, one
@@ -440,6 +545,14 @@ stamp_node() {
   echo "  ${GREEN}✓${NC} ${label} — /health now names ${REF_SHA}"
 }
 
+step "Checking that ${REF_SHA} carries what each node runs"
+if [[ -z "$ONLY_NODE" || "$ONLY_NODE" == "retichat" ]]; then
+  check_node_ancestry "retichat.com" RETICHAT_SSH_HOST RETICHAT_SSH_PASS </dev/null
+fi
+if [[ -z "$ONLY_NODE" || "$ONLY_NODE" == "selectiv" ]]; then
+  check_node_ancestry "selectivesubconscious.com" SELECTIV_SSH_HOST SELECTIV_SSH_PASS </dev/null
+fi
+
 if [[ -z "$ONLY_NODE" || "$ONLY_NODE" == "retichat" ]]; then
   step "Uploading to retichat.com (not live yet)"
   stage_node "retichat.com" RETICHAT_SSH_HOST RETICHAT_SSH_PASS
@@ -447,6 +560,18 @@ fi
 if [[ -z "$ONLY_NODE" || "$ONLY_NODE" == "selectiv" ]]; then
   step "Uploading to selectivesubconscious.com (not live yet)"
   stage_node "selectivesubconscious.com" SELECTIV_SSH_HOST SELECTIV_SSH_PASS
+fi
+
+# ── 4b. The schema, before any swap ──────────────────────────────────────
+if grep -qF "$MIGRATE_MARKER" "$STAGE_SRC/index.php"; then
+  while IFS='|' read -r label host_var pass_var; do
+    [[ -n "$label" ]] || continue
+    step "Building ${REF_SHA}'s schema on ${label} (not live yet)"
+    migrate_node "$label" "$host_var" "$pass_var" </dev/null
+  done <<< "$STAGED"
+else
+  step "Schema"
+  echo "  ${DIM}${REF_SHA}'s index.php has no migrate mode (a ref before Stage 1) — skipped${NC}"
 fi
 
 # ── 5. Swap ──────────────────────────────────────────────────────────────
@@ -466,9 +591,9 @@ else
   VERIFY_OK=0
 fi
 
-printf '%s  ref=%s  nodes=%s  dirty_override=%s  tests_skipped=%s  verified=%s\n' \
+printf '%s  ref=%s  nodes=%s  dirty_override=%s  tests_skipped=%s  rollback_override=%s  verified=%s\n' \
   "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$REF_SHA" "${ONLY_NODE:-all}" \
-  "${DEPLOY_ALLOW_DIRTY:-0}" "${DEPLOY_SKIP_TESTS:-0}" "$VERIFY_OK" >> "$LOG_FILE"
+  "${DEPLOY_ALLOW_DIRTY:-0}" "${DEPLOY_SKIP_TESTS:-0}" "${DEPLOY_ROLLBACK:-0}" "$VERIFY_OK" >> "$LOG_FILE"
 
 [[ $VERIFY_OK -eq 1 ]] || die "post-deploy verification failed — nodes do not match ${REF_SHA}; their /health reports no commit"
 

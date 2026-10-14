@@ -170,9 +170,11 @@ done
 exec /bin/mv "$@"
 SH,
     // Fails every lint, or with STUB_LINT_FAIL=live only the lint of the live
-    // directory, after the swap; anything else goes to the real php.
+    // directory, after the swap; anything else, the schema step's migrate
+    // included, goes to the real php.
     $badPhp . '/php' => <<<'SH'
 #!/bin/sh
+if [ "$1" != "-l" ]; then exec "$STUB_REAL_PHP" "$@"; fi
 if [ "$STUB_LINT_FAIL" = live ] && [ "$PWD" != "$HOME/public_html/reticulum" ]; then exec "$STUB_REAL_PHP" "$@"; fi
 echo "PHP Parse error: stand-in lint failure in $2"
 exit 255
@@ -188,6 +190,10 @@ $resetNode = static function (?string $stampCommit) use ($node, $stubLog): void 
     exec('rm -rf ' . escapeshellarg($node));
     mkdir($node . '/public_html/reticulum/lib', 0775, true);
     file_put_contents($node . '/public_html/reticulum/index.php', "<?php // old code\n");
+    // The node's config: deploy.sh's schema step (REGISTRATION-STAGE1.md
+    // §13) runs the uploaded release's migrate against the live database.
+    file_put_contents($node . '/public_html/reticulum/config.toml', implode("\n", [
+        '[storage]', 'backend = "sqlite"', 'sqlite_path = "' . $node . '/public_html/reticulum/node.sqlite"', '']));
     if ($stampCommit !== null) {
         file_put_contents($node . '/public_html/reticulum/build.json',
             json_encode(['commit' => $stampCommit, 'stamped_at' => '2026-09-01T00:00:00Z']) . "\n");
@@ -250,8 +256,11 @@ check('...and leaves the node saying "unknown"', $nodeStamp() === null
     && is_file($node . '/public_html/reticulum/build.json'), (string) @file_get_contents($node . '/public_html/reticulum/build.json'));
 
 $resetNode(null);
-[$code, $out] = $deploy();
-check('a node deployed before stamps gets an explicit unknown rollback stamp',
+// A node that predates stamps names no commit, so deploy.sh stops for James to
+// decide (REGISTRATION-STAGE1.md §13, tests/deploy_never_mixes_releases_test.php
+// (n)); DEPLOY_ROLLBACK=1 is his go-ahead.
+[$code, $out] = $deploy(['DEPLOY_ROLLBACK' => '1']);
+check('a node deployed before stamps (DEPLOY_ROLLBACK=1) gets an explicit unknown rollback stamp',
     $code === 0 && $nodeStamp() === $head
     && str_contains((string) @file_get_contents($node . '/reticulum-rollback/build.json'), '"commit":null'), $out);
 
