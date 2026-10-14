@@ -20,7 +20,11 @@
  *       relay, and the interface's rx counters count the batch once;
  *   (c) the batch id posted with fewer packets is answered with what was
  *       stored under it, not with the count that came this time;
- *   (d) recordInboundBatch() answers a repeat from the stored row too.
+ *   (d) recordInboundBatch() answers a repeat from the stored row too;
+ *   (e) when another request stores the batch between the check and the
+ *       INSERT, the race the duplicate-key catch is for, the loser is
+ *       answered as a duplicate with processing null too, and the batch is
+ *       processed once, by the request that won.
  *
  * Run: php tests/repeated_batch_is_a_duplicate_test.php
  */
@@ -46,10 +50,14 @@ function check(string $label, bool $ok, string $detail = ''): void
     }
 }
 
-/** Counts the INSERTs into inbound_batches the node attempts, failed ones too. */
+/**
+ * Counts the INSERTs into inbound_batches the node attempts, failed ones too,
+ * and can run a racing request just before the next one.
+ */
 final class CountingStatement extends PDOStatement
 {
     public static int $batchInserts = 0;
+    public static ?Closure $beforeNextBatchInsert = null;
 
     protected function __construct()
     {
@@ -59,6 +67,11 @@ final class CountingStatement extends PDOStatement
     {
         if (preg_match('/^\s*INSERT\s+INTO\s+inbound_batches\b/i', $this->queryString) === 1) {
             self::$batchInserts++;
+            $race = self::$beforeNextBatchInsert;
+            self::$beforeNextBatchInsert = null;
+            if ($race !== null) {
+                $race();
+            }
         }
         return parent::execute($params);
     }
@@ -187,6 +200,27 @@ check('(d) a repeat is answered from the stored row, before any INSERT',
         && $queuedRepeat === ['duplicate_batch' => true, 'accepted_packets' => $queuedStored['packets'] ?? -1, 'accepted_bytes' => $queuedStored['bytes'] ?? -1]
         && $queuedRepeatInserts === 0,
     json_encode($queuedRepeat) . ", $queuedRepeatInserts INSERT(s)");
+
+echo "\nA race: another request stores the batch between the check and the INSERT\n";
+$racePackets = [];
+foreach (['three', 'four'] as $appData) {
+    $racePackets[] = base64_encode(announceRaw(identity($appData), 1, random_bytes(16)));
+}
+$beforeRace = processed($db);
+CountingStatement::$beforeNextBatchInsert = static function () use ($storage, $racePackets): void {
+    $storage->ingestInboundBatchInline(GATEWAY, 'batch-3', $racePackets);
+};
+[$lost, $raceInserts] = post($inline, 'batch-3', $racePackets);
+$raceStored = storedBatch($db, 'batch-3');
+$afterRace = processed($db);
+check('(e) the request that loses the race is answered as a duplicate, processing null',
+    $lost === ['duplicate_batch' => true, 'accepted_packets' => $raceStored['packets'] ?? -1, 'accepted_bytes' => $raceStored['bytes'] ?? -1, 'processing' => null]
+        && $raceInserts === 2,
+    json_encode($lost) . ", $raceInserts INSERT(s), both requests should reach theirs");
+check('(e) ...and the batch is processed once, by the request that won',
+    $afterRace['stored'] - $beforeRace['stored'] === 2 && $afterRace['rx_packets'] - $beforeRace['rx_packets'] === 2
+        && $afterRace['batches'] - $beforeRace['batches'] === 1,
+    json_encode($afterRace) . ' vs ' . json_encode($beforeRace));
 
 echo "\n$pass passed, $fail failed\n";
 exit($fail === 0 ? 0 : 1);

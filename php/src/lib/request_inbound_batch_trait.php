@@ -116,6 +116,7 @@ trait RequestInboundBatchTrait
                     'duplicate_batch' => true,
                     'accepted_packets' => count($packets),
                     'accepted_bytes' => $byteCount,
+                    'processing' => null,
                 ];
             }
             throw $e;
