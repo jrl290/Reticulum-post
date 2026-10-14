@@ -29,7 +29,8 @@ use PDOException;
  *
  * Only a browser (client rns-js) signs in Stage 1; every other client's
  * registration runs as before, apart from an identity_hash it carries, which
- * is ignored.
+ * is ignored. The announce rule for browser rows (§9) is
+ * RequestAnnounceGuardTrait's.
  *
  * No log line carries a session token, signature, challenge or the node
  * secret (§11).
@@ -190,6 +191,10 @@ trait RequestRegistrationTrait
             error_log(sprintf('[REG-REFUSED] 500 internal client=%s %s',
                 RegistrationProtocol::logValue($context['client']), get_class($error) . ': ' . $error->getMessage()));
             throw $error;
+        } finally {
+            // A registration may have bound, re-bound or removed rows: what
+            // §9 remembered about any of them this request is stale.
+            $this->forgetRowRegistrationFacts();
         }
     }
 
@@ -1024,6 +1029,7 @@ trait RequestRegistrationTrait
         $fill->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
         $fill->bindValue(':empty', '', PDO::PARAM_STR);
         Database::executeWithRetry($fill, 'claimedIdentityFill');
+        $this->forgetRowRegistrationFacts($interfaceId);
 
         return $this->signedRowByIdentityHash($claim) !== null;
     }

@@ -199,7 +199,10 @@ trait RequestPathStateTrait
      * (deleteRedundantAnnounceCopies). All four rank with these keys, so the
      * copy maintenance keeps is the copy the readers would have used, and a
      * younger copy they prefer is one maintenance does not touch:
-     *   1. a copy the readers can use: parsed, an announce;
+     *   1. a copy the readers can use: parsed, an announce, and not one the
+     *      browser-row rule refused (REGISTRATION-STAGE1.md §9), which no
+     *      reader serves; so maintenance never keeps a refused copy in place
+     *      of an accepted copy of the same announce;
      *   2. the path's copy: the hop count the path holds (inbound_packets.hops
      *      and path_entries.hops both count this node's inbound increment);
      *   3. received on the path's interface: the same emission can arrive at
@@ -211,7 +214,8 @@ trait RequestPathStateTrait
      */
     private function announceCopyOrderSql(string $copy, string $path): string
     {
-        return "CASE WHEN {$copy}.status = 'parsed' AND {$copy}.packet_type = 1 THEN 0 ELSE 1 END, "
+        return "CASE WHEN {$copy}.status = 'parsed' AND {$copy}.packet_type = 1"
+            . " AND ({$copy}.announce_status IS NULL OR {$copy}.announce_status <> 'refused') THEN 0 ELSE 1 END, "
             . "CASE WHEN {$copy}.hops = {$path}.hops THEN 0 ELSE 1 END, "
             . "CASE WHEN {$copy}.interface_id = {$path}.interface_id THEN 0 ELSE 1 END, "
             . "{$copy}.packet_record_id DESC";
@@ -230,6 +234,7 @@ trait RequestPathStateTrait
              WHERE ip.packet_hash_hex = :packet_hash_hex
                AND ip.status = :status
                AND ip.packet_type = :packet_type
+               AND (ip.announce_status IS NULL OR ip.announce_status <> :refused)
              ORDER BY ' . $this->announceCopyOrderSql('ip', 'pe') . '
              LIMIT 1';
     }
@@ -240,6 +245,11 @@ trait RequestPathStateTrait
         $stmt->bindValue(':packet_hash_hex', $packetHashHex, PDO::PARAM_STR);
         $stmt->bindValue(':status', 'parsed', PDO::PARAM_STR);
         $stmt->bindValue(':packet_type', 1, PDO::PARAM_INT);
+        // An announce the browser-row rule refused (REGISTRATION-STAGE1.md
+        // §9) is kept in inbound_packets as a diagnostic, like every packet,
+        // but it is never the announce cache: no path response or cache
+        // request serves it.
+        $stmt->bindValue(':refused', 'refused', PDO::PARAM_STR);
         $row = $stmt->execute(); $row = $stmt->fetch(PDO::FETCH_ASSOC);
         return is_array($row) ? $row : null;
     }

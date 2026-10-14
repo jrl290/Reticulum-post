@@ -639,16 +639,22 @@ trait RequestOutboundBatchTrait
 
             // The announce the path keeps, by the same rule as a path or cache
             // request and as maintenance keeps one copy of it; with no path,
-            // or none of its copies stored, the newest copy.
+            // or none of its copies stored, the newest copy. Either way only
+            // a copy that was accepted (validated or path_updated): never one
+            // the browser-row rule refused (REGISTRATION-STAGE1.md §9).
             $rawStmt = $this->db->prepare($this->seedPathAnnounceSql());
             $rawStmt->bindValue(':dest', $destHex, PDO::PARAM_STR);
             $rawStmt->bindValue(':accepted', 'accepted', PDO::PARAM_STR);
+            $rawStmt->bindValue(':validated', 'validated', PDO::PARAM_STR);
+            $rawStmt->bindValue(':path_updated', 'path_updated', PDO::PARAM_STR);
             $rawStmt->execute();
             $rawRow = $rawStmt->fetch(PDO::FETCH_ASSOC);
             if (!is_array($rawRow)) {
                 $rawStmt = $this->db->prepare($this->seedNewestAnnounceSql());
                 $rawStmt->bindValue(':dest', $destHex, PDO::PARAM_STR);
                 $rawStmt->bindValue(':accepted', 'accepted', PDO::PARAM_STR);
+                $rawStmt->bindValue(':validated', 'validated', PDO::PARAM_STR);
+                $rawStmt->bindValue(':path_updated', 'path_updated', PDO::PARAM_STR);
                 $rawStmt->execute();
                 $rawRow = $rawStmt->fetch(PDO::FETCH_ASSOC);
             }
@@ -681,6 +687,7 @@ trait RequestOutboundBatchTrait
              WHERE pe.destination_hash_hex = :dest
                AND ip.packet_type = 1
                AND ip.filter_status = :accepted
+               AND ip.announce_status IN (:validated, :path_updated)
                AND ip.raw_base64 IS NOT NULL
              ORDER BY ' . $this->announceCopyOrderSql('ip', 'pe') . '
              LIMIT 1';
@@ -688,7 +695,9 @@ trait RequestOutboundBatchTrait
 
     /**
      * Seeding's pick for a destination with no path, or none of whose path's
-     * copies is stored: its newest accepted announce. The ORDER BY on the
+     * copies is stored: its newest accepted announce, validated or
+     * path_updated (until Stage 1 the newest accepted packet whatever its
+     * status, so a refused copy would have been seeded). The ORDER BY on the
      * primary key with LIMIT 1 walks the history backwards and stops at the
      * first match; the destinations come from the newest rows.
      */
@@ -698,6 +707,7 @@ trait RequestOutboundBatchTrait
              WHERE destination_hash_hex = :dest
                AND packet_type = 1
                AND filter_status = :accepted
+               AND announce_status IN (:validated, :path_updated)
                AND raw_base64 IS NOT NULL
              ORDER BY packet_record_id DESC
              LIMIT 1';

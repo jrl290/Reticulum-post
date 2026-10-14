@@ -17,6 +17,19 @@ trait RequestControlPlaneTrait
         try {
             $knownPublicKeyHex = $this->knownDestinationPublicKey((string) $packet['destination_hash_hex']);
             $announce = AnnounceValidator::validate($packet, $knownPublicKeyHex);
+
+            // REGISTRATION-STAGE1.md §9: the browser-row announce rule runs
+            // here, before anything is remembered, bound, routed, cached or
+            // relayed. rememberKnownDestination() below overwrites the stored
+            // ratchet, app_data and packet hash, so a dropped announce must
+            // not reach it: its log line is its only trace. 'refused' is
+            // neither 'validated' nor 'path_updated', so nothing relays it,
+            // and the announce cache never serves it.
+            $refusal = $this->announceGuardRefusal($interfaceId, $packet, $announce);
+            if ($refusal !== null) {
+                return ['refused', $refusal];
+            }
+
             $this->rememberKnownDestination(
                 (string) $packet['destination_hash_hex'],
                 (string) $packet['packet_hash_hex'],

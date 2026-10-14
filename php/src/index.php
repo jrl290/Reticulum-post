@@ -28,6 +28,7 @@ require_once __DIR__ . '/lib/request_php_wake_trait.php';
 require_once __DIR__ . '/lib/empty_poll.php';
 require_once __DIR__ . '/lib/registration_protocol.php';
 require_once __DIR__ . '/lib/request_registration_trait.php';
+require_once __DIR__ . '/lib/request_announce_guard_trait.php';
 
 // Reticulum-php is request-operated. Queued transport bytes only move during
 // authenticated request/response exchanges. Wake helpers exist to prompt the
@@ -1083,6 +1084,7 @@ final class TransportConstants
 
 final class Storage
 {
+    use RequestAnnounceGuardTrait;
     use RequestControlPlaneTrait;
     use RequestDebugReportTrait;
     use RequestInterfaceRegistryTrait;
