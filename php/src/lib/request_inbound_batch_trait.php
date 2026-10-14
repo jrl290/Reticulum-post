@@ -19,13 +19,13 @@ trait RequestInboundBatchTrait
         );
         $duplicateCheck->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
         $duplicateCheck->bindValue(':batch_id', $batchId, PDO::PARAM_STR);
-        $existing = $duplicateCheck->execute(); $row = $duplicateCheck->fetch(PDO::FETCH_ASSOC);
+        $duplicateCheck->execute(); $row = $duplicateCheck->fetch(PDO::FETCH_ASSOC);
 
-        if (is_array($existing)) {
+        if (is_array($row)) {
             return [
                 'duplicate_batch' => true,
-                'accepted_packets' => (int) $existing['packet_count'],
-                'accepted_bytes' => (int) $existing['byte_count'],
+                'accepted_packets' => (int) $row['packet_count'],
+                'accepted_bytes' => (int) $row['byte_count'],
             ];
         }
 
@@ -78,13 +78,13 @@ trait RequestInboundBatchTrait
         );
         $duplicateCheck->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
         $duplicateCheck->bindValue(':batch_id', $batchId, PDO::PARAM_STR);
-        $existing = $duplicateCheck->execute(); $row = $duplicateCheck->fetch(PDO::FETCH_ASSOC);
+        $duplicateCheck->execute(); $row = $duplicateCheck->fetch(PDO::FETCH_ASSOC);
 
-        if (is_array($existing)) {
+        if (is_array($row)) {
             return [
                 'duplicate_batch' => true,
-                'accepted_packets' => (int) $existing['packet_count'],
-                'accepted_bytes' => (int) $existing['byte_count'],
+                'accepted_packets' => (int) $row['packet_count'],
+                'accepted_bytes' => (int) $row['byte_count'],
                 'processing' => null,
             ];
         }
@@ -116,6 +116,7 @@ trait RequestInboundBatchTrait
                     'duplicate_batch' => true,
                     'accepted_packets' => count($packets),
                     'accepted_bytes' => $byteCount,
+                    'processing' => null,
                 ];
             }
             throw $e;
