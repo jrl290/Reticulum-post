@@ -859,7 +859,9 @@ http://127.0.0.1:8080`.
   registered (its contents were not read). So before Phase 1 there, besides the `RedirectMatch`: the
   copy leaves the web root, `curl` of `var/` and of the file answers `403`
   or `404`, and James decides whether any token in the copy can still work
-  on the live database. retichat.com was not checked.
+  on the live database. retichat.com, the same day: `error_log` `403`, but
+  `var/` listed and its `router.log` (360 KB, written that hour) served; its
+  SQLite files there are empty.
 - Record the commit `/health` names (`build.commit`; 50c870b on both nodes
   on 2026-10-14). It is that node's rollback target.
 - For retichat.com, the MySQL 8.4 run of open question 3 must have passed;
