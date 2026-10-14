@@ -728,7 +728,11 @@ code untouched, to be run again. Each table's missing columns are added by
 one `ALTER` with `ALGORITHM=INSTANT`, and the indexes are built with
 `ALGORITHM=INPLACE LOCK=NONE`, so a server that cannot do either online
 refuses at once instead of copying or locking the table (the review of
-stage1-sign, 2026-10-14). Reclaim's `OPTIMIZE TABLE`, which rebuilds an InnoDB
+stage1-sign, 2026-10-14). The older repair steps, `ensureColumnTypes`'
+`MODIFY … BIGINT` and `ensurePrimaryKeys`' primary-key change, carry no such
+clause and would copy their table with writes blocked (the 2 s bounds only
+their wait for the lock); each checks first and runs only on a schema older
+than 50c870b's, which neither host has. Reclaim's `OPTIMIZE TABLE`, which rebuilds an InnoDB
 table under the same lock, runs under the same ceiling, once.
 
 **Backfill**, in PHP at every migration, idempotent, with no `LIKE`:
