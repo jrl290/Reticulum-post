@@ -1447,8 +1447,14 @@ function initializeRuntime(string $projectRoot, ?array $reticulumPhpConfig = nul
 
 function runIndexCli(string $projectRoot, array $argv): int
 {
-    [$reticulumPhpConfig, $reticulumPhpStorage] = initializeRuntime($projectRoot);
     $mode = $argv[1] ?? 'once';
+    if ($mode === 'migrate') {
+        // Before initializeRuntime(), whose migrateIfNeeded() would record
+        // the version: this mode records none.
+        return runIndexMigrate($projectRoot, array_slice($argv, 2));
+    }
+
+    [$reticulumPhpConfig, $reticulumPhpStorage] = initializeRuntime($projectRoot);
     $maintenanceConfig = $reticulumPhpConfig['maintenance'] ?? $reticulumPhpConfig['worker'] ?? [];
 
     if ($mode === 'once') {
@@ -1494,6 +1500,66 @@ function runIndexCli(string $projectRoot, array $argv): int
 
     fwrite(STDERR, "Unsupported index mode: {$mode}\n");
     return 1;
+}
+
+/**
+ * `php index.php migrate [--project-root <dir>]`: REGISTRATION-STAGE1.md
+ * §13's step, which deploy.sh runs on each node after the lint and before
+ * the swap, from ~/reticulum-incoming against the live project root (the
+ * uploaded release holds no config). It runs this release's migrate()
+ * against the live database, prints each object it builds and how long that
+ * took, then §12's probe. It records no version: the first request of the
+ * new code does, after a migrate() that finds everything built. It exits
+ * non-zero on any error or a failed probe, and the deploy stops with nothing
+ * swapped; the release the node runs keeps serving meanwhile and ignores
+ * the new objects.
+ */
+function runIndexMigrate(string $projectRoot, array $args): int
+{
+    if (($args[0] ?? null) === '--project-root') {
+        $given = (string) ($args[1] ?? '');
+        $resolved = $given === '' ? false : realpath($given);
+        if ($resolved === false || !is_dir($resolved)) {
+            fwrite(STDERR, "migrate: --project-root needs an existing directory\n");
+            return 1;
+        }
+        $projectRoot = $resolved;
+        $args = array_slice($args, 2);
+    }
+    if ($args !== []) {
+        fwrite(STDERR, "migrate: usage: index.php migrate [--project-root <dir>]\n");
+        return 1;
+    }
+    if (!Config::hasConfigFile($projectRoot)) {
+        fwrite(STDERR, "migrate: no config file in {$projectRoot}; nothing done\n");
+        return 1;
+    }
+
+    $reticulumPhpConfig = loadRuntimeConfig($projectRoot);
+    $reticulumPhpStorage = new Storage($reticulumPhpConfig);
+    $startedAt = microtime(true);
+    $summary = $reticulumPhpStorage->migrate();
+    $elapsedMs = (microtime(true) - $startedAt) * 1000;
+    foreach ($summary['built'] as $built) {
+        fwrite(STDOUT, sprintf("built %s in %.1f ms\n", $built['object'], $built['ms']));
+    }
+    if (($summary['claims_backfilled'] ?? 0) > 0) {
+        fwrite(STDOUT, sprintf("backfilled claimed_identity_hash on %d row(s)\n", $summary['claims_backfilled']));
+    }
+    if ($summary['errors'] !== []) {
+        foreach ($summary['errors'] as $error) {
+            fwrite(STDERR, "migrate error: {$error}\n");
+        }
+        fwrite(STDERR, "migrate: FAILED with " . count($summary['errors']) . " error(s); no version recorded\n");
+        return 1;
+    }
+    if (!$reticulumPhpStorage->schemaObjectsPresent()) {
+        fwrite(STDERR, "migrate: FAILED the schema probe (a new column of interfaces, or the UNIQUE index idx_interfaces_identity_hash, is missing); no version recorded\n");
+        return 1;
+    }
+    fwrite(STDOUT, sprintf("migrate: ok, %d object(s) built in %.1f ms, probe passed; no version recorded\n", count($summary['built']), $elapsedMs));
+
+    return 0;
 }
 
 function runIndexHttp(string $projectRoot): never

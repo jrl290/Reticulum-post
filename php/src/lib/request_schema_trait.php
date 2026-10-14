@@ -23,35 +23,51 @@ use PDOException;
 trait RequestSchemaTrait
 {
     /**
-     * Run migrate() only when the schema code has changed since the last
-     * successful run against this database.
+     * Run migrate() only when this code's schema version is not the one
+     * recorded against this database.
      *
      * Until 2026-09-24 migrate() ran inside every request: ~20 CREATE TABLE
      * IF NOT EXISTS, 24 CREATE INDEX attempts that each fail with "duplicate
      * key" on MySQL, plus column and primary-key probes — about 60 statements
      * per request before any packet was touched, ~800 plain SELECTs a second
-     * on retichat.com. The fingerprint of the migration source is kept in a
-     * one-row table inside the database itself, so a recreated or restored
-     * database (staging wipes its SQLite file) migrates again and the check
-     * costs one SELECT. A changed schema trait re-runs the migration; the
-     * /v1/initialize path still calls migrate() unconditionally.
+     * on retichat.com. The version is kept in a one-row table inside the
+     * database itself, so a recreated or restored database (staging wipes
+     * its SQLite file) migrates again and the check costs one SELECT. The
+     * /v1/initialize path still calls migrate() unconditionally, and on the
+     * hosts deploy.sh runs it before the swap (`index.php migrate`), so the
+     * request that records the version finds every object built.
      */
     public function migrateIfNeeded(): array
     {
-        $fingerprint = $this->schemaFingerprint();
-        if ($this->recordedSchemaFingerprint() === $fingerprint) {
+        $version = $this->schemaVersion();
+        if ($this->recordedSchemaFingerprint() === $version) {
             return ['skipped' => true];
         }
         $summary = $this->migrate();
         if ($summary['errors'] === []) {
-            $this->recordSchemaFingerprint($fingerprint);
+            $this->recordSchemaFingerprint($version);
         }
         return $summary;
     }
 
-    private function schemaFingerprint(): string
+    /**
+     * REGISTRATION-STAGE1.md §12: the schema version, a literal the running
+     * code carries (a method, since a trait constant needs PHP 8.2 and the
+     * floor is 8.1). Raise it with every change to what migrate() builds;
+     * tests/schema_migration_marker_test.php pins it together with the SHA-1
+     * of this file with the literal masked, so a change here without a new
+     * version fails.
+     *
+     * Until Stage 1 the recorded value was the SHA-1 of this file on disk,
+     * which old code can record: for a moment after a swap opcache may still
+     * run the old compiled trait, which hashed the new file, ran its own old
+     * migrate(), succeeded and recorded the new file's hash, so the new code
+     * never migrated. Old code records SHA-1 values, which never equal this
+     * literal, so the next request of this code migrates.
+     */
+    private function schemaVersion(): string
     {
-        return sha1((string) @file_get_contents(__FILE__));
+        return 'stage1-1';
     }
 
     private function recordedSchemaFingerprint(): ?string
@@ -84,12 +100,18 @@ trait RequestSchemaTrait
         }
     }
 
+    /**
+     * Build every missing object, idempotently. 'built' lists each table,
+     * column and index this run created, with how long it took, for the
+     * deploy step that runs this before the swap (index.php migrate).
+     */
     public function migrate(): array
     {
         $summary = [
             'tables_created' => 0,
             'columns_added'  => 0,
             'indexes_added'  => 0,
+            'built'          => [],
             'errors'         => [],
         ];
 
@@ -98,8 +120,15 @@ trait RequestSchemaTrait
         $this->ensureColumnTypes($summary);
         $this->ensurePrimaryKeys($summary);
         $this->ensureIndexes($summary);
+        $this->backfillClaimedIdentityHashes($summary);
 
         return $summary;
+    }
+
+    /** One object this run built, for $summary['built']. */
+    private static function noteBuilt(array &$summary, string $object, float $startedAt): void
+    {
+        $summary['built'][] = ['object' => $object, 'ms' => round((microtime(true) - $startedAt) * 1000, 1)];
     }
 
     private function ensureTables(array &$summary): void
@@ -149,6 +178,14 @@ trait RequestSchemaTrait
                     wake_failure_count INT NOT NULL DEFAULT 0,
                     wake_backoff_until INT NOT NULL DEFAULT 0,
                     updated_at INT NOT NULL DEFAULT 0,
+                    identity_hash VARCHAR(32) DEFAULT NULL,
+                    identity_public_key VARCHAR(128) DEFAULT NULL,
+                    registration_seq BIGINT NOT NULL DEFAULT 0,
+                    registration_proof VARCHAR(16) NOT NULL DEFAULT 'none',
+                    claimed_identity_hash VARCHAR(32) DEFAULT NULL,
+                    previous_session_token_hash VARCHAR(64) DEFAULT NULL,
+                    superseded_logged_hash VARCHAR(64) NOT NULL DEFAULT '',
+                    refusal_logged_seq BIGINT NOT NULL DEFAULT -1,
                     PRIMARY KEY (interface_id)
                 ){$engine}",
 
@@ -323,10 +360,15 @@ trait RequestSchemaTrait
                 ){$engine}",
         ];
 
+        $existingTables = $this->existingTables();
         foreach ($tables as $name => $sql) {
             try {
+                $startedAt = microtime(true);
                 $this->db->exec($sql);
                 $summary['tables_created']++;
+                if ($existingTables !== null && !isset($existingTables[$name])) {
+                    self::noteBuilt($summary, 'table ' . $name, $startedAt);
+                }
             } catch (PDOException $e) {
                 $code = (int) ($e->errorInfo[1] ?? 0);
                 if ($code !== 1050 && !str_contains($e->getMessage(), 'already exists')) {
@@ -355,6 +397,16 @@ trait RequestSchemaTrait
             ['inbound_packets', 'filter_reason', 'VARCHAR(128)', 'filter_status'],
             ['inbound_packets', 'announce_status', 'VARCHAR(32)', 'filter_reason'],
             ['inbound_packets', 'announce_reason', 'VARCHAR(128)', 'announce_status'],
+            // REGISTRATION-STAGE1.md §12. Appended (no AFTER), so MySQL and
+            // MariaDB add each one in place, with no table rebuild.
+            ['interfaces', 'identity_hash', 'VARCHAR(32) DEFAULT NULL', null],
+            ['interfaces', 'identity_public_key', 'VARCHAR(128) DEFAULT NULL', null],
+            ['interfaces', 'registration_seq', 'BIGINT NOT NULL DEFAULT 0', null],
+            ['interfaces', 'registration_proof', "VARCHAR(16) NOT NULL DEFAULT 'none'", null],
+            ['interfaces', 'claimed_identity_hash', 'VARCHAR(32) DEFAULT NULL', null],
+            ['interfaces', 'previous_session_token_hash', 'VARCHAR(64) DEFAULT NULL', null],
+            ['interfaces', 'superseded_logged_hash', "VARCHAR(64) NOT NULL DEFAULT ''", null],
+            ['interfaces', 'refusal_logged_seq', 'BIGINT NOT NULL DEFAULT -1', null],
         ];
 
         // Ask each table for its columns once instead of issuing an ALTER per
@@ -373,9 +425,11 @@ trait RequestSchemaTrait
                 if ($this->backend === 'mysql' && $after !== null && $after !== '') {
                     $sql .= " AFTER `{$after}`";
                 }
+                $startedAt = microtime(true);
                 $this->db->exec($sql);
                 $existing[$table][$column] = true;
                 $summary['columns_added']++;
+                self::noteBuilt($summary, "column {$table}.{$column}", $startedAt);
             } catch (PDOException $e) {
                 $code = (int) ($e->errorInfo[1] ?? 0);
                 // 1060 = MySQL duplicate column; SQLite reports the same
@@ -631,12 +685,41 @@ trait RequestSchemaTrait
             'CREATE INDEX idx_known_dest_identity ON known_destinations (identity_hash_hex)',
             'CREATE INDEX idx_local_dest_iface ON local_destinations (interface_id)',
             'CREATE INDEX idx_outbound_packets_queued ON outbound_packets (queued_at)',
+            // REGISTRATION-STAGE1.md §12. The signed row is found only by its
+            // own UNIQUE column, lower-case hex (several NULLs are allowed on
+            // MySQL 8.4, MariaDB 11.4 and SQLite); a legacy claim by its own.
+            'CREATE UNIQUE INDEX idx_interfaces_identity_hash ON interfaces (identity_hash)',
+            'CREATE INDEX idx_interfaces_claimed_identity ON interfaces (claimed_identity_hash)',
+            // §4.5's removal of legacy rows: each step a statement on an
+            // index (local_destinations and outbound_batches already are).
+            'CREATE INDEX idx_outbound_packets_iface ON outbound_packets (interface_id, acked_at)',
+            'CREATE INDEX idx_path_entries_iface ON path_entries (interface_id)',
+            'CREATE INDEX idx_reverse_path_received ON reverse_path_entries (received_interface_id)',
+            'CREATE INDEX idx_link_transport_received ON link_transport_entries (received_interface_id)',
+            'CREATE INDEX idx_link_transport_outbound ON link_transport_entries (outbound_interface_id)',
         ];
 
+        // The existing indexes are read once and only the missing ones
+        // created, so a re-run takes no metadata lock. When they cannot be
+        // read, every CREATE is tried, and "already there" is harmless.
+        $tables = [];
         foreach ($indexes as $sql) {
+            if (preg_match('/\ACREATE (?:UNIQUE )?INDEX (\w+) ON (\w+) /', $sql, $m) === 1) {
+                $tables[$m[2]] = true;
+            }
+        }
+        $existing = $this->existingIndexes(array_keys($tables));
+
+        foreach ($indexes as $sql) {
+            $name = preg_match('/\ACREATE (?:UNIQUE )?INDEX (\w+) ON (\w+) /', $sql, $m) === 1 ? $m[1] : $sql;
+            if ($existing !== null && isset($m[2]) && isset($existing[$m[2] . '.' . $name])) {
+                continue;
+            }
             try {
+                $startedAt = microtime(true);
                 $this->db->exec($sql);
                 $summary['indexes_added']++;
+                self::noteBuilt($summary, 'index ' . $name, $startedAt);
             } catch (PDOException $e) {
                 $code = (int) ($e->errorInfo[1] ?? 0);
                 if (!in_array($code, [1061, 1072, 1146], true)
@@ -644,6 +727,200 @@ trait RequestSchemaTrait
                     $summary['errors'][] = "create_index: " . $e->getMessage();
                 }
             }
+        }
+    }
+
+    /**
+     * Every index of these tables, as "table.index" => true, read once
+     * (information_schema.STATISTICS on MySQL and MariaDB, PRAGMA index_list
+     * on SQLite); null when they cannot be read.
+     *
+     * @param list<string> $tables
+     * @return array<string, true>|null
+     */
+    private function existingIndexes(array $tables): ?array
+    {
+        $indexes = [];
+        try {
+            if ($this->backend === 'mysql') {
+                $stmt = $this->db->prepare(
+                    'SELECT TABLE_NAME, INDEX_NAME FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE()'
+                );
+                $stmt->execute();
+                while (($row = $stmt->fetch(PDO::FETCH_ASSOC)) !== false) {
+                    $table = (string) ($row['TABLE_NAME'] ?? $row['table_name'] ?? '');
+                    $index = (string) ($row['INDEX_NAME'] ?? $row['index_name'] ?? '');
+                    if ($table !== '' && $index !== '') {
+                        $indexes[$table . '.' . $index] = true;
+                    }
+                }
+                return $indexes;
+            }
+            foreach ($tables as $table) {
+                if (preg_match('/\A\w+\z/', $table) !== 1) {
+                    return null;
+                }
+                $stmt = $this->db->query("PRAGMA index_list(`{$table}`)");
+                if ($stmt === false) {
+                    return null;
+                }
+                foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
+                    $index = (string) ($row['name'] ?? '');
+                    if ($index !== '') {
+                        $indexes[$table . '.' . $index] = true;
+                    }
+                }
+            }
+        } catch (PDOException $e) {
+            return null;
+        }
+
+        return $indexes;
+    }
+
+    /** Every table, as name => true; null when they cannot be read. */
+    private function existingTables(): ?array
+    {
+        try {
+            $stmt = $this->backend === 'mysql'
+                ? $this->db->prepare('SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE()')
+                : $this->db->prepare('SELECT name FROM sqlite_master WHERE type = :type');
+            if ($this->backend !== 'mysql') {
+                $stmt->bindValue(':type', 'table', PDO::PARAM_STR);
+            }
+            $stmt->execute();
+            $tables = [];
+            foreach ($stmt->fetchAll(PDO::FETCH_NUM) as $row) {
+                $tables[(string) $row[0]] = true;
+            }
+
+            return $tables;
+        } catch (PDOException $e) {
+            return null;
+        }
+    }
+
+    /**
+     * REGISTRATION-STAGE1.md §12's backfill, at every migration, in PHP,
+     * idempotent, with no LIKE: claimed_identity_hash for legacy rns-js rows,
+     * from a top-level metadata.identity_hash of 32 lower-case hex. The key
+     * itself leaves metadata_json at the row's next write.
+     */
+    private function backfillClaimedIdentityHashes(array &$summary): void
+    {
+        try {
+            $stmt = $this->db->prepare(
+                'SELECT interface_id, metadata_json FROM interfaces
+                  WHERE claimed_identity_hash IS NULL AND identity_hash IS NULL AND registration_proof = :none'
+            );
+            $stmt->bindValue(':none', 'none', PDO::PARAM_STR);
+            $stmt->execute();
+            $claims = [];
+            foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
+                $metadata = json_decode((string) ($row['metadata_json'] ?? ''), true);
+                if (!is_array($metadata) || ($metadata['client'] ?? null) !== 'rns-js') {
+                    continue;
+                }
+                $claim = $metadata['identity_hash'] ?? null;
+                if (is_string($claim) && preg_match('/\A[0-9a-f]{32}\z/', $claim) === 1) {
+                    $claims[(string) $row['interface_id']] = $claim;
+                }
+            }
+            if ($claims === []) {
+                return;
+            }
+            $fill = $this->db->prepare(
+                'UPDATE interfaces SET claimed_identity_hash = :claim
+                  WHERE interface_id = :interface_id AND claimed_identity_hash IS NULL AND identity_hash IS NULL'
+            );
+            $filled = 0;
+            foreach ($claims as $interfaceId => $claim) {
+                $fill->bindValue(':claim', $claim, PDO::PARAM_STR);
+                $fill->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
+                Database::executeWithRetry($fill, 'claimedIdentityBackfill');
+                $filled += $fill->rowCount();
+            }
+            $summary['claims_backfilled'] = $filled;
+        } catch (\Throwable $e) {
+            $summary['errors'][] = 'backfill claimed_identity_hash: ' . $e->getMessage();
+        }
+    }
+
+    /**
+     * REGISTRATION-STAGE1.md §12, /health's schema_migrated: the recorded
+     * version is this code's and the probe finds §12's objects. Never
+     * throws: a query that fails says false.
+     */
+    public function schemaMigrated(): bool
+    {
+        try {
+            return $this->recordedSchemaFingerprint() === $this->schemaVersion() && $this->schemaObjectsPresent();
+        } catch (\Throwable $e) {
+            return false;
+        }
+    }
+
+    /**
+     * §12's probe: a zero-row SELECT of the new columns (the same on all
+     * three engines), and idx_interfaces_identity_hash unique on
+     * identity_hash (SHOW INDEX on MySQL and MariaDB, PRAGMA index_list on
+     * SQLite). Needed because ensureIndexes() treats 1061, 1072 and 1146 as
+     * harmless, so migrate() can report a clean run without the index. Never
+     * throws.
+     */
+    public function schemaObjectsPresent(): bool
+    {
+        try {
+            $probe = $this->db->query(
+                'SELECT identity_hash, identity_public_key, registration_seq, registration_proof,
+                        claimed_identity_hash, previous_session_token_hash, superseded_logged_hash,
+                        refusal_logged_seq
+                   FROM interfaces LIMIT 0'
+            );
+            if ($probe === false) {
+                return false;
+            }
+            $probe->fetchAll();
+            $probe->closeCursor();
+
+            if ($this->backend === 'mysql') {
+                $rows = $this->db->query('SHOW INDEX FROM interfaces');
+                if ($rows === false) {
+                    return false;
+                }
+                foreach ($rows->fetchAll(PDO::FETCH_ASSOC) as $row) {
+                    if ((string) ($row['Key_name'] ?? '') === 'idx_interfaces_identity_hash'
+                        && (int) ($row['Non_unique'] ?? 1) === 0
+                        && (string) ($row['Column_name'] ?? '') === 'identity_hash') {
+                        return true;
+                    }
+                }
+
+                return false;
+            }
+
+            $list = $this->db->query('PRAGMA index_list(interfaces)');
+            if ($list === false) {
+                return false;
+            }
+            $unique = false;
+            foreach ($list->fetchAll(PDO::FETCH_ASSOC) as $row) {
+                if ((string) ($row['name'] ?? '') === 'idx_interfaces_identity_hash' && (int) ($row['unique'] ?? 0) === 1) {
+                    $unique = true;
+                }
+            }
+            if (!$unique) {
+                return false;
+            }
+            $info = $this->db->query('PRAGMA index_info(idx_interfaces_identity_hash)');
+            if ($info === false) {
+                return false;
+            }
+            $columns = array_map(static fn (array $row): string => (string) ($row['name'] ?? ''), $info->fetchAll(PDO::FETCH_ASSOC));
+
+            return $columns === ['identity_hash'];
+        } catch (\Throwable $e) {
+            return false;
         }
     }
 }
