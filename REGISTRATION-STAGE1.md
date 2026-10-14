@@ -409,7 +409,10 @@ it" (§18). It keeps the token from anyone who replays a captured body (§3)
 or holds only a copy of the answer, such as a log that records answers. It
 does not keep it from the PHP node the browser uses: the browser sends the
 token to that node, in plain text inside HTTPS, on every exchange and goodbye
-(§6), as today. So it does not change A12 (§16 item 6).
+(§6), as today. So it does not change A12 (§16 item 6). The browser keeps
+the token in memory only: it never writes it to storage, and removes the
+entry older builds wrote there (review of 2026-10-14: a stored token
+outlives the tab, and nothing read it).
 
 ## 6. Exchange, Poll and Goodbye
 
@@ -428,7 +431,10 @@ changes nothing, as today.
 network send under §1 of the principles: the browser times each POST to its
 answer, and an answer later than 5 s is logged as a §1 violation
 (`console.error`, the line carrying `// NEVER REMOVE EVER — see
-DESIGN_PRINCIPLES.md §1`) and still decides. Today none is asserted. The
+DESIGN_PRINCIPLES.md §1`) and still decides. A request with no answer 5 s
+after it was sent is logged then, once, by a watch that decides nothing and
+ends at the answer, an abort or a stop, so a request abandoned or never
+answered is said too (as `Link.requestLog`'s watch, Retichat-js f54d7cd). Today none is asserted. The
 goodbye beacon has no answer to time (`navigator.sendBeacon` reports only
 that the body was queued), so the stale sweep stays its backstop; the
 keepalive fetch used only where `sendBeacon` is missing does get an answer
@@ -465,7 +471,10 @@ challenge never answer `401` or `session_superseded`.
 again (challenge, then register) at once, as today, with no backoff: a `401`
 is a protocol answer, not a failure (§10). That is at most one registration
 per `401`: a `401` on the first exchange of a session the browser has just
-made stops it, saying why (§10), with no backoff. It acts on the status and
+made by a signed registration stops it, saying why (§10), with no backoff. A
+session made the legacy way (after a challenge `404`) registers again at
+every `401`, as today, so it stays in old pages' position (§8), and a
+stranger's legacy re-bind at a PHP node without Stage 1 cannot stop it. It acts on the status and
 code alone; today's match on the text "Invalid interface credentials" goes.
 
 ## 8. Superseded (409)
@@ -581,13 +590,15 @@ Every 4xx and 5xx body that carries an `error` is `{"error": "<code>",
 | 403 | `identity_requires_signature` | a legacy registration claiming an identity that has signed here | only pages older than Stage 1 get it; they show "offline" |
 | 403 | `signature_required` | a legacy browser registration while the switch is on | the same |
 | 409 | `stale_challenge` | the challenge does not verify against this PHP node, identity and count; or the bind race was lost | one new challenge, one more registration; a second `409` stops: "Another registration of this identity got in first. Reload to connect here." |
-| 401 | `unauthorized` | `/exchange`, `/tx`, `/poll`, `/goodbye`: §7 | registers again; a `401` on the first exchange of that new session stops: "The PHP node dropped this connection as soon as it was made. Reload to connect." |
+| 401 | `unauthorized` | `/exchange`, `/tx`, `/poll`, `/goodbye`: §7 | registers again; a `401` on the first exchange of a new signed session stops: "The PHP node dropped this connection as soon as it was made. Reload to connect." |
 | 409 | `session_superseded` | the same endpoints: any token but the current one on a signed row | stops with §8's message |
 | 404 | (any) | the challenge, at a PHP node without Stage 1 | registers the legacy way |
 
 **"Stops, says why":** no further automatic registration, and no backoff.
-The interface emits `stopped(reason)` exactly once, whatever `down` has said
-before; the reason is a sentence for a person (§8's for
+The interface takes its stopped state first, then emits `down` if it has
+not (so an older `app.js` served with this lib, by `deploy.sh`'s lib-first
+copy or a browser's cache, shows offline, as §13's watch expects), then
+`stopped(reason)` exactly once, whatever `down` has said before; the reason is a sentence for a person (§8's for
 `session_superseded`, this table's where it gives one, otherwise the
 answer's `message`), never the raw error text. `app.js` keeps it as its own
 state, a status `stopped` that `_applyStatusDot` redraws after every render,
@@ -600,10 +611,12 @@ on the exchange URL, with a cure that does not apply. The browser also stops,
 saying why, on a token that does not decrypt or another `identity_hash`
 (§5), and when its page gave it no signing identity (an `app.js` older than
 Stage 1): it then asks the challenge by `identity_hash`, registers the legacy
-way only on `404`, and otherwise stops: "This page is out of date. Reload it
+way only on `404`, backs off on no protocol answer (below), and otherwise
+stops: "This page is out of date. Reload it
 to connect."
 
-**The backoff.** A network failure or a 5xx is no protocol answer: the
+**The backoff.** A network failure, a 5xx, or a 2xx whose body is not JSON
+(a captive portal's page, a PHP error page) is no protocol answer: the
 attempt's packets are reported lost, and the next attempt (challenge,
 registration or exchange) comes after a backoff of 2 s, doubling after each
 failure, capped at 5 min, and reset by any success, an exchange or a
@@ -1061,7 +1074,8 @@ with a bound that only fails it.
   tokens decrypt, and both `tokens_negative` fail, against a copy of the
   vector file whose SHA-256 the test pins. *Today:* no `signRegistration()`.
 - **A page test** (like `exchange_truth.test.mjs`): `app.js` gives the
-  interface `IdMgr.id`; a stop's reason shows under the status dot, survives a
+  interface `IdMgr.id` in the trailing options argument, the third staying
+  the hash string; a stop's reason shows under the status dot, survives a
   re-render, and is not replaced by a later `down` or `up`. *Today:* it
   passes `IdMgr.hash`, and `down` only sets "offline".
 - **`exchange_url_policy.test.mjs`:** `EXCHANGE_PATHS` has
@@ -1277,7 +1291,14 @@ refused copy would be seeded; §9); the extended placeholder scanner (§14).
   its packets lost and emit `stopped(reason)` once; `401` by status only, at
   most one registration per `401` (§7); §6's assertions; §10's backoff in
   place of the fixed 5 s wait (`RECONNECT_WAIT_MS`).
-- **`app.js`:** `new PostInterface(name, url, IdMgr.id)`, and a `stopped`
+- **`app.js`:** `new PostInterface(name, url, IdMgr.hash, undefined, {
+  identity: IdMgr.id })`. The third argument stays the hash string: an
+  interface older than Stage 1 (f54d7cd) sends its third argument as
+  `metadata.identity_hash` through `JSON.stringify`, and an Identity
+  serializes its private keys, so a page running this `app.js` with an old
+  lib (a rollback, `deploy.sh`'s lib-first copy, a cached module) would send
+  them to the PHP node (review of 2026-10-14). The constructor refuses a
+  third argument that is not a string or null. And a `stopped`
   handler: the reason kept as its own state with the status `stopped`, shown
   under the status dot by `_applyStatusDot` after every render (where
   `EXCHANGE_BLOCKED_NOTICE` is shown, never in `exchangeBlocked`), after which
