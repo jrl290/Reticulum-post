@@ -5231,8 +5231,9 @@ answers there hold here.
       2 s to 5 min". After a network failure, a 5xx, or a 4xx on an exchange
       that Stage 1's §10 does not list, the browser's next attempt
       (challenge, registration or exchange) comes after 2 s, doubling,
-      capped at 5 min, reset by a successful registration
-      (`REGISTRATION-STAGE1.md` §10; `DESIGN_PRINCIPLES.md` §3).
+      capped at 5 min, reset by any success, an exchange or a registration
+      ("Any success resets it", the same day) (`REGISTRATION-STAGE1.md` §10;
+      `DESIGN_PRINCIPLES.md` §3).
 
     **Recommendation: (a) for each.**
 18. **This document's own words.** You chose the names of the parties (PHP

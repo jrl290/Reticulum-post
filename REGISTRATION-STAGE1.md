@@ -28,8 +28,9 @@ Stage 1 (§19, question 3); until then Stage 1 goes to selectiv only (§13).
 What you do is in §13: before the first deploy to each host, make it refuse
 the two log files (the lines are there); later, the enforcement date and each
 host's config edit. The choices this file made that you may overrule are at
-the end of §18; this revision adds one: an `online` or `visible` event makes
-the browser's next attempt at once without resetting its backoff (§10). What
+the end of §18; this revision adds one: an `online`, `visible` or `pageshow`
+event makes the browser's next attempt at once without resetting its backoff
+(§10). What
 stays exposed until Stage 2 is §16. §3 to §7, §11, §12, §14, §15 and §17 are
 for the build.
 
@@ -110,9 +111,9 @@ word: its `relay` means PHP node.
 6. **The browser backs off.** After a network failure, a 5xx, or a 4xx on
    an exchange that §10 does not list, its next attempt (challenge,
    registration or exchange) comes after 2 s, doubling, capped at 5 min, and
-   a successful registration resets it; today it waits a fixed 5 s. James
-   decided it on 2026-10-14 (open question 4), and the principles' §3
-   records it (§10).
+   any success, an exchange or a registration, resets it; today it waits a
+   fixed 5 s. James decided it on 2026-10-14 (open question 4, then "Any
+   success resets it"), and the principles' §3 records it (§10).
 
 **Left as today.**
 
@@ -604,12 +605,15 @@ to connect."
 **The backoff.** A network failure or a 5xx is no protocol answer: the
 attempt's packets are reported lost, and the next attempt (challenge,
 registration or exchange) comes after a backoff of 2 s, doubling after each
-failure, capped at 5 min, and reset by a successful registration. A 4xx that
-this table does not list counts as such a failure on an exchange, and stops,
-says why, on the challenge or the registration. An `online` or `visible`
-event makes the next attempt at once, without resetting the backoff (this
-file's choice, §18), so a failure after it waits the next step. A `401` is a
-protocol answer, not a failure: the browser registers again at once (§7).
+failure, capped at 5 min, and reset by any success, an exchange or a
+registration (James, 2026-10-14: "Any success resets it"; after a network
+drop the session is still valid, so the next attempt is usually an
+exchange). A 4xx that this table does not list counts as such a failure on
+an exchange, and stops, says why, on the challenge or the registration. An
+`online`, `visible` or `pageshow` event makes the next attempt at once,
+without resetting the backoff (this file's choice, §18), so a failure after
+it waits the next step. A `401` is a protocol answer, not a failure: the
+browser registers again at once (§7).
 The codes that stop end the attempts with no wait. The failure is still
 surfaced: the status dot shows offline while it lasts. James decided the
 backoff on 2026-10-14 ("Back off 2 s to 5 min", open question 4), in place
@@ -1044,11 +1048,12 @@ with a bound that only fails it.
 - **`post_interface_backoff.test.mjs`:** with a test clock, consecutive
   failures (a network failure, a 5xx, a 4xx on an exchange that §10 does not
   list), on the challenge, the registration or an exchange, wait 2, 4, 8 … s
-  before the next attempt, capped at 300 s; a successful registration resets
-  the wait to 2 s; an `online` or `visible` event makes the next attempt at
-  once and leaves the backoff where it was, so a failure after it waits the
-  next step; a `401` registers again at once with no backoff; terminal codes
-  stop with no backoff. *Today:* every wait is 5 s.
+  before the next attempt, capped at 300 s; a successful exchange resets the
+  wait to 2 s, and so does a successful registration; an `online`, `visible`
+  or `pageshow` event makes the next attempt at once and leaves the backoff
+  where it was, so a failure after it waits the next step; a `401` registers
+  again at once with no backoff; terminal codes stop with no backoff.
+  *Today:* every wait is 5 s.
 - **`registration_vectors.test.mjs`:** `signRegistration()` reproduces
   `browser-first`'s and `browser-reregister`'s bytes and signatures, their
   tokens decrypt, and both `tokens_negative` fail, against a copy of the
@@ -1337,6 +1342,7 @@ as asked, "relay" included.
 | 2026-10-14 | "An old tab whose announces the PHP node refuses" (§19, question 2) | "Accept it (Recommended)": option (a) | §9, §19 |
 | 2026-10-14 | "How MySQL 8.4 is proven before retichat.com" (§19, question 3) | "selectiv only, for now": Phases 1 to 3 go to selectiv alone, and retichat.com's PHP node stays on today's code until MySQL 8.4 is proven; how it is proven stays open | §13, §16, §17.3, §19 |
 | 2026-10-14 | "The browser's wait of 5 s" (§19, question 4) | "Back off 2 s to 5 min": option (b), now recorded in the principles' §3 | header, §2, §10, §14, §17.2, §19 |
+| 2026-10-14 | "The browser's backoff (2 s doubling to 5 min) resets only on a successful registration. After a network drop the session is still valid, so the next attempt is an exchange, and a successful exchange wouldn't reset it: separate drops over hours would grow an open tab's wait toward 5 min. What should reset the wait to 2 s?" | "Any success resets it (Recommended)": a successful exchange or registration | §2, §10, §14, §19, the principles' §3 |
 | 2026-10-14 | "Sign the address of the PHP node?" (§19, question 5) | "the verdict was to rely on Reticulum's security for PHP nodes. A compromised node still can only manifest as a black hole. It can't actually manipulate the messages. This is a standard risk of Reticulum." No address is signed. | §4.2, §14, §15, §16 item 6, §19 |
 
 **This file's own choices**, which James may overrule:
@@ -1369,8 +1375,9 @@ as asked, "relay" included.
 - `deploy.sh` builds the schema before the swap and refuses a ref that does
   not descend from the live commit (§13); `/health` counts challenges asked by
   hash (§12); a probe with test identities checks each node (§17.3).
-- **New in revision 3:** an `online` or `visible` event makes the browser's
-  next attempt at once without resetting its backoff, so a failure after it
+- **New in revision 3:** an `online`, `visible` or `pageshow` event (today's
+  code reconnects at once on all three) makes the browser's next attempt at
+  once without resetting its backoff, so a failure after it
   waits the next step (§10). You decided the backoff (question 4), not this.
   The alternatives: the event also resets the backoff to 2 s, or the browser
   waits the backoff out, up to 5 min after its tab comes back. The
@@ -1493,8 +1500,9 @@ pages live. Read 3, then 1, then 2.
 4. **Answered 2026-10-14:** (b), "Back off 2 s to 5 min". After a network
    failure, a 5xx, or a 4xx on an exchange that §10 does not list, the next
    attempt (challenge, registration or exchange) comes after 2 s, doubling,
-   capped at 5 min, reset by a successful registration. An `online` or
-   `visible` event makes the next attempt at once without resetting it: this
+   capped at 5 min, reset by any success, an exchange or a registration
+   ("Any success resets it", asked the same day). An `online`, `visible` or
+   `pageshow` event makes the next attempt at once without resetting it: this
    file's choice, which you may overrule (§18). `DESIGN_PRINCIPLES.md` §3
    records the backoff as a decided exception, with the one extra round after
    `409 stale_challenge` (§4.3). §2, §10, §14 and §17.2 follow it.
