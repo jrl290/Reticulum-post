@@ -3,28 +3,35 @@
 > Read [`../DESIGN_PRINCIPLES.md`](../DESIGN_PRINCIPLES.md) first. Every rule
 > below follows it (events, not timers; no timeouts as a fix; strict
 > ordering; §1's 5 seconds), and its §3, no retries, with three exceptions,
-> each named where it applies: the browser's existing wait of 5 s after a
-> network failure or a 5xx, a retry and a timer (§2, open question 4); the
-> one extra round after `409 stale_challenge`, among the steps James approved
-> on 2026-10-04 at 12:11 UTC (§4.3); and the database helper's re-runs after a
-> deadlock or a lock-wait timeout, inherited from today's code (§2, §18).
+> each named where it applies: the browser's backoff after a network failure
+> or a 5xx (2 s, doubling, capped at 5 min), a retry and a timer that James
+> decided on 2026-10-14 (§2, §10, open question 4); the one extra round after
+> `409 stale_challenge`, among the steps James approved on 2026-10-04 at
+> 12:11 UTC (§4.3); and the database helper's re-runs after a deadlock or a
+> lock-wait timeout, inherited from today's code (§2, §18). The principles'
+> §3 records both browser exceptions.
 
-**Status:** specification, revision 2, 2026-10-05: revision 1 (8e271d1) with
-the 37 findings of its review applied. Not built. James chose on 2026-10-05
-to ship signed registration in stages, each with its own spec, build, private
-staging run (Phase 0) and deploy ("Stages, browsers first (Recommended)",
-§18). This is Stage 1: the browser signs its registration with its own
-identity key, the takeover fix he chose on 2026-10-02.
+**Status:** specification, revision 3, 2026-10-14: revision 2 (58c5008) with
+James's answers to the five open questions of §19. Not built. James chose on
+2026-10-05 to ship signed registration in stages, each with its own spec,
+build, private staging run (Phase 0) and deploy ("Stages, browsers first
+(Recommended)", §18). This is Stage 1: the browser signs its registration
+with its own identity key, the takeover fix he chose on 2026-10-02.
 [`REGISTRATION.md`](REGISTRATION.md) (revision 10) is the full design and the
 roadmap for Stage 2 (gateways) and Stage 3 (PHP node to PHP node peering);
 for browsers, where the two differ, this file holds.
 
-**For James.** Your five questions are §19 (read 3, then 1, then 2; 4 and 5
-stand alone). What you do is in §13: before the first deploy to each host,
-make it refuse the two log files (the lines are there); later, the
-enforcement date and each host's config edit. The choices this file made
-that you may overrule are at the end of §18. What stays exposed until Stage 2
-is §16. §3 to §7, §11, §12, §14, §15 and §17 are for the build.
+**For James.** You answered the five questions of §19 on 2026-10-14; §18
+records your answers, and §19 keeps the questions with each answer at its
+start. One thing stays open: how MySQL 8.4 is proven before retichat.com gets
+Stage 1 (§19, question 3); until then Stage 1 goes to selectiv only (§13).
+What you do is in §13: before the first deploy to each host, make it refuse
+the two log files (the lines are there); later, the enforcement date and each
+host's config edit. The choices this file made that you may overrule are at
+the end of §18; this revision adds one: an `online` or `visible` event makes
+the browser's next attempt at once without resetting its backoff (§10). What
+stays exposed until Stage 2 is §16. §3 to §7, §11, §12, §14, §15 and §17 are
+for the build.
 
 **Normative for** Reticulum-post (the PHP node) and Retichat-js (the browser:
 `lib/rns/interfaces/post_interface.js`, `lib/connect_policy.js`, and what
@@ -100,6 +107,12 @@ word: its `relay` means PHP node.
    James sets (§13). Schema, logging and `/health` follow (§11, §12), and
    `deploy.sh` builds the schema before the code that reads it goes live
    (§13).
+6. **The browser backs off.** After a network failure, a 5xx, or a 4xx on
+   an exchange that §10 does not list, its next attempt (challenge,
+   registration or exchange) comes after 2 s, doubling, capped at 5 min, and
+   a successful registration resets it; today it waits a fixed 5 s. James
+   decided it on 2026-10-14 (open question 4), and the principles' §3
+   records it (§10).
 
 **Left as today.**
 
@@ -121,11 +134,8 @@ word: its `relay` means PHP node.
 - **Exchange, Poll, Goodbye**, the stale sweep, the maintenance pass, the
   storage reclaim, the random transport id (Stage 3), and unbounded rows (§16
   item 5).
-- **The browser's** one connected tab per identity (`ActiveTab`), its goodbye
-  beacon, and its wait of 5 s before it tries again after a network failure,
-  a 5xx, or a 4xx on an exchange that §10 does not list. That wait is a retry
-  and a timer in the sense of the principles' §3; open question 4 asks
-  whether it stays.
+- **The browser's** one connected tab per identity (`ActiveTab`) and its
+  goodbye beacon. Its fixed 5 s wait gives way to the backoff (item 6).
 - **The database helper.** Stage 1's writes, like every hot-path write
   today, go through `Database::executeWithRetry`. It runs a statement again
   after MySQL error 1213 (deadlock) or 1205 (lock wait timeout, 50 s by
@@ -234,11 +244,13 @@ signature = Ed25519-sign(ed25519 private key, signed)   -- RNS Identity.sign, 64
 REGISTRATION.md's one layout for every client, so Stage 2 changes no byte;
 a browser signs the last four fields as empty (`0000` each). No JSON is
 signed; values are read from the decoded body before any normalisation. No
-address of the PHP node is signed (open question 5; §16 item 6). Worked
-example: REGISTRATION.md §4.3.1, vector `browser-first`. The browser builds
-these bytes in one function, `signRegistration()`, and signs nothing received
-apart from the challenge in its field; no RNS signature can begin with them,
-since each starts with a 16- or 32-byte hash or key.
+address of the PHP node is signed, now or in a later version of the
+browser's registration: James decided on 2026-10-14 to rely on Reticulum's
+security (open question 5; §16 item 6). Worked example: REGISTRATION.md
+§4.3.1, vector `browser-first`. The browser builds these bytes in one
+function, `signRegistration()`, and signs nothing received apart from the
+challenge in its field; no RNS signature can begin with them, since each
+starts with a 16- or 32-byte hash or key.
 
 ### 4.3 Checks, in order
 
@@ -266,8 +278,8 @@ browser's own, or a replayed one) gets `409`.
 **One more round after `409 stale_challenge`.** The browser fetches one new
 challenge and registers once more, and only once; a second `409` stops it
 (§10). James approved this step on 2026-10-04 ("If the code is out of date,
-the connecting side fetches a new one and tries once more", §18); the
-principles' §3 does not record it yet (open question 4). Its causes are
+the connecting side fetches a new one and tries once more", §18), and the
+principles' §3 records it with the browser's backoff (§10). Its causes are
 events: another tab or device of the identity binding between this browser's
 challenge and its registration; this browser's own registration, abandoned
 by `check()` or `disconnect()`, which the PHP node still completed; or a
@@ -448,11 +460,11 @@ answers in this order:
 challenge never answer `401` or `session_superseded`.
 
 **The browser**, on `401`, reports that exchange's packets lost and registers
-again (challenge, then register) at once, as today. That is at most one
-registration per `401`: a `401` on the first exchange of a session the
-browser has just made stops it, saying why (§10), with no 5 s wait. It acts
-on the status and code alone; today's match on the text "Invalid interface
-credentials" goes.
+again (challenge, then register) at once, as today, with no backoff: a `401`
+is a protocol answer, not a failure (§10). That is at most one registration
+per `401`: a `401` on the first exchange of a session the browser has just
+made stops it, saying why (§10), with no backoff. It acts on the status and
+code alone; today's match on the text "Invalid interface credentials" goes.
 
 ## 8. Superseded (409)
 
@@ -470,7 +482,7 @@ forged, and earns `409` (§7 step 4). Newest wins (James: "Newest wins
      "message": "This identity connected from another tab or device. Reload to connect here."}
 ```
 
-**The browser** stops: no exchange, no registration, no 5 s wait; its held
+**The browser** stops: no exchange, no registration, no backoff; its held
 packets are reported lost; the message is shown under its status dot (§10).
 A reload or an explicit reconnect registers again, and the other side then
 gets the message.
@@ -545,7 +557,8 @@ RFed inside an RNS link request and reaches the PHP node through the gateway.
 Today's move of a local destination between browser rows then only happens
 between rows of one owner, as at a reload. The rule runs in every mode, so an
 old legacy row with a transit mode is covered. Other rows follow today's
-rules. What "held" costs is open question 2; a signed row is never subject to
+rules. What "held" costs an old tab is open question 2, and James accepted it
+on 2026-10-14 ("Accept it (Recommended)"); a signed row is never subject to
 it.
 
 ## 10. Errors
@@ -570,7 +583,7 @@ Every 4xx and 5xx body that carries an `error` is `{"error": "<code>",
 | 409 | `session_superseded` | the same endpoints: any token but the current one on a signed row | stops with §8's message |
 | 404 | (any) | the challenge, at a PHP node without Stage 1 | registers the legacy way |
 
-**"Stops, says why":** no further automatic registration, and no 5 s wait.
+**"Stops, says why":** no further automatic registration, and no backoff.
 The interface emits `stopped(reason)` exactly once, whatever `down` has said
 before; the reason is a sentence for a person (§8's for
 `session_superseded`, this table's where it gives one, otherwise the
@@ -588,11 +601,21 @@ Stage 1): it then asks the challenge by `identity_hash`, registers the legacy
 way only on `404`, and otherwise stops: "This page is out of date. Reload it
 to connect."
 
-A network failure or a 5xx is no protocol answer and keeps today's handling:
-the attempt's packets are reported lost, and the next attempt comes after the
-5 s wait, or at once on an `online` or `visible` event (open question 4). Any
-other 4xx is handled as today on an exchange, and stops, says why, on the
-challenge or the registration. Old pages know none of these codes (§8).
+**The backoff.** A network failure or a 5xx is no protocol answer: the
+attempt's packets are reported lost, and the next attempt (challenge,
+registration or exchange) comes after a backoff of 2 s, doubling after each
+failure, capped at 5 min, and reset by a successful registration. A 4xx that
+this table does not list counts as such a failure on an exchange, and stops,
+says why, on the challenge or the registration. An `online` or `visible`
+event makes the next attempt at once, without resetting the backoff (this
+file's choice, §18), so a failure after it waits the next step. A `401` is a
+protocol answer, not a failure: the browser registers again at once (§7).
+The codes that stop end the attempts with no wait. The failure is still
+surfaced: the status dot shows offline while it lasts. James decided the
+backoff on 2026-10-14 ("Back off 2 s to 5 min", open question 4), in place
+of today's fixed 5 s wait, which old pages keep; the principles' §3 records
+it, with the one extra round after `409 stale_challenge` (§4.3). Old pages
+know none of these codes (§8).
 
 ## 11. Logging
 
@@ -725,6 +748,18 @@ anyone can POST one.
 
 ## 13. Rollout
 
+**selectiv only, for now.** James decided on 2026-10-14 ("selectiv only, for
+now", open question 3) that Phases 1 to 3 go to selectiv alone.
+retichat.com's PHP node stays on today's code, and with it today's takeover
+risk (§16 item 3), until MySQL 8.4 is proven; how it is proven is still open
+(§19, question 3). The web client is one build on both hosts: at
+retichat.com's PHP node the challenge answers `404`, the only status on which
+a browser registers the legacy way (§3, §10), so a page registers there as
+today, whichever site served it. No phase below goes to retichat.com until
+MySQL 8.4 is proven, and meanwhile no deploy there may carry Stage 1's code:
+`./deploy.sh` with no node deploys to both, so a Stage 1 ref is deployed by
+naming selectiv.
+
 ```toml
 [registration]
 enforce_signed_registration = false   # browsers only. James turns it on, on a date he sets.
@@ -785,9 +820,8 @@ http://127.0.0.1:8080`.
   until then Stage 1 goes to selectiv only.
 
 **Phase 1: the PHP node, accepting both.** `./deploy.sh <ref> selectiv`,
-then, after the MySQL proof, retichat.com, each run from a checkout of
-`<ref>` (the suite tests the working tree, so the suite that passes is the
-code shipped); the switch stays off. Gates on each node:
+run from a checkout of `<ref>` (the suite tests the working tree, so the
+suite that passes is the code shipped); the switch stays off. Gates:
 
 - (a0) `git merge-base --is-ancestor <the recorded commit> <ref>` succeeds,
   so the ref carries everything live there. `deploy.sh` SHOULD make this a
@@ -807,12 +841,11 @@ code shipped); the switch stays off. Gates on each node:
   the live ref before reading the rest, and before Phase 2); and the live
   page loads and turns green.
 
-**Phase 2: the browser signs.** Retichat-js to a site the same day its PHP
+**Phase 2: the browser signs.** Retichat-js to selectiv the same day its PHP
 node passed Phase 1, so that legacy tabs, §9's cost and §16 item 3 last
-hours, not days: selectiv as open question 1 allows, retichat.com after its
-node. Gates on each site: (a) Retichat-js's `./verify-deploy.sh <ref> <site>`
-passes byte for byte, on selectiv again hours later, where a foreign
-`app.js` has replaced verified deploys before; (b) a fresh load registers
+hours, not days. Gates: (a) Retichat-js's `./verify-deploy.sh <ref> selectiv`
+passes byte for byte, and again hours later, since a foreign `app.js` has
+replaced verified deploys there before (below); (b) a fresh load registers
 signed and turns green, its console shows no §1 line from §6's assertions,
 and `/health` shows `browsers_online.signed` of at least 1; (c) the same
 identity opened in a second browser profile makes the first page show §8's
@@ -827,7 +860,17 @@ run on a node's database once at the probe's first run there (§17.3), and
 then for every user at Phase 2; a failure costs no session (§4.5) and is
 logged `failed=`.
 
-**Phase 3: enforcement, on James's date.** On each host, a hand edit of its
+**Verify often** (James, 2026-10-14: "Go ahead, verify often
+(Recommended)", open question 1). A page served with selectiv's foreign
+`app.js` cannot sign and never turns green (§10), so while that file is
+served every selectiv user is offline. Retichat-js's `./verify-deploy.sh
+<ref> selectiv` runs after each deploy to selectiv, again hours later,
+whenever a selectiv tab shows offline and whenever `/health`'s
+`hash_only_challenges` rises (§12); when it fails, the ref is deployed
+again. The search for the file's source goes on, including other machines
+that deploy there.
+
+**Phase 3: enforcement, on James's date.** On selectiv, a hand edit of its
 config: `enforce_signed_registration = true`. Before it, the same day,
 Retichat-js's `verify-deploy.sh` shows a signing build on the sites that use
 that node, and `/health`'s `browsers_online` is read, for James's judgement
@@ -990,7 +1033,7 @@ with a bound that only fails it.
   second; a registration abandoned by `check()` that binds between the new
   challenge and the new registration still connects, with no stop;
   Superseded stops with its message and sends nothing more; terminal codes
-  stop without the 5 s wait; each stop emits `stopped` once, also after a
+  stop with no backoff; each stop emits `stopped` once, also after a
   network failure then `409` Superseded, and after a `401` then two `409
   stale_challenge`; a challenge `404` leads to the legacy registration; a
   `401` registers signed at once, and a `401` on that new session's first
@@ -998,6 +1041,14 @@ with a bound that only fails it.
   only a hash registers legacy on `404` and otherwise stops "out of date";
   §6's assertions with a test clock, the keepalive goodbye included, each
   answer still deciding. *Today:* no challenge; a plaintext token is read.
+- **`post_interface_backoff.test.mjs`:** with a test clock, consecutive
+  failures (a network failure, a 5xx, a 4xx on an exchange that §10 does not
+  list), on the challenge, the registration or an exchange, wait 2, 4, 8 … s
+  before the next attempt, capped at 300 s; a successful registration resets
+  the wait to 2 s; an `online` or `visible` event makes the next attempt at
+  once and leaves the backoff where it was, so a failure after it waits the
+  next step; a `401` registers again at once with no backoff; terminal codes
+  stop with no backoff. *Today:* every wait is 5 s.
 - **`registration_vectors.test.mjs`:** `signRegistration()` reproduces
   `browser-first`'s and `browser-reregister`'s bytes and signatures, their
   tokens decrypt, and both `tokens_negative` fail, against a copy of the
@@ -1007,9 +1058,8 @@ with a bound that only fails it.
   re-render, and is not replaced by a later `down` or `up`. *Today:* it
   passes `IdMgr.hash`, and `down` only sets "offline".
 - **`exchange_url_policy.test.mjs`:** `EXCHANGE_PATHS` has
-  `/v1/interfaces/challenge`, which `.htaccess` allows on both nodes; while
-  open question 5 is (b), the test fails if `connect-src` names a PHP node
-  beyond the two hosts. *Today:* the path is missing.
+  `/v1/interfaces/challenge`, which `.htaccess` allows on both nodes.
+  *Today:* the path is missing.
 
 **Harness scripts for private staging** (Phase 0):
 
@@ -1044,8 +1094,8 @@ they run one at a time.
 `php/tests/vectors/registration_vectors.json`, format 6, SHA-256
 `7d2bcfee1742a6421a05e2b212c04182cc94247d53128ad91d35139fb07304ef`, made by
 `tools/registration_vectors.py` from RNS 1.5.2 and checked independently by
-`tools/check_registration_vectors.php` (384 checks). Stage 1 changes no byte
-unless open question 5 is answered (a). It pins the `identities` `browser`,
+`tools/check_registration_vectors.php` (384 checks). Stage 1 changes no byte:
+no address is signed (§4.2). It pins the `identities` `browser`,
 `other`, `lowx` and `gateway` (only to fail decrypting a browser's token);
 `relays.A` and `relays.B` (node secrets); the `challenges` of `browser`,
 `other` and `lowx`; the `registrations` `browser-first` (count 0 → 1) and
@@ -1075,7 +1125,10 @@ signed at that PHP node and for all once the switch is on; and at once A3
 signed registration inheriting a legacy row that claimed its identity), A8
 (claiming a browser's identity under another `client`) and A13 (what a
 challenge or a refused signed registration reveals about the row: nothing,
-§3, §4.3). What stays exposed:
+§3, §4.3). It closes them at selectiv only: retichat.com's PHP node keeps
+today's code until MySQL 8.4 is proven (James, 2026-10-14: "selectiv only,
+for now", §13), so there it closes none of them yet, and item 3's takeover
+stays as today for every user. What stays exposed:
 
 1. **Gateway and peering rows are re-bound by their address (A5).** Anyone
    can POST an unsigned `reticulum-php` registration naming the live
@@ -1105,9 +1158,9 @@ challenge or a refused signed registration reveals about the row: nothing,
      holds it only by registering again.
    - After Phase 2 the user's reload signs and ends it: §4.5 removes the row,
      and a later legacy claim gets `403 identity_requires_signature`. During
-     Phase 1, and on a site whose pages still register the legacy way (open
-     question 1 (a) or (c)), the reload re-binds the row the legacy way, and
-     one more request takes it again.
+     Phase 1, and at retichat.com's PHP node, which keeps today's code until
+     MySQL 8.4 is proven (§13), the reload re-binds the row the legacy way,
+     and one more request takes it again.
    - Separately, any identity that has not signed at that PHP node, every
      native user included, can be given a local destination on a stranger's
      legacy row whenever the node holds no local destination or usable path
@@ -1140,7 +1193,10 @@ challenge or a refused signed registration reveals about the row: nothing,
    rows by hand needs the secret rotated (§12). Every refusal is logged (an
    old page's repeated `403`s once per row or count, §11), so a stranger can
    grow the error log, as malformed claims already can.
-6. **A12, accepted by this file pending open question 5.** The PHP node a
+6. **A12, accepted by James on 2026-10-14** (open question 5): "the verdict
+   was to rely on Reticulum's security for PHP nodes. A compromised node
+   still can only manifest as a black hole. It can't actually manipulate the
+   messages. This is a standard risk of Reticulum." The PHP node a
    page uses could fetch another PHP node's challenge for the user's key,
    have the browser sign it and forward the body. The other node then binds
    the identity there, and the identity's own session there gets `409`; and
@@ -1150,8 +1206,10 @@ challenge or a refused signed registration reveals about the row: nothing,
    seen, payloads end-to-end encrypted). The encrypted token does not change
    this (§5). Today nobody can choose a PHP node but James's two (the web's
    CSP `connect-src` allows only the page's origin and the two hosts'
-   `/reticulum/`), so this needs one of them compromised; the acceptance
-   rests on that.
+   `/reticulum/`), so this needs one of them compromised. His answer rests on
+   Reticulum's security, not on that, so no test pins `connect-src` to the
+   two hosts, and no address is signed, now or in a later version of the
+   browser's registration (§4.2).
 7. **Unchanged by Stage 1:** a restored database backup brings back an old
    secret and old counts, so each captured body in that range replays once
    (its replayer cannot decrypt the token; the session it supersedes is told
@@ -1210,8 +1268,8 @@ refused copy would be seeded; §9); the extended placeholder scanner (§14).
   the registration, §5's decrypt and checks; one more round after `409
   stale_challenge`; §10's stops end the interface as `block()` does, report
   its packets lost and emit `stopped(reason)` once; `401` by status only, at
-  most one registration per `401` (§7); §6's assertions; the 5 s wait as
-  open question 4 decides.
+  most one registration per `401` (§7); §6's assertions; §10's backoff in
+  place of the fixed 5 s wait (`RECONNECT_WAIT_MS`).
 - **`app.js`:** `new PostInterface(name, url, IdMgr.id)`, and a `stopped`
   handler: the reason kept as its own state with the status `stopped`, shown
   under the status dot by `_applyStatusDot` after every render (where
@@ -1247,15 +1305,17 @@ refused copy would be seeded; §9); the extended placeholder scanner (§14).
   export Retichat-js 90640bf`, `HARNESS_WEB_ROOT`).
 - **`deploy.sh`:** the migrate step and the ancestry refusal (§13), with
   their tests (§14).
-- **MySQL 8.4 for the suite**, as open question 3 decides: one database
-  fixture for every PHP test (`RETICULUM_TEST_DB=sqlite|mysql|mariadb`), and
-  `deploy.sh`'s suite step on SQLite and MySQL 8.4, refusing a red or missing
-  MySQL run (REGISTRATION.md §22.5 (a), (b)).
+- **MySQL 8.4 for the suite**, before retichat.com gets Stage 1, in the way
+  open question 3 has still to settle: one database fixture for every PHP
+  test (`RETICULUM_TEST_DB=sqlite|mysql|mariadb`), and `deploy.sh`'s suite
+  step on SQLite and MySQL 8.4, refusing a red or missing MySQL run
+  (REGISTRATION.md §22.5 (a), (b)).
 
 ## 18. Decisions
 
-Times are UTC, from the session's record. Where James picked an offered
-option, the question is quoted as asked, "relay" included.
+Times are UTC, from the session's record; none was recorded for the answers
+of 2026-10-14. Where James picked an offered option, the question is quoted
+as asked, "relay" included.
 
 | When | What he was answering | James | Where |
 |---|---|---|---|
@@ -1263,7 +1323,7 @@ option, the question is quoted as asked, "relay" included.
 | 2026-10-02 23:18 | "The '%' wildcard bug lets anyone re-bind some browser's relay row right now, with no knowledge at all. Hotfix it immediately, ahead of the full signing work?" | "Hotfix now (Recommended)" (3281ad5, live) | §4.6 |
 | 2026-10-02 23:18 | "Replay protection for a signed browser registration — how should the relay know a signature is fresh?" | "Can we do a standard challenge and signing?" | §3 |
 | 2026-10-03 02:38 | "When two devices or tabs hold the same identity on one relay, the spec has the newest registration win and the older one stop with 'connected elsewhere' (instead of both evicting each other forever). OK?" | "Newest wins (Recommended)" | §8 |
-| 2026-10-03 02:43 | "1. Sign the relay address the browser actually connected to (stops a rogue relay proxying your registration)?" | "Don't we have ssl to prevent spoofing?" A question, never answered: it was recorded as a decision a minute later. The 2026-10-04 00:41 report told him no address is signed and why, not that TLS leaves A12 open. Open question 5. | §4.2, §16 item 6, §19 |
+| 2026-10-03 02:43 | "1. Sign the relay address the browser actually connected to (stops a rogue relay proxying your registration)?" | "Don't we have ssl to prevent spoofing?" A question, never answered: it was recorded as a decision a minute later. The 2026-10-04 00:41 report told him no address is signed and why, not that TLS leaves A12 open. Open question 5, which he answered on 2026-10-14 (the last row). | §4.2, §16 item 6, §19 |
 | 2026-10-03 02:43 | "4. Separate enforcement switches for browsers and for gateways/relay peers?" | "Yes (Recommended)" | §13 |
 | 2026-10-04 03:39 | "Should the session token still come back encrypted to the registrant's key, given HTTPS and single-use challenges already cover it?" | "Keep it (Recommended)". Its option text said the encryption "also covers the accepted case of a registration passed along by someone in the middle"; it does not (§5). It still guards against replays and copied answers, so the answer stands. | §5 |
 | 2026-10-04 11:27 | "... May I start Docker Desktop and pull the official mysql:8.4 and mariadb:11.4 images from Docker Hub (about 1 GB together) to run the relay's tests on both before Phase 1?" | "Selectiv is the staging server" (not an approval of the download: open question 3) | §1.2, §13 |
@@ -1273,6 +1333,11 @@ option, the question is quoted as asked, "relay" included.
 | 2026-10-04 12:13 | why wakes went before the answer, and sending them after it | "Excellent. Let's continue as planned" | §2 (Stage 2) |
 | 2026-10-05 14:49 | "How should the signed registration go forward?", offered as "Narrow the spec to Stage 1 (browsers sign), finish its few questions, then build, stage and deploy it. Gateways and PHP-node peering follow as Stages 2 and 3, each with its own spec and questions." | "Stages, browsers first (Recommended)" | this file |
 | 2026-10-05 14:49 | "Fix the live peer-repair bug (the request that repairs a dead peering session fails with a 500) now, as its own small change?" | "Fix and deploy (Recommended)" (2b2ad9c, live on both nodes since 2026-10-05) | §2, §17.1 |
+| 2026-10-14 | "selectiv's foreign `app.js` at Phase 2" (§19, question 1) | "Go ahead, verify often (Recommended)": option (b); (a) and (c) are not taken | §13, §16 item 3, §19 |
+| 2026-10-14 | "An old tab whose announces the PHP node refuses" (§19, question 2) | "Accept it (Recommended)": option (a) | §9, §19 |
+| 2026-10-14 | "How MySQL 8.4 is proven before retichat.com" (§19, question 3) | "selectiv only, for now": Phases 1 to 3 go to selectiv alone, and retichat.com's PHP node stays on today's code until MySQL 8.4 is proven; how it is proven stays open | §13, §16, §17.3, §19 |
+| 2026-10-14 | "The browser's wait of 5 s" (§19, question 4) | "Back off 2 s to 5 min": option (b), now recorded in the principles' §3 | header, §2, §10, §14, §17.2, §19 |
+| 2026-10-14 | "Sign the address of the PHP node?" (§19, question 5) | "the verdict was to rely on Reticulum's security for PHP nodes. A compromised node still can only manifest as a black hole. It can't actually manipulate the messages. This is a standard risk of Reticulum." No address is signed. | §4.2, §14, §15, §16 item 6, §19 |
 
 **This file's own choices**, which James may overrule:
 
@@ -1281,7 +1346,6 @@ option, the question is quoted as asked, "relay" included.
 - The signature is checked before the challenge, so a request without the
   key learns nothing about the row (§4.3); the 11:57 explanation listed the
   code first.
-- No address of the PHP node is signed, pending open question 5 (§4.2).
 - **A legacy browser re-bind keeps today's `401`, as a gateway's does**
   (§4.6, §8). An old page does not know `409`: with it, one unsigned request
   would leave a user's page offline with no reason until reloaded, while a
@@ -1299,20 +1363,39 @@ option, the question is quoted as asked, "relay" included.
 - Stage 1's writes stay on `Database::executeWithRetry`, like every other
   hot-path write, and changing the helper (dropping 1205; lock order) is its
   own change (§2, §4.4). The alternative: Stage 1's statements run once, so a
-  deadlock answers `5xx` and the browser's 5 s wait follows.
+  deadlock answers `5xx` and the browser's backoff follows (§10).
 - Logs through `error_log()`; a served log file holds Phase 1 on that host;
   §4.6's two `403`s logged once per row or count (§11, §13).
 - `deploy.sh` builds the schema before the swap and refuses a ref that does
   not descend from the live commit (§13); `/health` counts challenges asked by
   hash (§12); a probe with test identities checks each node (§17.3).
+- **New in revision 3:** an `online` or `visible` event makes the browser's
+  next attempt at once without resetting its backoff, so a failure after it
+  waits the next step (§10). You decided the backoff (question 4), not this.
+  The alternatives: the event also resets the backoff to 2 s, or the browser
+  waits the backoff out, up to 5 min after its tab comes back. The
+  principles' §3 states this with the backoff, so overruling it changes that
+  text too.
 
 ## 19. Open questions for James
+
+James answered all five on 2026-10-14 (§18). Each question is kept below as
+it was asked, for the record, with his answer at its start. One thing stays
+open: how MySQL 8.4 is proven before retichat.com gets Stage 1 (question 3's
+candidates).
 
 Questions 1 to 3 depend on each other: 3 decides whether retichat.com gets
 Stage 1 at all, 1 what selectiv runs, and 2's cost lasts as long as 1 lets old
 pages live. Read 3, then 1, then 2.
 
-1. **selectiv's foreign `app.js` at Phase 2.** An `app.js` from 1 August keeps
+1. **Answered 2026-10-14:** (b), "Go ahead, verify often (Recommended)".
+   Retichat-js's `verify-deploy.sh <ref> selectiv` runs after each deploy to
+   selectiv, again hours later, whenever a selectiv tab shows offline and
+   whenever `/health`'s `hash_only_challenges` rises; a failure means a
+   redeploy; the search for the source goes on, including other machines
+   that deploy there (§13). Options (a) and (c) are not taken.
+
+   **selectiv's foreign `app.js` at Phase 2.** An `app.js` from 1 August keeps
    replacing verified deploys on selectiv (twice so far: 5 hours after one, 83
    minutes after another), from a source not yet found. It gives the connection
    only the identity hash, so it cannot sign. Once Phase 2 reaches selectiv,
@@ -1351,7 +1434,9 @@ pages live. Read 3, then 1, then 2.
    redeploy, while (a)'s loss is silent. Keep looking for the source,
    including other machines that deploy there.
 
-2. **An old tab whose announces the PHP node refuses.** A legacy tab whose
+2. **Answered 2026-10-14:** (a), "Accept it (Recommended)" (§9).
+
+   **An old tab whose announces the PHP node refuses.** A legacy tab whose
    identity another row already holds (§9's "held": your native app, reached
    through the gateway, say) keeps a green dot, because its exchanges work.
    It still sends and receives propagated messages, but direct messages for
@@ -1373,7 +1458,19 @@ pages live. Read 3, then 1, then 2.
    **Recommendation: (a).** (b) takes everything from the tab and still tells
    its user only "offline".
 
-3. **How MySQL 8.4 is proven before retichat.com.** Every test runs on
+3. **Answered 2026-10-14:** "selectiv only, for now". Stage 1's Phases 1 to
+   3 go to selectiv alone; retichat.com's PHP node stays on today's code, and
+   with it today's takeover risk (§16 item 3), until MySQL 8.4 is proven. The
+   web client is one build on both hosts: at retichat.com the challenge
+   answers `404`, so the browser registers there the legacy way (§13).
+   **Still open: how MySQL 8.4 is proven.** The candidates now (the options
+   below are as first asked): (a) a local MySQL 8.4 install on your Mac,
+   which `deploy.sh` starts for the test run and stops afterwards; (b)
+   Docker, as in the first option below (on 2026-10-07 you said "Don't build
+   the docker testing", about load tests); (c) a MySQL 8.4 server you name,
+   as in the second option below.
+
+   **How MySQL 8.4 is proven before retichat.com.** Every test runs on
    SQLite, and the 2026-09-23 outage shipped past a green SQLite suite;
    afterwards "MySQL in the staging chain, and the PHP suite on both engines
    in deploy.sh" was agreed. selectiv proves MariaDB 11.4, not MySQL. Your
@@ -1393,7 +1490,16 @@ pages live. Read 3, then 1, then 2.
    skips the whole suite), and the rollback copy (§13) needs neither. Until
    you answer, Stage 1 goes to selectiv only. **Recommendation: (a).**
 
-4. **The browser's wait of 5 s.** After a network failure, a 5xx, or a 4xx
+4. **Answered 2026-10-14:** (b), "Back off 2 s to 5 min". After a network
+   failure, a 5xx, or a 4xx on an exchange that §10 does not list, the next
+   attempt (challenge, registration or exchange) comes after 2 s, doubling,
+   capped at 5 min, reset by a successful registration. An `online` or
+   `visible` event makes the next attempt at once without resetting it: this
+   file's choice, which you may overrule (§18). `DESIGN_PRINCIPLES.md` §3
+   records the backoff as a decided exception, with the one extra round after
+   `409 stale_challenge` (§4.3). §2, §10, §14 and §17.2 follow it.
+
+   **The browser's wait of 5 s.** After a network failure, a 5xx, or a 4xx
    on an exchange that §10 does not list, the browser waits 5 s before it
    tries again, or less if an `online` or `visible` event comes first
    (`post_interface.js:36-44`, after RNS's TCP client interface, which waits
@@ -1420,7 +1526,14 @@ pages live. Read 3, then 1, then 2.
    the build: (b) or (c) changes §10 and §14's tests in the same Retichat-js
    change. **Recommendation: (a).**
 
-5. **Sign the address of the PHP node?** TLS proves which PHP node the
+5. **Answered 2026-10-14:** no. "the verdict was to rely on Reticulum's
+   security for PHP nodes. A compromised node still can only manifest as a
+   black hole. It can't actually manipulate the messages. This is a standard
+   risk of Reticulum." No address is signed, now or in a later version of the
+   browser's registration; the vectors stay at format 6, and neither (b)'s
+   test nor its version 2 registration comes (§4.2, §14, §15, §16 item 6).
+
+   **Sign the address of the PHP node?** TLS proves which PHP node the
    browser reached. It does not stop the node the page uses from passing the
    registration on: that node (one of your two hosts, if compromised; later,
    someone else's) fetches another PHP node's challenge for the user's key,

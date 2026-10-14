@@ -648,6 +648,15 @@ gateways register only at their configured `node_url`; PHP nodes register
 only at the PHP nodes in their own `[interfaces]` (§10.3). Revisit this if
 the web client ever lets users choose other PHP nodes.
 
+**For browsers, James decided on 2026-10-14** (Stage 1's open question 5):
+"the verdict was to rely on Reticulum's security for PHP nodes. A
+compromised node still can only manifest as a black hole. It can't actually
+manipulate the messages. This is a standard risk of Reticulum." A browser's
+registration signs no address of the PHP node, now or in a later version
+(`REGISTRATION-STAGE1.md` §4.2, §16 item 6). Whether this extends to
+gateways (Stage 2) and to PHP nodes registering at each other (Stage 3) is
+for those stages' specs to settle.
+
 ### 4.4 Web addresses in canonical form
 
 Every web address the protocol compares (a wake address, a `node_url`, a
@@ -5218,7 +5227,12 @@ answers there hold here.
       interface reconnects. (a) Keep it, as a recorded exception. (b) Give it
       the same backoff as a gateway. Asked for Stage 1, as
       `REGISTRATION-STAGE1.md`'s open question 4, with a third option; his
-      answer there holds here.
+      answer there holds here. **Answered there on 2026-10-14:** "Back off
+      2 s to 5 min". After a network failure, a 5xx, or a 4xx on an exchange
+      that Stage 1's §10 does not list, the browser's next attempt
+      (challenge, registration or exchange) comes after 2 s, doubling,
+      capped at 5 min, reset by a successful registration
+      (`REGISTRATION-STAGE1.md` §10; `DESIGN_PRINCIPLES.md` §3).
 
     **Recommendation: (a) for each.**
 18. **This document's own words.** You chose the names of the parties (PHP
@@ -5631,6 +5645,7 @@ Git keeps the full text of every revision.
 | 8e271d1 | 2026-10-05 | 10, record corrected: D2 restated as James decided it (no process but the storage reclaim); when the address check, registrations at and exchanges with PHP nodes, and goodbyes run is open question 20, not his decision; this document becomes the roadmap for Stages 2 and 3, and Stage 1 is specified in `REGISTRATION-STAGE1.md` |
 | c37b08f | 2026-10-05 | 10, corrected: §10.12, §15, §17 and §22.1 say what 2b2ad9c changed (`Storage`'s five `$this->log()` calls write with `error_log()`); nothing else changes |
 | 58c5008 | 2026-10-05 | 10, record corrected again: A12 is accepted by this document, not by James, whose 2026-10-03 answer was a question (§4.3.2, §19, §20; Stage 1's open question 5); question 12 and §10.12 no longer say James asked for the one-a-second wake limit to go (it is §20.2's choice); question 17.3 is asked in Stage 1 |
+| this commit | 2026-10-14 | 10, two notes: question 17.3 gives James's answer of 2026-10-14 in Stage 1 (the browser's backoff); §4.3.2 says that for browsers he decided the same day to sign no address of the PHP node, and that gateways and peering are for Stages 2 and 3; nothing else changes |
 
 Revision 7's question 3 (the double link after the later node's database
 reset) and revision 8's question 12 (a node that loses its identity file and
