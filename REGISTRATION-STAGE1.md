@@ -728,7 +728,8 @@ code untouched, to be run again. Each table's missing columns are added by
 one `ALTER` with `ALGORITHM=INSTANT`, and the indexes are built with
 `ALGORITHM=INPLACE LOCK=NONE`, so a server that cannot do either online
 refuses at once instead of copying or locking the table (the review of
-stage1-sign, 2026-10-14).
+stage1-sign, 2026-10-14). Reclaim's `OPTIMIZE TABLE`, which rebuilds an InnoDB
+table under the same lock, runs under the same ceiling, once.
 
 **Backfill**, in PHP at every migration, idempotent, with no `LIKE`:
 `claimed_identity_hash` for legacy `rns-js` rows, from a top-level
