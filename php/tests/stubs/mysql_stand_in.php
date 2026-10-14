@@ -8,8 +8,8 @@
  * DUPLICATE KEY, the ENGINE, ALGORITHM and LOCK clauses, an ALTER adding
  * several columns, OPTIMIZE and ANALYZE TABLE (a table's failure as rows of
  * the answer). It can fail one statement with 1205, MySQL's lock wait
- * timeout. Used by schema_migration_lock_wait_test.php and
- * storage_reclaim_lock_wait_test.php.
+ * timeout, or with any other exception. Used by
+ * schema_migration_lock_wait_test.php and storage_reclaim_lock_wait_test.php.
  *
  * Not a test: php/tests/stubs/ holds fixtures, and deploy.sh runs only
  * php/tests/*.php.
@@ -28,6 +28,9 @@ final class MysqlStandInPdo extends PDO
     public int $lockWait = 86400;
     /** The first statement matching this fails with 1205, as a lock wait timeout. */
     public ?string $timeOut = null;
+    /** The first statement matching $throwOn throws $throw instead: any other failure. */
+    public ?string $throwOn = null;
+    public ?Throwable $throw = null;
     /** The session's lock_wait_timeout cannot be read (a connection gone). */
     public bool $unreadable = false;
     /**
@@ -91,6 +94,10 @@ final class MysqlStandInPdo extends PDO
         if ($this->timeOut !== null && preg_match($this->timeOut, $sql) === 1) {
             $this->timeOut = null;
             throw self::error(1205, 'Lock wait timeout exceeded; try restarting transaction');
+        }
+        if ($this->throwOn !== null && $this->throw !== null && preg_match($this->throwOn, $sql) === 1) {
+            [$throw, $this->throwOn, $this->throw] = [$this->throw, null, null];
+            throw $throw;
         }
 
         return $sql;

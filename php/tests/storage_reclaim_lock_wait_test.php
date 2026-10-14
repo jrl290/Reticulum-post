@@ -29,7 +29,10 @@ declare(strict_types=1);
  *      table is logged as not run;
  *  (f) `index.php once` reaches the same rebuilds through
  *      enforceStorageBudget(), under the same 2 s;
- *  (g) on SQLite the reclaim is a VACUUM, with no lock_wait_timeout.
+ *  (g) on SQLite the reclaim is a VACUUM, with no lock_wait_timeout;
+ *  (h) an exception other than PDOException out of an OPTIMIZE leaves the
+ *      reclaim as before, thrown, and the session's value is put back on its
+ *      way out.
  */
 
 $root = dirname(__DIR__);
@@ -230,6 +233,21 @@ $summary = $storage->reclaimStorage();
 check('VACUUM, and no lock_wait_timeout read or set',
     $summary['storage_reclaimed_tables'] === ['sqlite:vacuum'] && positions($pdo->log, '/\AVACUUM\z/') !== []
     && positions($pdo->log, '/lock_wait_timeout|\AOPTIMIZE /') === [], json_encode(array_column($pdo->log, 'sql')));
+
+echo "(h) any other exception out of an OPTIMIZE leaves the reclaim as before, and the session's value is put back\n";
+[$pdo, $storage] = node($dir . '/h.sqlite');
+$pdo->throwOn = '/\AOPTIMIZE TABLE `inbound_packets`\z/';
+$pdo->throw = new RuntimeException('stand-in: not a PDOException');
+$thrown = null;
+try {
+    $storage->reclaimStorage();
+} catch (Throwable $e) {
+    $thrown = $e;
+}
+check('thrown out of reclaimStorage(), the same exception, with the value put back as the one statement after the OPTIMIZE',
+    $thrown instanceof RuntimeException && $thrown->getMessage() === 'stand-in: not a PDOException' && $pdo->lockWait === 86400
+    && array_column(array_slice($pdo->log, (positions($pdo->log, '/\AOPTIMIZE TABLE /')[0] ?? 0) + 1), 'sql') === ['SET SESSION lock_wait_timeout = 86400'],
+    json_encode(['thrown' => $thrown?->getMessage(), 'after' => array_column(array_slice($pdo->log, (positions($pdo->log, '/\AOPTIMIZE TABLE /')[0] ?? 0) + 1), 'sql')]));
 
 echo "\n$pass passed, $fail failed\n";
 exit($fail === 0 ? 0 : 1);

@@ -34,7 +34,14 @@ declare(strict_types=1);
  *      the deploy can be run again; the next run builds the rest;
  *  (e) when the session's value cannot be read, no DDL runs;
  *  (f) on SQLite: no lock_wait_timeout, one ADD COLUMN per statement, and
- *      no MySQL clause.
+ *      no MySQL clause;
+ *  (g) a DDL statement that fails some other way: an exception other than
+ *      PDOException leaves migrate() as before, thrown, through `index.php
+ *      migrate` and a request's migrateIfNeeded() alike, and the session's
+ *      value is put back on its way out; a PDOException with another code
+ *      (1846, no INSTANT for this ALTER) is recorded as before, the run goes
+ *      on, `index.php migrate` exits 1 without "stopped at", and the value is
+ *      put back after the last DDL statement.
  */
 
 $root = dirname(__DIR__);
@@ -266,6 +273,75 @@ check('and it builds the same objects, one column per entry, with no error',
     ($summaryF['errors'] ?? ['?']) === [] && count($summaryF['built'] ?? []) === 15 && missingObjects($plainF) === [],
     json_encode(['errors' => $summaryF['errors'] ?? null, 'built' => array_column($summaryF['built'] ?? [], 'object')]));
 unset($pdoF, $plainF);
+
+// ── (g) a DDL statement that fails some other way ───────────────────────
+echo "(g) any other failure out of a DDL statement surfaces as before, and the session's value is put back\n";
+/** @return Throwable|null what $run threw */
+function thrownBy(callable $run): ?Throwable
+{
+    try {
+        $run();
+    } catch (Throwable $e) {
+        return $e;
+    }
+
+    return null;
+}
+$pathG = $dir . '/g.sqlite';
+$plainG = liveDatabase($pathG);
+$pdoG = new MysqlStandInPdo($pathG);
+$pdoG->throwOn = '/\AALTER TABLE `interfaces` /';
+$pdoG->throw = new RuntimeException('stand-in: not a PDOException');
+$thrownG = thrownBy(static fn () => standInStorage($pathG, $pdoG)->migrate());
+$alterG = positions($pdoG->log, '/\AALTER TABLE `interfaces` /');
+check('a RuntimeException out of the interfaces ALTER leaves migrate() as before: the same exception, thrown',
+    $thrownG instanceof RuntimeException && $thrownG->getMessage() === 'stand-in: not a PDOException',
+    $thrownG === null ? 'nothing thrown' : get_class($thrownG) . ': ' . $thrownG->getMessage());
+check('...and on its way out the session\'s value is put back: the one statement after the failed ALTER',
+    count($alterG) === 1 && array_column(array_slice($pdoG->log, $alterG[0] + 1), 'sql') === ['SET SESSION lock_wait_timeout = 86400']
+    && $pdoG->lockWait === 86400,
+    json_encode(['after' => array_column(array_slice($pdoG->log, ($alterG[0] ?? 0) + 1), 'sql'), 'lock_wait' => $pdoG->lockWait]));
+
+// The ALTER runs this time; the UNIQUE index throws.
+$pdoG2 = new MysqlStandInPdo($pathG);
+$pdoG2->throwOn = '/\ACREATE UNIQUE INDEX idx_interfaces_identity_hash /';
+$pdoG2->throw = new RuntimeException('stand-in: not a PDOException');
+$thrownG2 = thrownBy(static fn () => standInStorage($pathG, $pdoG2)->migrateIfNeeded());
+check('through a request\'s migrateIfNeeded() (an index this time): thrown, the value put back, no version recorded',
+    $thrownG2 instanceof RuntimeException && $pdoG2->lockWait === 86400
+    && ($pdoG2->log[count($pdoG2->log) - 1]['sql'] ?? '') === 'SET SESSION lock_wait_timeout = 86400'
+    && recordedVersion($plainG) === LIVE_VERSION,
+    json_encode(['thrown' => $thrownG2?->getMessage(), 'last' => $pdoG2->log[count($pdoG2->log) - 1]['sql'] ?? null, 'recorded' => recordedVersion($plainG)]));
+
+// A later index throws, through `index.php migrate`.
+$pdoG3 = new MysqlStandInPdo($pathG);
+$pdoG3->throwOn = '/\ACREATE INDEX idx_outbound_packets_iface /';
+$pdoG3->throw = new RuntimeException('stand-in: not a PDOException');
+$thrownG3 = thrownBy(static fn () => report(standInStorage($pathG, $pdoG3)));
+check('through `index.php migrate`: thrown out of the report, the value put back',
+    $thrownG3 instanceof RuntimeException && $pdoG3->lockWait === 86400
+    && ($pdoG3->log[count($pdoG3->log) - 1]['sql'] ?? '') === 'SET SESSION lock_wait_timeout = 86400',
+    json_encode(['thrown' => $thrownG3?->getMessage(), 'last' => $pdoG3->log[count($pdoG3->log) - 1]['sql'] ?? null]));
+unset($pdoG, $pdoG2, $pdoG3, $plainG);
+
+$pathG4 = $dir . '/g4.sqlite';
+$plainG4 = liveDatabase($pathG4);
+$pdoG4 = new MysqlStandInPdo($pathG4);
+$pdoG4->throwOn = '/\AALTER TABLE `interfaces` /';
+$noInstant = new PDOException('SQLSTATE[0A000]: Feature not supported: 1846 ALGORITHM=INSTANT is not supported. Try ALGORITHM=COPY/INPLACE.');
+$noInstant->errorInfo = ['0A000', 1846, 'ALGORITHM=INSTANT is not supported. Try ALGORITHM=COPY/INPLACE.'];
+$pdoG4->throw = $noInstant;
+[$codeG4, $outG4, $errG4] = report(standInStorage($pathG4, $pdoG4));
+check('a PDOException with another code (1846) is recorded as before: `index.php migrate` exits 1 naming it, not "stopped at"',
+    $codeG4 === 1 && str_contains($errG4, 'migrate error: add_column interfaces.' . implode(', ', STAGE1_COLUMNS) . ': SQLSTATE[0A000]: Feature not supported: 1846 ')
+    && str_contains($errG4, 'migrate: FAILED with ') && !str_contains($errG4, 'stopped at'), trim($errG4));
+$ddlG4 = array_keys(array_filter(array_column($pdoG4->log, 'sql'), 'isDdl'));
+$setsG4 = positions($pdoG4->log, '/\ASET SESSION lock_wait_timeout = /');
+check('...the run goes on to the indexes as before, and the value is put back after its last DDL statement',
+    statements($pdoG4->log, '/\ACREATE (UNIQUE )?INDEX /') !== [] && count($setsG4) === 2
+    && $pdoG4->log[$setsG4[1]]['sql'] === 'SET SESSION lock_wait_timeout = 86400' && $setsG4[1] > max($ddlG4) && $pdoG4->lockWait === 86400,
+    json_encode(['sets' => $setsG4, 'last_ddl' => $ddlG4 === [] ? null : max($ddlG4)]));
+unset($pdoG4, $plainG4);
 
 array_map('unlink', glob($dir . '/*') ?: []);
 @rmdir($dir);
