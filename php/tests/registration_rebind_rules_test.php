@@ -27,6 +27,10 @@
  * switch on, one per legacy row. No SQL in php/src compares metadata_json
  * with a value from a request: the one comparison allowed is
  * recentNodeInterfacesByStatus's LIKE :poll_gateway, bound to a constant.
+ * A legacy re-bind whose row a concurrent signed bind's §4.5 removes
+ * between step 5's read and its UPDATE (a connection that runs the other
+ * request in between) answers 403 identity_requires_signature, never 200
+ * with a token no row holds; with no signed row, step 5 inserts a row.
  *
  * Before Stage 1: A8 re-binds the browser's row; mode 6 is accepted; the
  * old-code row gets 200; every refusal is logged; the scan finds
@@ -591,6 +595,85 @@ check("php/src ($scanned files): exactly one comparison on metadata_json, recent
 foreach ($others as $hit) {
     check("no other comparison: {$hit['file']}:{$hit['line']} in {$hit['function']}() ({$hit['operator']} {$hit['placeholder']})", false);
 }
+
+echo "\n(10) a legacy re-bind whose row goes between step 5's read and its UPDATE never answers 200 for it\n";
+
+/**
+ * The node's connection to its SQLite file, which runs $race once just
+ * before the legacy re-bind's UPDATE is prepared: after step 5 has read the
+ * row, as another request would in between.
+ */
+final class RacingPdo extends PDO
+{
+    /** @var (\Closure(): void)|null */
+    public ?\Closure $race = null;
+    public int $rebinds = 0;
+
+    public function __construct(string $path)
+    {
+        parent::__construct('sqlite:' . $path);
+        $this->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+    }
+
+    public function prepare(string $query, array $options = []): PDOStatement|false
+    {
+        $sql = (string) preg_replace('/\s+/', ' ', trim($query));
+        if (str_starts_with($sql, 'UPDATE interfaces SET session_token = :session_token, previous_session_token_hash = NULL')) {
+            $this->rebinds++;
+            $race = $this->race;
+            $this->race = null;
+            if ($race !== null) {
+                $race();
+            }
+        }
+
+        return parent::prepare($query, $options);
+    }
+}
+
+$racePath = sys_get_temp_dir() . '/rebind-race-' . bin2hex(random_bytes(4)) . '.sqlite';
+register_shutdown_function(static function () use ($racePath): void {
+    foreach (['', '-wal', '-shm'] as $suffix) {
+        @unlink($racePath . $suffix);
+    }
+});
+$raced = RegFixture::storage([], $racePath);
+$rival = RegFixture::storage([], $racePath); // another request, its own connection
+$racingPdo = new RacingPdo($racePath);
+(new ReflectionProperty(Storage::class, 'db'))->setValue($raced, $racingPdo);
+
+// The identity signs in between: its bind's §4.5 removes the legacy row.
+$racer = RegFixture::identity();
+[$racerLegacy] = legacy($raced, ['client' => 'rns-js', 'mode' => 1, 'identity_hash' => $racer['hash_hex']]);
+$racingPdo->rebinds = 0;
+$racingPdo->race = static function () use ($rival, $racer): void {
+    RegFixture::capture(static fn () => RegFixture::register($rival, $racer));
+};
+[$r, $log] = legacy($raced, ['client' => 'rns-js', 'mode' => 1, 'identity_hash' => $racer['hash_hex']]);
+check('(precondition) the race ran: the identity signed and §4.5 removed the legacy row',
+    is_array($racerLegacy) && row($raced, $racerLegacy['interface_id']) === null
+    && count_rows($raced, 'interfaces', 'identity_hash = :h', [':h' => $racer['hash_hex']]) === 1);
+check('the re-bind that changed no row goes back to step 4: 403 identity_requires_signature, logged',
+    RegFixture::outcome($r) === [403, 'identity_requires_signature'] && str_contains($log, '[REG-REFUSED] 403 identity_requires_signature'),
+    json_encode(RegFixture::outcome($r)) . ' ' . trim($log));
+check('...not "rebound" for a row that is gone, no second re-bind, and no legacy row inserted',
+    !str_contains($log, '[REG-LEGACY]') && $racingPdo->rebinds === 1
+    && count_rows($raced, 'interfaces', 'claimed_identity_hash = :h AND identity_hash IS NULL', [':h' => $racer['hash_hex']]) === 0,
+    "rebinds={$racingPdo->rebinds} " . trim($log));
+
+// The row goes some other way, with no signed row: step 5 again inserts one.
+$gone = bin2hex(random_bytes(16));
+[$goneLegacy] = legacy($raced, ['client' => 'rns-js', 'mode' => 1, 'identity_hash' => $gone]);
+$racingPdo->rebinds = 0;
+$racingPdo->race = static function () use ($rival, $goneLegacy): void {
+    RegFixture::db($rival)->prepare('DELETE FROM interfaces WHERE interface_id = :i')->execute([':i' => $goneLegacy['interface_id']]);
+};
+[$r, $log] = legacy($raced, ['client' => 'rns-js', 'mode' => 1, 'identity_hash' => $gone]);
+check('with no signed row, step 5 again inserts a row: 200, a new interface, logged created',
+    is_array($r) && $r['interface_id'] !== $goneLegacy['interface_id'] && row($raced, $goneLegacy['interface_id']) === null
+    && str_contains($log, '[REG-LEGACY] client=rns-js action=created interface=' . substr($r['interface_id'], 0, 8)) && $racingPdo->rebinds === 1,
+    "rebinds={$racingPdo->rebinds} " . trim($log));
+check('...whose token a row holds: it authenticates', is_array($r) && authStatus($raced, $r['interface_id'], $r['session_token']) === 200);
 
 echo "\n$pass passed, $fail failed\n";
 exit($fail === 0 ? 0 : 1);

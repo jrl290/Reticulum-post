@@ -795,34 +795,25 @@ trait RequestRegistrationTrait
         } else {
             $context['identity'] = $claim;
             // 4. A claim its identity has proven here is not for this path.
-            $signed = $this->signedRowByIdentityHash($claim);
-            if ($signed !== null) {
-                throw $this->registrationRefusal(403, 'identity_requires_signature',
-                    'This identity registers with a signature on this PHP node. Reload this page to connect.', $context,
-                    $this->legacyRefusalShouldLog($claim, $signed));
-            }
+            $this->refuseClaimOfSignedIdentity($claim, $context);
         }
 
-        // 5. Re-bind the claim's legacy row in place, or insert one.
-        $existing = $claim === null ? null : $this->legacyBrowserRowByClaim($claim);
+        // 5. Re-bind the claim's legacy row in place, or insert one. A
+        // re-bind that changes no row lost its row after the read, to a
+        // concurrent signed bind's §4.5. Then back to step 4, once: with the
+        // signed row there, 403 identity_requires_signature; without it (the
+        // row went some other way), step 5 again, which inserts a row if
+        // that re-bind finds its row gone too.
         $sessionToken = bin2hex(random_bytes(32));
-        if ($existing !== null) {
+        $existing = $claim === null ? null : $this->legacyBrowserRowByClaim($claim);
+        $rebound = $existing !== null && $this->rebindLegacyBrowserRow((string) $existing['interface_id'], $sessionToken, $bitrate, $mtu, $metadata);
+        if ($claim !== null && $existing !== null && !$rebound) {
+            $this->refuseClaimOfSignedIdentity($claim, $context);
+            $existing = $this->legacyBrowserRowByClaim($claim);
+            $rebound = $existing !== null && $this->rebindLegacyBrowserRow((string) $existing['interface_id'], $sessionToken, $bitrate, $mtu, $metadata);
+        }
+        if ($rebound) {
             $interfaceId = (string) $existing['interface_id'];
-            $stmt = $this->db->prepare(
-                'UPDATE interfaces
-                    SET session_token = :session_token, previous_session_token_hash = NULL,
-                        bitrate = :bitrate, mtu = :mtu, status = :status,
-                        metadata_json = :metadata_json, last_seen_at = :last_seen_at
-                  WHERE interface_id = :interface_id AND identity_hash IS NULL'
-            );
-            $stmt->bindValue(':session_token', $sessionToken, PDO::PARAM_STR);
-            $stmt->bindValue(':bitrate', $bitrate, PDO::PARAM_INT);
-            $stmt->bindValue(':mtu', $mtu, PDO::PARAM_INT);
-            $stmt->bindValue(':status', 'online', PDO::PARAM_STR);
-            $stmt->bindValue(':metadata_json', self::encodeJson($metadata), PDO::PARAM_STR);
-            $stmt->bindValue(':last_seen_at', time(), PDO::PARAM_INT);
-            $stmt->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
-            Database::executeWithRetry($stmt, 'legacyBrowserRebind');
             $action = 'rebound';
         } else {
             $interfaceId = $this->insertLegacyRow($name, $bitrate, $mtu, $metadata, $sessionToken, $claim, null);
@@ -831,6 +822,43 @@ trait RequestRegistrationTrait
         error_log(sprintf('[REG-LEGACY] client=rns-js action=%s interface=%s', $action, substr($interfaceId, 0, 8)));
 
         return ['interface_id' => $interfaceId, 'session_token' => $sessionToken];
+    }
+
+    /** §4.6 step 4: a claim its identity has proven here is not for this path. */
+    private function refuseClaimOfSignedIdentity(string $claim, array $context): void
+    {
+        $signed = $this->signedRowByIdentityHash($claim);
+        if ($signed !== null) {
+            throw $this->registrationRefusal(403, 'identity_requires_signature',
+                'This identity registers with a signature on this PHP node. Reload this page to connect.', $context,
+                $this->legacyRefusalShouldLog($claim, $signed));
+        }
+    }
+
+    /**
+     * §4.6 step 5's re-bind of a legacy browser row, in place. False when the
+     * UPDATE changed no row: the row went after step 5 read it. It always
+     * writes a new token, so MySQL's affected rows equal its matched rows.
+     */
+    private function rebindLegacyBrowserRow(string $interfaceId, string $sessionToken, int $bitrate, int $mtu, array $metadata): bool
+    {
+        $stmt = $this->db->prepare(
+            'UPDATE interfaces
+                SET session_token = :session_token, previous_session_token_hash = NULL,
+                    bitrate = :bitrate, mtu = :mtu, status = :status,
+                    metadata_json = :metadata_json, last_seen_at = :last_seen_at
+              WHERE interface_id = :interface_id AND identity_hash IS NULL'
+        );
+        $stmt->bindValue(':session_token', $sessionToken, PDO::PARAM_STR);
+        $stmt->bindValue(':bitrate', $bitrate, PDO::PARAM_INT);
+        $stmt->bindValue(':mtu', $mtu, PDO::PARAM_INT);
+        $stmt->bindValue(':status', 'online', PDO::PARAM_STR);
+        $stmt->bindValue(':metadata_json', self::encodeJson($metadata), PDO::PARAM_STR);
+        $stmt->bindValue(':last_seen_at', time(), PDO::PARAM_INT);
+        $stmt->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
+        Database::executeWithRetry($stmt, 'legacyBrowserRebind');
+
+        return $stmt->rowCount() === 1;
     }
 
     /**
