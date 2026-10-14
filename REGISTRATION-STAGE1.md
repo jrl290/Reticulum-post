@@ -74,7 +74,7 @@ format 6, unchanged (§15). MUST, MUST NOT, SHOULD and MAY are as in RFC 2119.
 | **Local destination** | A `local_destinations` entry: the PHP node delivers that destination's packets on that row. Only browser rows have them, made from their own announces (`registerLocalDestinationIfOwnInterface`). |
 | **Node secret** | The PHP node's key for its challenges (§3). |
 | **Enforcement switch** | `[registration] enforce_signed_registration`. Off, the default: the PHP node **accepts both** signed and legacy browser registrations. On: signed only (§13). |
-| **Transit mode** | RNS interface mode 3 (access point), 5 (boundary) or 6 (gateway), in which an interface carries other nodes' traffic. |
+| **Transit mode** | RNS interface mode 3 (access point), 5 (boundary) or 6 (gateway), in which an interface carries other nodes' traffic. A registration's `mode` is read as the node's runtime reads it (`interfaceMode()`: `(int)` of a scalar), so `"6.0"`, `" 6"`, `"+6"` and `"6abc"` are 6, and the row stores that integer (the review of stage1-sign, 2026-10-14). |
 | **Peering** | How retichat.com and selectiv carry each other's traffic: each registers at the other the legacy way, and wakes it. |
 | **The two hosts** | retichat.com (**production**, MySQL 8.4) and selectivesubconscious.com, **selectiv** (James's staging server, MariaDB 11.4), one PHP node each on cPanel shared hosting. |
 | **Private staging** | `staging.sh` with `STAGING_PHP=local` on James's Mac: a PHP node under `php -S` on 127.0.0.1, the local gateway, and browsers driven by the harness scripts in `test-harnesses/`. Never either host. |
@@ -361,8 +361,9 @@ A body without `registration` whose `client` is `rns-js`, in order:
    then gets `401`, and an old page registers again at once, as after a
    gateway's legacy re-bind and for the reason REGISTRATION.md §4.10 gives: a
    client that does not know `409` would stay down after one unsigned
-   registration. Otherwise INSERT a legacy row with `claimed_identity_hash =
-   claim`.
+   registration. If the `UPDATE` changes no row (a signed registration's
+   §4.5 removed it after it was read), go back to step 4. Otherwise INSERT a
+   legacy row with `claimed_identity_hash = claim`.
 6. Store neither `metadata.identity_hash` nor `metadata.wake_url` (the latter
    logged `[REG-WAKE-URL-IGNORED]`, as today); log `[REG-LEGACY]`.
 
@@ -556,11 +557,19 @@ An announce not accepted is dropped whole: no remembered key, ratchet or
 `app_data`, no local destination, no path update, no announce cache, no
 forwarding. Its `inbound_packets` row says `refused`, and nothing serves it:
 a cache request that replays it relays nothing, and a new row is seeded only
-with copies that were accepted (§17.1). Logged `[ANNOUNCE-FOREIGN]
+with copies that were accepted (§17.1). A copy whose row is gone (§4.5, the
+stale sweep) answers a cache request as not cached: replayed through a row
+that no longer exists, it would skip this check and make a path to an
+interface that does not exist (the review of stage1-sign, 2026-10-14). Logged `[ANNOUNCE-FOREIGN]
 interface=<id8> dest=<hash> identity=<8 hex> owner=<8 hex|none>` or
 `[ANNOUNCE-LEGACY-REFUSED] interface=<id8> dest=<hash> reason=<seen|held>`.
 `owner(R)` is read as the announce arrives, so a legacy row loses its claim
-the moment its identity signs here.
+the moment its identity signs here. A row that is gone by then owns nothing,
+whatever its client was: an announce handled under the id of a row that no
+longer exists (a cache request's replay, a legacy row §4.5 removed while its
+own batch was being read, a PHP-node peering row `connectToPeer` replaced
+during an exchange with that peer) is refused as `owner=none`, since a path
+through it would lead nowhere (the review of stage1-sign, 2026-10-14).
 
 Nothing legitimate breaks: the browser announces only its own identity's
 destinations (`lxmf.delivery`, `rfed.delivery`); a distro's announce goes to
@@ -712,6 +721,25 @@ SHOULD read the existing indexes once (`information_schema.STATISTICS` on
 MySQL and MariaDB, `PRAGMA index_list` on SQLite) and create only the missing
 ones, so a re-run takes no metadata lock.
 
+**The migration's locks.** On MySQL and MariaDB each DDL statement takes an
+exclusive metadata lock on its table, at its start or its end, and while it
+waits for one every new statement on that table waits behind it: a statement
+waiting on a row lock holds its table for up to `innodb_lock_wait_timeout`
+(50 s), and MariaDB's own `lock_wait_timeout` is a day. So `migrate()` runs
+its DDL with `lock_wait_timeout = 2`, once each, with no retry (§3): a
+statement that cannot have its lock within 2 s fails the migration, `index.php
+migrate` exits non-zero and `deploy.sh` stops before the swap with the live
+code untouched, to be run again. Each table's missing columns are added by
+one `ALTER` with `ALGORITHM=INSTANT`, and the indexes are built with
+`ALGORITHM=INPLACE LOCK=NONE`, so a server that cannot do either online
+refuses at once instead of copying or locking the table (the review of
+stage1-sign, 2026-10-14). The older repair steps, `ensureColumnTypes`'
+`MODIFY … BIGINT` and `ensurePrimaryKeys`' primary-key change, carry no such
+clause and would copy their table with writes blocked (the 2 s bounds only
+their wait for the lock); each checks first and runs only on a schema older
+than 50c870b's, which neither host has. Reclaim's `OPTIMIZE TABLE`, which rebuilds an InnoDB
+table under the same lock, runs under the same ceiling, once.
+
 **Backfill**, in PHP at every migration, idempotent, with no `LIKE`:
 `claimed_identity_hash` for legacy `rns-js` rows, from a top-level
 `metadata.identity_hash` of 32 lower-case hex; the key leaves `metadata_json`
@@ -832,6 +860,18 @@ http://127.0.0.1:8080`.
   For example, add `RedirectMatch 404 ^/reticulum/(error_log|var/)` to
   `~/public_html/reticulum/.htaccess`; the proof is both `curl`s answering
   `403` or `404`.
+- On 2026-10-14 selectiv answered `403` for `error_log` but `200` for
+  `var/router.log` (5 KB, written that day) and for `var/` itself, an Apache
+  directory listing naming `reticulum-php.sqlite` (3.5 MB, 19 July), which
+  it also serves: a copy of a PHP node database, whose tables hold session
+  tokens and PHP-node peer tokens in plain text (the node compares them with
+  `hash_equals`) and the identity hashes and announces of those who
+  registered (its contents were not read). So before Phase 1 there, besides the `RedirectMatch`: the
+  copy leaves the web root, `curl` of `var/` and of the file answers `403`
+  or `404`, and James decides whether any token in the copy can still work
+  on the live database. retichat.com, the same day: `error_log` `403`, but
+  `var/` listed and its `router.log` (360 KB, written that hour) served; its
+  SQLite files there are empty.
 - Record the commit `/health` names (`build.commit`; 50c870b on both nodes
   on 2026-10-14). It is that node's rollback target.
 - For retichat.com, the MySQL 8.4 run of open question 3 must have passed;
@@ -858,6 +898,18 @@ suite that passes is the code shipped); the switch stays off. Gates:
   2026-10-14; on selectiv a failure means the old `app.js` is back: redeploy
   the live ref before reading the rest, and before Phase 2); and the live
   page loads and turns green.
+
+**The swap's seconds.** `deploy.sh` renames `lib/` before the top-level
+files, and opcache may recheck each file on its own clock (`revalidate_freq`,
+2 s by default), so for milliseconds, or up to about 2 s, a request can run
+Stage 1's `index.php` with today's `lib/` or the reverse. Either is a fatal
+error, answered `500`, since Stage 1 moves `registerInterface` and
+`authenticateInterface` between traits. Browsers and gateways take a `5xx`
+as a failure and come back at their next cycle, and no data is damaged.
+Accepted (the review of stage1-sign, 2026-10-14): an `index.php` check of a
+release constant in `lib/` would answer `503` instead, which changes nothing
+for a client. The manual rollback `deploy.sh` prints (`cp -r
+~/reticulum-rollback/*`) has the same seconds.
 
 **Phase 2: the browser signs.** Retichat-js to selectiv the same day its PHP
 node passed Phase 1, so that legacy tabs, §9's cost and §16 item 3 last
@@ -970,7 +1022,12 @@ with a bound that only fails it.
   `rns-post-interface` registration naming a browser's identity hash makes its
   own row (A8); no identity field in `metadata_json`; legacy rows claiming an
   identity that signs are removed with their traffic; legacy mode 3, 5 or 6
-  `400`; the switch refuses legacy browsers only. With the switch off, a
+  `400`, in every spelling the runtime reads as one (`6.0`, `"6.0"`, `" 6"`,
+  `"6abc"`, `"+6"`, `5.0`, `"3 "`), at registration and at a re-bind, and the
+  modes accepted are stored as the integer the runtime reads; a legacy re-bind
+  whose `UPDATE` a signed registration's §4.5 overtook answers `403
+  identity_requires_signature` (and, with no signed row, makes a new row), never
+  `200` for a gone row; the switch refuses legacy browsers only. With the switch off, a
   legacy row claiming a signed identity (written as old code writes it, with
   `H` only in `metadata_json`, and with the claim filled) gets `401` with its
   own token, with nothing written but the claim, and the next signed
@@ -992,7 +1049,9 @@ with a bound that only fails it.
   `known_destinations` untouched and is neither cached nor forwarded; a
   `CACHE_REQUEST` for a legacy browser row's own earlier announce, which §9
   now finds seen, queues no announce on any row (no `relay_announce`), and
-  its verdict is `miss`; a row registered after a refused copy of `D`'s
+  its verdict is `miss`; a `CACHE_REQUEST` for a copy whose row §4.5 removed
+  is a miss that queues nothing and makes no path, while a path request is
+  answered from that copy as before; a row registered after a refused copy of `D`'s
   announce is seeded with `D`'s last accepted copy, not the refused one; a
   browser's own announces still make local destinations; a gateway row's
   behave as today. A stated residual (§16 item 3): once the stale sweep has
@@ -1006,6 +1065,15 @@ with a bound that only fails it.
   `/poll`, `/goodbye` answer `409` and `401` as §7 says, register and
   challenge never; no log line holds a token, signature, challenge or the
   secret. *Today:* no challenge route.
+- **`schema_migration_lock_wait_test.php`** (new; a recording connection
+  standing in for MySQL, since the suite has none): on `mysql`, the session's
+  `lock_wait_timeout` is read, set to 2 before the first DDL statement and put
+  back after the last; each table's missing columns are one `ALTER` with
+  `ALGORITHM=INSTANT`, each index `ALGORITHM=INPLACE LOCK=NONE`; a re-run
+  issues no `ALTER` and no `CREATE INDEX`; a `1205` on a statement stops the
+  migration there with no retry, records no version, and `index.php migrate`
+  exits `1` with its line; SQLite gets none of it. Reclaim's `OPTIMIZE TABLE`
+  runs under the same ceiling.
 - **`schema_migration_marker_test.php`** (extended): §12's objects, the
   UNIQUE index enforced, the backfill (idempotent, `rns-js` only), the claim
   filled at first authentication, a 50c870b database migrated cleanly. With
