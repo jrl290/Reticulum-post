@@ -3,8 +3,9 @@
  * Initializing a node is the operator's `php index.php initialize`, on the
  * host. No web request can do it.
  *
- * Until 2026-10-14 GET /v1/initialize did it for anyone. It was routed before
- * the operator-path gate (HttpApi::OPERATOR_PATHS), and it:
+ * Until 2026-10-14 GET /v1/initialize did it for anyone. It was routed ahead
+ * of the gate that kept the other operator routes to nodes with debug.enabled
+ * (those routes are gone too: the admin page replaced them), and it:
  * - ran migrate() in full: on MySQL/MariaDB 15 CREATE TABLE IF NOT EXISTS,
  *   22 CREATE INDEX that each fail with "duplicate key name", and 10
  *   information_schema reads, then said "migrated": true whatever migrate()
@@ -36,7 +37,8 @@
  *     anonymous GET /v1/initialize changes neither node's row, and both
  *     credentials still work.
  * (d) The CLI reports a migration that failed and exits 1.
- * (e) Source: no web request can reach initializeNode(), and no file that
+ * (e) Source: no web request can reach initializeNode(), the admin page's
+ *     included (its Reconnect registers without migrating), and no file that
  *     deploy.sh ships calls opcache_reset(). opcache_reset.php did, for
  *     anyone who asked for it by URL, until 2026-10-14. The scanner is run
  *     on samples first, so a scanner that finds nothing cannot pass.
@@ -336,6 +338,7 @@ stopNode($b);
 echo "(e) source: no web request reaches initializeNode() or opcache_reset()\n";
 $samples = [
     'a route calling it' => ['<?php class HttpApi { function handle() { $s = $this->storage->initializeNode(); } }', ['HttpApi::handle']],
+    'an admin action calling it' => ['<?php final class AdminConsole { private function act(): never { $this->storage->initializeNode(); } }', ['AdminConsole::act']],
     'a CLI function calling it' => ['<?php function runIndexCli() { $x->initializeNode(); }', ['runIndexCli']],
     'a fully qualified \\opcache_reset()' => ['<?php class HttpApi { function f() { \\opcache_reset(); } }', ['HttpApi::f']],
     'a declaration, a comment, a string, a function_exists() check' => [
@@ -355,6 +358,8 @@ foreach ($samples as $label => [$code, $expected]) {
     check("scanner: $label", $where === $expected, json_encode($where));
 }
 
+// The classes web requests run: HttpApi routes, and hands /admin to AdminConsole.
+$routeClasses = ['HttpApi', 'AdminConsole'];
 $httpApiSites = [];
 $initializeNodeSites = [];
 $opcacheSites = [];
@@ -365,7 +370,7 @@ foreach ($files as $file) {
     $sites = callSites((string) file_get_contents($file), ['initializeNode', 'migrate', 'opcache_reset']);
     foreach ($sites as $site) {
         $site['file'] = basename($file);
-        if ($site['class'] === 'HttpApi') {
+        if (in_array($site['class'], $routeClasses, true)) {
             $httpApiSites[] = $site;
         }
         if ($site['name'] === 'initializeNode') {
@@ -378,7 +383,8 @@ foreach ($files as $file) {
 }
 check('index.php, the other top-level files and lib/ were read',
     in_array($src . '/index.php', $files, true) && count($files) > 10 && $initializeNodeSites !== [], count($files) . ' files');
-check('HttpApi calls none of initializeNode(), migrate(), opcache_reset()', $httpApiSites === [], describe($httpApiSites));
+check('HttpApi and AdminConsole call none of initializeNode(), migrate(), opcache_reset()', $httpApiSites === [], describe($httpApiSites));
+check('both classes were found', count(array_filter($files, static fn (string $f): bool => preg_match('/\\bfinal class (HttpApi|AdminConsole)\\b/', (string) file_get_contents($f)) === 1)) === 2);
 check('initializeNode() is called only by runIndexCli()',
     $initializeNodeSites !== [] && array_filter($initializeNodeSites, static fn (array $s): bool => $s['function'] !== 'runIndexCli' || $s['class'] !== '') === [],
     describe($initializeNodeSites));

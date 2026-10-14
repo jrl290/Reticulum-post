@@ -52,6 +52,14 @@ path_expiry_access_point_seconds = 86400
 path_expiry_roaming_seconds = 21600
 max_random_blobs = 64
 
+[admin]
+# The admin page, <host_url>/admin, answers 404 until someone on the host runs
+# `php index.php admin-setup <username>`, which keeps the username and a bcrypt
+# hash of the password in ~/.reticulum-post/admin.json, outside the web root.
+# Set credentials_file only if the web server cannot see that home directory;
+# it must be an absolute path outside public_html.
+# credentials_file = "/home/you/.reticulum-post/admin.json"
+
 [interfaces]
 
 [[YourPeerName]]

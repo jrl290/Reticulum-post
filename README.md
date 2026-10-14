@@ -200,6 +200,52 @@ line to HTTP clients, while the hardened version had been sitting committed in
 git. Drift runs in both directions — a fix that is committed but never deployed
 is just as invisible as a regression that is deployed but never committed.
 
+## Admin page
+
+`<host_url>/admin` (on retichat.com, `https://retichat.com/reticulum/admin`) is
+the node's operator console. It shows the connections, the configured peers,
+traffic in and out, the queues and storage, live, and it has the peering
+actions (Reconnect, Rotate) and the maintenance actions (flush stale sessions,
+normal or forced, and the debug report). It answers 404, like any unknown path,
+until someone on the host sets a username and password:
+
+```bash
+cd ~/public_html/reticulum && php index.php admin-setup <username>
+```
+
+It asks for the password twice without showing it (12 to 72 bytes), and keeps
+only the username and a bcrypt hash, in `~/.reticulum-post/admin.json` (mode
+0600, outside the web root). From this Mac, with the password piped in so it
+is neither shown nor on a command line:
+
+```bash
+read -rs -p 'Password: ' P; echo; printf '%s\n' "$P" | test-harnesses/distro-pipeline/node.sh retichat "cd ~/public_html/reticulum && php index.php admin-setup <username>"; unset P
+```
+
+- `admin-setup` again changes the password, signs out every session and lifts
+  a sign-in lockout. `php index.php admin-remove` closes the page (404).
+- A session lasts two hours. While its tab is visible the page polls
+  `/admin/data` every 5 s.
+- Sign-in allows five attempts per address in 15 minutes, and a hundred per
+  hour from all addresses together; past that, only an address that has
+  signed in within 30 days may try.
+- It answers over HTTPS only, sends no CORS headers, and every action needs
+  this page's origin and a token from the session.
+- If it still answers 404 after `admin-setup`, the web server does not see the
+  home directory the command did (no posix extension, or another account): set
+  `[admin] credentials_file` in the node's config to an absolute path outside
+  `public_html` that the web server can read, and run `admin-setup` again.
+- The page shares its origin with everything else the host serves, so a script
+  injected into another page there could act as a signed-in admin. Sign out
+  when done; sessions are short for this reason.
+
+It replaced `/v1/monitor`, `/v1/monitor/data|json`, `POST /v1/monitor/clear`,
+`POST /v1/maintenance/flush`, `/debug` and `monitor.php` on 2026-10-14. None of
+them authenticated: every node answered them until 2026-09-30, then every node
+with `debug.enabled`. The clear-all button did not come back. `debug.enabled`
+now only turns on extra logging, and `debug.max_rows` sizes the debug report.
+`php/tests/admin_console_test.php` pins all of this.
+
 ## Rotating a PHP peering's credentials
 
 A PHP-to-PHP peering is two rows. The node with an `[interfaces]` block for the
@@ -223,8 +269,10 @@ again once it is live on both nodes.
 Rotate only once every node runs code that closes both leaks, or the new tokens
 leak too:
 
-- **Publishes neither.** `curl -s https://<node>/reticulum/health | grep -c peer_session_token`,
-  and the same for `/v1/monitor/data`, must both print 0.
+- **Publishes neither.** `curl -s https://<node>/reticulum/health | grep -c peer_session_token`
+  must print 0. `/v1/monitor/data` was the other place until 2026-10-14; the
+  admin page that replaced it is behind its sign-in and gets the same
+  allowlist as `/health`.
 - **Sends a peer's credentials only to the row's own URL.** Every node must be
   at the wake fix (✓) or "ahead of" it. Anything else ("behind", "diverged",
   no stamp, no answer) means the fix is not proven live there: do not rotate.
@@ -273,11 +321,18 @@ leak too:
    token is already dead, but the peer's is live until a registration lands, so
    run `initialize` again once the peer answers.
 
+   Or press **Rotate** beside the peer on the initiator's admin page: the
+   `DELETE` and the registration in one action, refused with nothing deleted
+   when step 1 would have stopped (two rows naming the peer). It answers with
+   the new `interface_id` and the one it replaced, and the same statuses.
+
    `initialize` is a command on the host, not a URL. Until 2026-10-14
    `GET /v1/initialize` did the same for anyone. While a node's row for its
    peer sat offline after a quiet spell, one anonymous request rotated the
    peering, with every cost listed below. It now answers 404
-   (`php/tests/initialize_is_operator_only_test.php`).
+   (`php/tests/initialize_is_operator_only_test.php`). The admin page's
+   **Reconnect** is `initialize` for one peer, without the migration, so it
+   rotates a row that is merely quiet in the same way.
 
 3. **Verify.** Step 1's query again. The initiator's row has a new
    `interface_id`, and the old one is gone. The peer's row keeps its
@@ -298,7 +353,8 @@ never checked (Reticulum-rust `post_interface.rs` wake server), and the bridge's
 real `session_token` was never published. A wake sends only the unchecked one.
 
 `php/tests/peer_session_rotation_test.php` runs this procedure on two real
-nodes, with a peer exchange between the two commands, and pins the gate above.
+nodes, with a peer exchange between the two commands, and pins the gate above;
+`php/tests/admin_console_test.php` runs the admin page's Rotate.
 
 ## Storage Budget
 

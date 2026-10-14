@@ -263,8 +263,10 @@ $sectionAt = strpos($readme, "## Rotating a PHP peering's credentials");
 $stepOneAt = $sectionAt === false ? false : strpos($readme, "\n1. **Read", $sectionAt);
 $gate = ($sectionAt !== false && $stepOneAt !== false) ? substr($readme, $sectionAt, $stepOneAt - $sectionAt) : '';
 check('README has the rotation section, with its gate before step 1', $gate !== '', $readmePath);
-check('the gate: /health and /v1/monitor publish no peer_session_token',
-    str_contains($gate, 'grep -c peer_session_token') && str_contains($gate, '/v1/monitor/data'));
+// /v1/monitor/data was the gate's second URL until 2026-10-14; the admin page
+// that replaced it is behind a sign-in (tests/admin_console_test.php).
+check('the gate: /health publishes no peer_session_token',
+    str_contains($gate, 'grep -c peer_session_token') && str_contains($gate, '/reticulum/health'));
 check('the gate: every node runs the /v1/wake fix, by build stamp, failing on an empty ref',
     str_contains($gate, '`POST /v1/wake`') && str_contains($gate, GATE_FIX_LINE) && str_contains($gate, GATE_STAMP_LINE));
 // The gate finds the fix by the first commit that added canonicalPeerBaseUrl
