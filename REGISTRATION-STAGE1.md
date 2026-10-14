@@ -564,7 +564,12 @@ interface that does not exist (the review of stage1-sign, 2026-10-14). Logged `[
 interface=<id8> dest=<hash> identity=<8 hex> owner=<8 hex|none>` or
 `[ANNOUNCE-LEGACY-REFUSED] interface=<id8> dest=<hash> reason=<seen|held>`.
 `owner(R)` is read as the announce arrives, so a legacy row loses its claim
-the moment its identity signs here.
+the moment its identity signs here. A row that is gone by then owns nothing,
+whatever its client was: an announce handled under the id of a row that no
+longer exists (a cache request's replay, a legacy row §4.5 removed while its
+own batch was being read, a PHP-node peering row `connectToPeer` replaced
+during an exchange with that peer) is refused as `owner=none`, since a path
+through it would lead nowhere (the review of stage1-sign, 2026-10-14).
 
 Nothing legitimate breaks: the browser announces only its own identity's
 destinations (`lxmf.delivery`, `rfed.delivery`); a distro's announce goes to
