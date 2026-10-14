@@ -1012,7 +1012,12 @@ with a bound that only fails it.
   `rns-post-interface` registration naming a browser's identity hash makes its
   own row (A8); no identity field in `metadata_json`; legacy rows claiming an
   identity that signs are removed with their traffic; legacy mode 3, 5 or 6
-  `400`; the switch refuses legacy browsers only. With the switch off, a
+  `400`, in every spelling the runtime reads as one (`6.0`, `"6.0"`, `" 6"`,
+  `"6abc"`, `"+6"`, `5.0`, `"3 "`), at registration and at a re-bind, and the
+  modes accepted are stored as the integer the runtime reads; a legacy re-bind
+  whose `UPDATE` a signed registration's §4.5 overtook answers `403
+  identity_requires_signature` (and, with no signed row, makes a new row), never
+  `200` for a gone row; the switch refuses legacy browsers only. With the switch off, a
   legacy row claiming a signed identity (written as old code writes it, with
   `H` only in `metadata_json`, and with the claim filled) gets `401` with its
   own token, with nothing written but the claim, and the next signed
@@ -1034,7 +1039,9 @@ with a bound that only fails it.
   `known_destinations` untouched and is neither cached nor forwarded; a
   `CACHE_REQUEST` for a legacy browser row's own earlier announce, which §9
   now finds seen, queues no announce on any row (no `relay_announce`), and
-  its verdict is `miss`; a row registered after a refused copy of `D`'s
+  its verdict is `miss`; a `CACHE_REQUEST` for a copy whose row §4.5 removed
+  is a miss that queues nothing and makes no path, while a path request is
+  answered from that copy as before; a row registered after a refused copy of `D`'s
   announce is seeded with `D`'s last accepted copy, not the refused one; a
   browser's own announces still make local destinations; a gateway row's
   behave as today. A stated residual (§16 item 3): once the stale sweep has
@@ -1048,6 +1055,15 @@ with a bound that only fails it.
   `/poll`, `/goodbye` answer `409` and `401` as §7 says, register and
   challenge never; no log line holds a token, signature, challenge or the
   secret. *Today:* no challenge route.
+- **`schema_migration_lock_wait_test.php`** (new; a recording connection
+  standing in for MySQL, since the suite has none): on `mysql`, the session's
+  `lock_wait_timeout` is read, set to 2 before the first DDL statement and put
+  back after the last; each table's missing columns are one `ALTER` with
+  `ALGORITHM=INSTANT`, each index `ALGORITHM=INPLACE LOCK=NONE`; a re-run
+  issues no `ALTER` and no `CREATE INDEX`; a `1205` on a statement stops the
+  migration there with no retry, records no version, and `index.php migrate`
+  exits `1` with its line; SQLite gets none of it. Reclaim's `OPTIMIZE TABLE`
+  runs under the same ceiling.
 - **`schema_migration_marker_test.php`** (extended): §12's objects, the
   UNIQUE index enforced, the backfill (idempotent, `rns-js` only), the claim
   filled at first authentication, a 50c870b database migrated cleanly. With
