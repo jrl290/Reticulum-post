@@ -53,11 +53,12 @@
  *  (11) a cache request whose copy's row another request removes after the
  *      copy is looked up and before §9 reads the row (a legacy row §4.5
  *      removes as its identity signs; a dead PHP node peering row replaced)
- *      is refused, [ANNOUNCE-FOREIGN] ... owner=none: a miss, no announce
+ *      is refused, [ANNOUNCE-FOREIGN] ... owner=gone: a miss, no announce
  *      queued, no path, no local destination, known_destinations as it was;
- *      with its row there the peering row's copy is replayed as today, and a
+ *      with its row there the peering row's copy is replayed as today, a
  *      gateway row's and a browser row's (legacy, signed) own announces in a
- *      later request are as today.
+ *      later request are as today, and a legacy row with no claim, which is
+ *      there, still logs owner=none.
  *
  * Today (before Stage 1) the replay moves the local destination, and the
  * cache replay is relayed to every other row. On code without signed
@@ -721,8 +722,8 @@ foreach ($gone as $what => [$identity, $row, $hops, $goes]) {
     $r = cacheRequestWhileRowGoes($dbPath, $third, $a['packet_hash_hex'], $goes);
     check("[$what] (precondition) the row went after the copy was looked up, before §9 read it",
         $r['raced'] && q($db, 'SELECT 1 FROM interfaces WHERE interface_id = :i', [':i' => $row]) === []);
-    check("[$what] the replay is refused: [ANNOUNCE-FOREIGN] interface dest identity owner=none",
-        str_contains($r['log'], foreignLine($row, $a['dest_hex'], $identity, 'none')), trim($r['log']));
+    check("[$what] the replay is refused: [ANNOUNCE-FOREIGN] interface dest identity owner=gone",
+        str_contains($r['log'], foreignLine($row, $a['dest_hex'], $identity, 'gone')), trim($r['log']));
     check("[$what] ...the cache request is a miss (cached_announce_not_relayed)",
         verdictOf($db, $r['request_hash']) === ['miss', 'cached_announce_not_relayed'], json_encode(verdictOf($db, $r['request_hash'])));
     check("[$what] ...no announce is queued on any row", announcesQueued($db) === [], json_encode(announcesQueued($db)));
@@ -756,6 +757,15 @@ foreach ($browsers as $what => [$identity, $row]) {
         localOf($db, $a['dest_hex']) === $row && in_array([$third, $a['packet_hash_hex']], announcesQueued($db), true)
         && !str_contains($log, '[ANNOUNCE-'), trim($log));
 }
+// owner=gone is only for a row that is gone: one that is there and owns
+// nothing is owner=none, as before.
+$noClaimRow = legacyRow($node, browser(), 'no claim');
+$stranger = RegFixture::identity();
+$aNc = AnnounceFixture::announce($stranger, 'lxmf.delivery', 0, null, 'not mine');
+$log = feed($later, $noClaimRow, $aNc['raw']);
+check('a legacy row with no claim, which is there, still logs owner=none, not owner=gone',
+    str_contains($log, foreignLine($noClaimRow, $aNc['dest_hex'], $stranger, 'none')) && !str_contains($log, 'owner=gone')
+    && verdictOf($db, $aNc['packet_hash_hex']) === ['refused', 'announce_foreign'], trim($log));
 
 echo "\n$pass passed, $fail failed\n";
 exit($fail === 0 ? 0 : 1);

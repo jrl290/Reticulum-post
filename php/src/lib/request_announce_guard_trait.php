@@ -25,12 +25,17 @@ use PDO;
  * packet, and a cache request's replay) get it. A browser row is a signed row
  * or a row whose client is rns-js, in every mode; every other row follows
  * today's rules. A row that is gone when the announce is read owns nothing,
- * so its announce is refused as foreign (owner=none), whatever the row was.
+ * so its announce is refused as foreign, whatever the row was, and logged
+ * owner=gone: a PHP node peering row that connectToPeer() replaced during an
+ * exchange must not read as a foreign announce. owner=none stays for a row
+ * that is there and owns nothing.
  *
- * A refusal is logged ([ANNOUNCE-FOREIGN], [ANNOUNCE-LEGACY-REFUSED]), the
- * announce's inbound_packets row says 'refused', and nothing else changes:
- * 'refused' is neither 'validated' nor 'path_updated', so nothing relays it,
- * and no reader of the announce cache serves it.
+ * A refusal is logged ([ANNOUNCE-FOREIGN] interface=<id8> dest=<hash>
+ * identity=<8 hex> owner=<8 hex|none|gone>, [ANNOUNCE-LEGACY-REFUSED]
+ * interface=<id8> dest=<hash> reason=<seen|held>), the announce's
+ * inbound_packets row says 'refused', and nothing else changes: 'refused' is
+ * neither 'validated' nor 'path_updated', so nothing relays it, and no reader
+ * of the announce cache serves it.
  */
 trait RequestAnnounceGuardTrait
 {
@@ -99,12 +104,13 @@ trait RequestAnnounceGuardTrait
         // (§4.5 removes a legacy row; a dead PHP node peering row is
         // replaced). Until 2026-10-14 a gone row passed as no browser row: the
         // replay rewrote known_destinations, could set a path through the
-        // gone row, and was relayed to every other row.
+        // gone row, and was relayed to every other row. Logged owner=gone, so
+        // that the peering row's case does not read as a foreign announce.
         $owner = $facts === null ? null : $this->announceOwner($facts);
         if ($owner === null || !hash_equals($owner, $identity)) {
             error_log(sprintf('[ANNOUNCE-FOREIGN] interface=%s dest=%s identity=%s owner=%s',
                 substr($interfaceId, 0, 8), $destinationHashHex, substr($identity, 0, 8),
-                $owner === null ? 'none' : substr($owner, 0, 8)));
+                $facts === null ? 'gone' : ($owner === null ? 'none' : substr($owner, 0, 8))));
 
             return 'announce_foreign';
         }
