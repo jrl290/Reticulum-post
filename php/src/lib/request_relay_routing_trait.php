@@ -570,7 +570,7 @@ trait RequestRelayRoutingTrait
         }
         $meta = self::decodeJson((string) ($row['metadata_json'] ?? ''));
         // MODE_GATEWAY = 6 in the standard RNS interface mode enum
-        return (int) ($meta['mode'] ?? 0) === 6;
+        return self::metadataMode($meta) === 6;
     }
 
     private function queueRelayPathRequestIfNeeded(string $sourceInterfaceId, array $packet): void

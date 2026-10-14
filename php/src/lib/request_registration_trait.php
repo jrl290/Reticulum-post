@@ -233,12 +233,14 @@ trait RequestRegistrationTrait
         }
 
         // Step 4: only a browser signs, in an endpoint mode, with no transit
-        // fields.
+        // fields. Step 1 took the mode only as a JSON integer from 1 to 7,
+        // which the signed bytes carry as one byte; it is read as the
+        // runtime reads it all the same.
         if ($metadata['client'] !== 'rns-js') {
             throw $this->registrationRefusal(400, 'unknown_client',
                 'A signed registration must name the client rns-js.', $context);
         }
-        if (in_array($metadata['mode'], [3, 5, 6], true)) {
+        if (in_array(self::metadataMode($metadata), [3, 5, 6], true)) {
             throw $this->registrationRefusal(400, 'transit_mode_not_allowed',
                 'A browser registers in mode 1, 2, 4 or 7.', $context);
         }
@@ -367,7 +369,7 @@ trait RequestRegistrationTrait
         if (is_string($metadata['implementation'] ?? null) && $metadata['implementation'] !== '') {
             $stored['implementation'] = $metadata['implementation'];
         }
-        $stored['mode'] = $metadata['mode'];
+        $stored['mode'] = self::metadataMode($metadata);
 
         return $stored;
     }
@@ -757,13 +759,16 @@ trait RequestRegistrationTrait
         // 6. never stored: the claim lives in claimed_identity_hash.
         unset($metadata['identity_hash']);
 
-        // 1. A browser is an endpoint, signed or not.
-        $mode = $metadata['mode'] ?? 1;
-        $modeNumber = is_int($mode) ? $mode : ((is_string($mode) && ctype_digit($mode)) ? (int) $mode : null);
-        if (in_array($modeNumber, [3, 5, 6], true)) {
+        // 1. A browser is an endpoint, signed or not. Its mode is read as
+        // the runtime reads it, and stored as that integer, by the insert
+        // and by the re-bind, which rewrites metadata_json: a spelling the
+        // runtime reads as 3, 5 or 6 ("6.0", " 6", 6.0) is refused here.
+        $mode = self::metadataMode($metadata);
+        if (in_array($mode, [3, 5, 6], true)) {
             throw $this->registrationRefusal(400, 'transit_mode_not_allowed',
                 'A browser registers in mode 1, 2, 4 or 7.', $context);
         }
+        $metadata['mode'] = $mode;
 
         // 2. The switch.
         if ($this->enforceSignedRegistration()) {

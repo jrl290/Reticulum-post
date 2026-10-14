@@ -294,7 +294,19 @@ trait RequestInterfaceRuntimeTrait
 
     private function interfaceMode(string $interfaceId): int
     {
-        $metadata = $this->interfaceMetadata($interfaceId);
-        return (int) ($metadata['mode'] ?? 1); // default MODE_FULL
+        return self::metadataMode($this->interfaceMetadata($interfaceId));
+    }
+
+    /**
+     * An interface's mode as the runtime reads it from its metadata: PHP's
+     * (int) of metadata.mode, MODE_FULL (1) when there is none, so "6.0",
+     * " 6", "6abc", "+6" and 6.0 are all 6. The one reading: the transit
+     * checks here and in the control plane, and the registrations, which
+     * refuse a browser's transit mode and store this integer
+     * (REGISTRATION-STAGE1.md §4.3 step 4, §4.6 step 1).
+     */
+    private static function metadataMode(array $metadata): int
+    {
+        return (int) ($metadata['mode'] ?? 1);
     }
 }

@@ -325,7 +325,7 @@ trait RequestControlPlaneTrait
             return;
         }
 
-        $mode = (int) ($metadata['mode'] ?? 1); // default MODE_FULL
+        $mode = self::metadataMode($metadata); // default MODE_FULL
 
         // RNS mode constants: MODE_ACCESS_POINT=3, MODE_BOUNDARY=5, MODE_GATEWAY=6
         if ($mode === 3 || $mode === 5 || $mode === 6) {

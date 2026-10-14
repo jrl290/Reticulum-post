@@ -12,18 +12,21 @@
  * Covered: a legacy claim of a signed identity, '%' and '_%' never touch the
  * signed row (A1); a legacy rns-post-interface registration naming a
  * browser's identity hash makes its own row (A8); no identity field in
- * metadata_json; legacy rows claiming an identity that signs are removed with
- * their traffic; legacy mode 3, 5 or 6 400; the switch refuses legacy
- * browsers only. With the switch off, a legacy row claiming a signed identity
- * (written as old code writes it, with H only in metadata_json, and with the
- * claim filled) gets 401 with its own token, with nothing written but the
- * claim, and the next signed registration removes it; a legacy row of an
- * identity that never signed still gets 200. N legacy registrations claiming
- * a signed identity log one [REG-REFUSED] line and write once; a new signed
- * registration allows one more; with the switch on, one per legacy row. No
- * SQL in php/src compares metadata_json with a value from a request: the one
- * comparison allowed is recentNodeInterfacesByStatus's LIKE :poll_gateway,
- * bound to a constant.
+ * metadata_json; legacy rows claiming an identity that signs are removed
+ * with their traffic; legacy mode 3, 5 or 6 400, in every spelling the
+ * runtime reads as one of them ("6.0", " 6", "6abc", 6.0, ...), an accepted
+ * mode stored as the integer the runtime reads, and no re-bind into a
+ * transit mode; the signed path takes the mode only as a JSON integer; the
+ * switch refuses legacy browsers only. With the switch off, a legacy row
+ * claiming a signed identity (written as old code writes it, with H only in
+ * metadata_json, and with the claim filled) gets 401 with its own token,
+ * with nothing written but the claim, and the next signed registration
+ * removes it; a legacy row of an identity that never signed still gets 200.
+ * N legacy registrations claiming a signed identity log one [REG-REFUSED]
+ * line and write once; a new signed registration allows one more; with the
+ * switch on, one per legacy row. No SQL in php/src compares metadata_json
+ * with a value from a request: the one comparison allowed is
+ * recentNodeInterfacesByStatus's LIKE :poll_gateway, bound to a constant.
  *
  * Before Stage 1: A8 re-binds the browser's row; mode 6 is accepted; the
  * old-code row gets 200; every refusal is logged; the scan finds
@@ -212,16 +215,51 @@ RegFixture::db($node)->prepare("INSERT INTO interfaces (interface_id, name, sess
     ->execute([$c2]);
 [$l3] = legacy($node, ['client' => 'rns-js', 'mode' => 1, 'identity_hash' => $c2]);
 check('a claim never re-binds a row of another client holding the same claim', is_array($l3) && $l3['interface_id'] !== 'notbrowser');
-foreach ([3, 5, 6, '6'] as $mode) {
+// The runtime reads a mode as PHP's (int) of it (interfaceMode(), the control
+// plane), so every spelling it reads as 3, 5 or 6 is that transit mode.
+$transitSpellings = [3, 5, 6, '6', 6.0, '6.0', ' 6', '6abc', '+6', 5.0, '3 '];
+foreach ($transitSpellings as $mode) {
     $before = count_rows($node, 'interfaces');
     [$r, $log] = legacy($node, ['client' => 'rns-js', 'mode' => $mode, 'identity_hash' => bin2hex(random_bytes(16))]);
     check('legacy rns-js mode ' . var_export($mode, true) . ' -> 400 transit_mode_not_allowed, logged, no row',
         RegFixture::outcome($r) === [400, 'transit_mode_not_allowed'] && str_contains($log, '[REG-REFUSED] 400 transit_mode_not_allowed client=rns-js')
         && count_rows($node, 'interfaces') === $before);
 }
-foreach ([1, 2, 4, 7] as $mode) {
+$modeOf = new ReflectionMethod(Storage::class, 'interfaceMode');
+foreach ([1, 2, 4, 7, '2', ' 4', 7.0, '1abc', null] as $mode) {
     [$r] = legacy($node, ['client' => 'rns-js', 'mode' => $mode]);
-    check("legacy rns-js mode $mode is accepted", is_array($r));
+    $stored = is_array($r) ? (json_decode((string) row($node, $r['interface_id'])['metadata_json'], true)['mode'] ?? 'none') : 'refused';
+    check('legacy rns-js mode ' . var_export($mode, true) . ' is accepted, stored as the integer the runtime reads',
+        is_array($r) && is_int($stored) && $stored === (int) ($mode ?? 1) && $modeOf->invoke($node, $r['interface_id']) === $stored,
+        var_export($stored, true));
+}
+// A re-bind rewrites metadata_json: it cannot turn a row into a transit mode.
+$flipClaim = bin2hex(random_bytes(16));
+[$flip] = legacy($node, ['client' => 'rns-js', 'mode' => 1, 'identity_hash' => $flipClaim]);
+$flipBefore = row($node, $flip['interface_id']);
+foreach (['6.0', 6.0, ' 5', '3abc'] as $mode) {
+    [$r] = legacy($node, ['client' => 'rns-js', 'mode' => $mode, 'identity_hash' => $flipClaim]);
+    check('a re-bind in mode ' . var_export($mode, true) . ' -> 400 transit_mode_not_allowed, its row untouched, still mode 1',
+        RegFixture::outcome($r) === [400, 'transit_mode_not_allowed'] && row($node, $flip['interface_id']) === $flipBefore
+        && $modeOf->invoke($node, $flip['interface_id']) === 1);
+}
+[$r] = legacy($node, ['client' => 'rns-js', 'mode' => '2 ', 'identity_hash' => $flipClaim]);
+check('a re-bind in mode \'2 \' re-binds the row, storing mode 2',
+    is_array($r) && $r['interface_id'] === $flip['interface_id']
+    && (json_decode((string) row($node, $flip['interface_id'])['metadata_json'], true)['mode'] ?? null) === 2);
+// The signed path's step 1 takes the mode only as a JSON integer from 1 to
+// 7 (the signed bytes carry it as one byte): every other spelling is
+// malformed, refused before the signature is looked at.
+$signer = RegFixture::identity();
+$signerChallenge = $node->issueChallenge(['public_key' => $signer['public_key_hex']])['challenge'];
+foreach ($transitSpellings as $mode) {
+    if (is_int($mode)) {
+        continue;
+    }
+    $body = RegFixture::body($signer, $signerChallenge, RegFixture::browserMetadata());
+    $body['metadata']['mode'] = $mode;
+    [$r] = RegFixture::capture(static fn () => $node->registerFromBody($body));
+    check('signed rns-js mode ' . var_export($mode, true) . ' -> 400 bad_registration', RegFixture::outcome($r) === [400, 'bad_registration']);
 }
 
 echo "\n(4) no identity field reaches metadata_json, on any path\n";
