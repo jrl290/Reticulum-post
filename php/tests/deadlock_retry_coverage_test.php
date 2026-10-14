@@ -47,6 +47,12 @@ $hotPathTraits = [
     // run on every exchange - was missing from this list until 2026-09-22,
     // with four bare writes nobody could see.
     'request_interface_runtime_trait.php',
+    // REGISTRATION-STAGE1.md §14: the registration's writes (the challenge
+    // count, the bind, §4.5's removal, the claim fill, the logged-once
+    // marks), and §9's announce guard, which only reads today and stays on
+    // the list so a write added to it cannot go in bare.
+    'request_registration_trait.php',
+    'request_announce_guard_trait.php',
 ];
 
 $failures = [];
