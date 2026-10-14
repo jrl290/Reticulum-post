@@ -207,7 +207,7 @@ trait RequestControlPlaneTrait
             return ['ignored', 'cache_request_hash_length_invalid', 0, false];
         }
 
-        $cachedAnnounce = $this->cachedAnnounceRecordByPacketHash(bin2hex($payload));
+        $cachedAnnounce = $this->cacheRequestCopy(bin2hex($payload));
         if ($cachedAnnounce === null) {
             return ['miss', 'cached_announce_not_found', 0, false];
         }

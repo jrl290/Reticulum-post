@@ -222,25 +222,22 @@ trait RequestPathStateTrait
     }
 
     /**
-     * The copy a cache request replays, and announceRawByPacketHash() answers
-     * a path request with. One packet hash: idx_inbound_packets_hash finds its
-     * few copies and idx_path_entries_packet_hash its path, if any.
+     * The copy announceRawByPacketHash() answers a path request with. One
+     * packet hash: idx_inbound_packets_hash finds its few copies and
+     * idx_path_entries_packet_hash its path, if any.
      *
-     * Only a copy whose interface row is still there. A cache request replays
-     * a copy as if it had just come in on that row, so it can set a path
-     * through it, updates known_destinations and relays to every row, and
-     * §9 reads a row that is gone as no browser row, whose owner, seen and
-     * held rules never run. A row removed with its inbound history kept
-     * (REGISTRATION-STAGE1.md §4.5's legacy rows claiming an identity that
-     * signs) leaves its copies behind; they answer as not cached.
-     * Maintenance does not look at the row: it keeps such a copy only when
-     * none received on the path's interface at its hop count is stored.
+     * Any stored copy answers, also one whose interface row is gone: the
+     * answer is that announce rebuilt as a PATH_RESPONSE at the path's hop
+     * count, queued for the row that asked (buildPathResponsePacket()).
+     * Nothing reads the row the copy came in on or runs the copy through
+     * processAcceptedAnnounce(), and no path or known_destinations row
+     * changes. A cache request replays its copy through that row, so it
+     * reads cacheRequestCopySql(), which also needs the row.
      */
     private function cachedAnnounceByPacketHashSql(): string
     {
         return 'SELECT ip.interface_id AS received_interface_id, ip.raw_base64
              FROM inbound_packets ip
-             JOIN interfaces i ON i.interface_id = ip.interface_id
              LEFT JOIN path_entries pe ON pe.packet_hash_hex = ip.packet_hash_hex
              WHERE ip.packet_hash_hex = :packet_hash_hex
                AND ip.status = :status
@@ -262,6 +259,48 @@ trait RequestPathStateTrait
         // request serves it.
         $stmt->bindValue(':refused', 'refused', PDO::PARAM_STR);
         $row = $stmt->execute(); $row = $stmt->fetch(PDO::FETCH_ASSOC);
+        return is_array($row) ? $row : null;
+    }
+
+    /**
+     * The copy a cache request replays: the one cachedAnnounceByPacketHashSql()
+     * would pick, among the copies whose interface row is still there.
+     *
+     * The replay runs the copy through processAcceptedAnnounce() as if it had
+     * just come in on that row (replayCachedAnnouncePacket()), so it can set a
+     * path through the row, update known_destinations and relay to every other
+     * row, and §9 reads a row that is gone as no browser row, whose owner,
+     * seen and held rules never run. A row removed with its inbound history
+     * kept (REGISTRATION-STAGE1.md §4.5's legacy rows claiming an identity
+     * that signs) leaves its copies behind; a cache request answers them as
+     * not cached. Maintenance does not look at the row, and can keep such a
+     * copy as an announce's only one (when a link proof has set the path's
+     * hop count to that copy's); a path request still answers with it.
+     */
+    private function cacheRequestCopySql(): string
+    {
+        return 'SELECT ip.interface_id AS received_interface_id, ip.raw_base64
+             FROM inbound_packets ip
+             JOIN interfaces i ON i.interface_id = ip.interface_id
+             LEFT JOIN path_entries pe ON pe.packet_hash_hex = ip.packet_hash_hex
+             WHERE ip.packet_hash_hex = :packet_hash_hex
+               AND ip.status = :status
+               AND ip.packet_type = :packet_type
+               AND (ip.announce_status IS NULL OR ip.announce_status <> :refused)
+             ORDER BY ' . $this->announceCopyOrderSql('ip', 'pe') . '
+             LIMIT 1';
+    }
+
+    private function cacheRequestCopy(string $packetHashHex): ?array
+    {
+        $stmt = $this->db->prepare($this->cacheRequestCopySql());
+        $stmt->bindValue(':packet_hash_hex', $packetHashHex, PDO::PARAM_STR);
+        $stmt->bindValue(':status', 'parsed', PDO::PARAM_STR);
+        $stmt->bindValue(':packet_type', 1, PDO::PARAM_INT);
+        $stmt->bindValue(':refused', 'refused', PDO::PARAM_STR);
+        $stmt->execute();
+        $row = $stmt->fetch(PDO::FETCH_ASSOC);
+
         return is_array($row) ? $row : null;
     }
 

@@ -28,8 +28,9 @@
  *       announces with two old copies each, drain over several runs;
  *   (f) two referenced announces are each kept once, each by the copy that
  *       came in on the path's interface when two share the path's hops;
- *   (cost) seeding and the cache/path request reader look copies up through
- *       the path and idx_inbound_packets_hash, never by scanning the history.
+ *   (cost) seeding and the path request and cache request readers look
+ *       copies up through the path and idx_inbound_packets_hash, never by
+ *       scanning the history.
  *
  * Run: php tests/inbound_one_copy_test.php
  */
@@ -338,10 +339,11 @@ check('a path request after the cache requests is still answered at 4 hops for A
 check('and at 2 hops for F', pathResponseHops($storage, $db, $idF) === 2);
 
 // ── (cost) index-backed readers ──────────────────────────────────────────
-echo "(cost) seeding and the cache/path request reader never scan the inbound history\n";
+echo "(cost) seeding and the path request and cache request readers never scan the inbound history\n";
 $plans = [
     'seedPathAnnounceSql' => [':dest' => bin2hex($idA['destination']), ':accepted' => 'accepted'],
     'cachedAnnounceByPacketHashSql' => [':packet_hash_hex' => $hashA, ':status' => 'parsed', ':packet_type' => 1],
+    'cacheRequestCopySql' => [':packet_hash_hex' => $hashA, ':status' => 'parsed', ':packet_type' => 1],
 ];
 foreach ($plans as $method => $params) {
     if (!method_exists($storage, $method)) {

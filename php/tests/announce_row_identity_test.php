@@ -43,7 +43,13 @@
  *  (9) once §4.5 has removed a legacy row, keeping its inbound history, a
  *      CACHE_REQUEST for its copy of an announce is a miss: no announce is
  *      queued, no path leads to the removed row, known_destinations is as
- *      it was.
+ *      it was;
+ *  (10) a path request is answered from such a copy exactly as before the
+ *      row went: when maintenance kept the removed row's copy as the only
+ *      one of an announce a live path through another row holds (a link
+ *      proof set the path's hop count to that copy's), the PATH_RESPONSE is
+ *      the same bytes, to the same row, and no path or known_destinations
+ *      row changes, while a cache request for it is still a miss.
  *
  * Today (before Stage 1) the replay moves the local destination, and the
  * cache replay is relayed to every other row. On code without signed
@@ -160,6 +166,31 @@ function browser(?string $claim = null): array
     return $claim === null ? ['client' => 'rns-js', 'mode' => 1] : ['client' => 'rns-js', 'mode' => 1, 'identity_hash' => $claim];
 }
 
+/**
+ * A PATH_REQUEST for a destination, as Transport.request_path() sends it: DATA
+ * to the PLAIN destination rnstransport.path.request, carrying the destination
+ * hash and a fresh tag.
+ */
+function pathRequest(string $destHex): string
+{
+    $control = substr(hash('sha256', substr(hash('sha256', 'rnstransport.path.request', true), 0, 10), true), 0, 16);
+
+    return chr(0x08) . chr(0) . $control . chr(0x00) . (string) hex2bin($destHex) . random_bytes(16);
+}
+
+/** A path request for $dest through $row: its verdict, and every packet it queued. */
+function pathAnswer(Storage $s, PDO $db, string $row, string $dest): array
+{
+    $db->exec('DELETE FROM outbound_packets');
+    $request = pathRequest($dest);
+    feed($s, $row, $request);
+
+    return [
+        'verdict' => verdictOf($db, AnnounceFixture::packetHash($request)),
+        'queued' => q($db, 'SELECT interface_id, queue_reason, packet_base64 FROM outbound_packets ORDER BY packet_id'),
+    ];
+}
+
 $tmp = sys_get_temp_dir() . '/announce-row-identity-' . bin2hex(random_bytes(4));
 mkdir($tmp, 0775, true);
 register_shutdown_function(static function () use ($tmp): void {
@@ -176,6 +207,7 @@ if (!$signedHere) {
     check("Stage 1's signed registration exists", false, 'no Storage::issueChallenge(): every signed case below is skipped');
 }
 $cachedAnnounce = new ReflectionMethod($node, 'cachedAnnounceRecordByPacketHash');
+$cacheRequestCopy = new ReflectionMethod($node, 'cacheRequestCopy');
 
 // Rows every section uses.
 $third = legacyRow($node, browser(), 'third party'); // sends DATA and cache requests
@@ -509,7 +541,8 @@ if ($signedHere) {
         $retiredSigned !== '' && q($db, 'SELECT 1 FROM interfaces WHERE interface_id = :i', [':i' => $retiredRow]) === []
         && pathOf($db, $aR['dest_hex']) === null && localOf($db, $aR['dest_hex']) === null
         && array_column($copies, 'interface_id') === [$retiredRow], json_encode($copies));
-    check('that copy answers as not cached', $cachedAnnounce->invoke($node, $aR['packet_hash_hex']) === null);
+    check('that copy answers a cache request as not cached', $cacheRequestCopy->invoke($node, $aR['packet_hash_hex']) === null);
+    check('...while the path request reader still finds it, as before', $cachedAnnounce->invoke($node, $aR['packet_hash_hex']) !== null);
     $knownR = knownOf($db, $aR['dest_hex']);
     $db->exec('DELETE FROM outbound_packets');
     $request = AnnounceFixture::cacheRequest($aR['packet_hash_hex']);
@@ -520,6 +553,59 @@ if ($signedHere) {
     check('...no path to the removed row, and known_destinations as it was',
         pathOf($db, $aR['dest_hex']) === null && q($db, 'SELECT 1 FROM path_entries WHERE interface_id = :i', [':i' => $retiredRow]) === []
         && knownOf($db, $aR['dest_hex']) === $knownR, trim($log));
+}
+
+echo "\n(10) a path request answered from a copy whose row §4.5 removed is answered as before\n";
+if ($signedHere) {
+    $mover = RegFixture::identity();
+    $moverRow = legacyRow($node, browser($mover['hash_hex']));
+    $aM = AnnounceFixture::announce($mover, 'lxmf.delivery', 0, null, 'm', time() - 30);
+    feed($node, $moverRow, $aM['raw']);
+    // The path through the legacy row lapses, and the same announce comes in
+    // through the peer PHP node, two hops further out: the path moves there.
+    $db->prepare('UPDATE path_entries SET expires_at = :t WHERE destination_hash_hex = :d')
+        ->execute([':t' => time() - 1, ':d' => $aM['dest_hex']]);
+    feed($node, $peerRow, AnnounceFixture::withHops($aM['raw'], 2));
+    $moved = pathOf($db, $aM['dest_hex']);
+    check('(precondition) the path moved to the peer PHP node, 3 hops, holding the same announce',
+        ($moved['interface_id'] ?? null) === $peerRow && (int) ($moved['hops'] ?? -1) === 3
+        && ($moved['packet_hash_hex'] ?? null) === $aM['packet_hash_hex'], json_encode($moved));
+    // A link proof through the node then sets the path's hop count, as RNS
+    // does (path_entry[IDX_PT_HOPS] = packet.hops: the rebalance in
+    // request_relay_routing_trait.php), here to the legacy row's copy's 1.
+    // Past the inbound TTL maintenance keeps the copy at the path's hop
+    // count, the legacy row's, and deletes the peer's.
+    $db->prepare('UPDATE path_entries SET hops = 1 WHERE destination_hash_hex = :d')->execute([':d' => $aM['dest_hex']]);
+    $db->prepare('UPDATE inbound_packets SET created_at = created_at - 7200 WHERE packet_hash_hex = :h')->execute([':h' => $aM['packet_hash_hex']]);
+    $node->runMaintenance(300, 86400);
+    $kept = q($db, 'SELECT interface_id FROM inbound_packets WHERE packet_hash_hex = :h', [':h' => $aM['packet_hash_hex']]);
+    check("(precondition) maintenance kept one copy, the legacy row's, while the path is through the peer PHP node",
+        array_column($kept, 'interface_id') === [$moverRow] && (pathOf($db, $aM['dest_hex'])['interface_id'] ?? null) === $peerRow,
+        json_encode([$kept, pathOf($db, $aM['dest_hex'])]));
+    $before = pathAnswer($node, $db, $third, $aM['dest_hex']);
+    check('(precondition) a path request is answered: one PATH_RESPONSE, for the row that asked',
+        $before['verdict'] === ['response_queued', 'known_path_response'] && count($before['queued']) === 1
+        && $before['queued'][0]['interface_id'] === $third && $before['queued'][0]['queue_reason'] === 'path_response',
+        json_encode($before));
+    // The identity signs: §4.5 removes the legacy row and keeps its copy.
+    $pathM = pathOf($db, $aM['dest_hex']);
+    $knownM = knownOf($db, $aM['dest_hex']);
+    $moverSigned = (string) signedRow($node, $mover);
+    $kept = q($db, 'SELECT interface_id FROM inbound_packets WHERE packet_hash_hex = :h', [':h' => $aM['packet_hash_hex']]);
+    check("(precondition) the identity signs: §4.5 removes the legacy row, its copy stays the announce's only one, the path stands",
+        $moverSigned !== '' && q($db, 'SELECT 1 FROM interfaces WHERE interface_id = :i', [':i' => $moverRow]) === []
+        && array_column($kept, 'interface_id') === [$moverRow] && pathOf($db, $aM['dest_hex']) === $pathM, json_encode($kept));
+    $after = pathAnswer($node, $db, $third, $aM['dest_hex']);
+    check('a path request is answered exactly as before: the same verdict, the same PATH_RESPONSE bytes, for the same row, nothing else queued',
+        $after === $before, json_encode(['before' => $before, 'after' => $after]));
+    check('...and it changed no path and no known_destinations row',
+        pathOf($db, $aM['dest_hex']) === $pathM && knownOf($db, $aM['dest_hex']) === $knownM);
+    $db->exec('DELETE FROM outbound_packets');
+    $request = AnnounceFixture::cacheRequest($aM['packet_hash_hex']);
+    feed($node, $third, $request);
+    check('a cache request for that copy is still a miss (cached_announce_not_found), and queues no announce',
+        verdictOf($db, AnnounceFixture::packetHash($request)) === ['miss', 'cached_announce_not_found'] && announcesQueued($db) === [],
+        json_encode([verdictOf($db, AnnounceFixture::packetHash($request)), announcesQueued($db)]));
 }
 
 echo "\n$pass passed, $fail failed\n";
