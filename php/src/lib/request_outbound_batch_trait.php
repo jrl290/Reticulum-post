@@ -570,40 +570,45 @@ trait RequestOutboundBatchTrait
         Database::executeWithRetry($stmt, 'expireOutboundPackets');
     }
 
-    private function interfaceRxPackets(string $interfaceId): int
-    {
-        $stmt = $this->db->prepare(
-            'SELECT rx_packets FROM interfaces WHERE interface_id = :id'
-        );
-        $stmt->bindValue(':id', $interfaceId, PDO::PARAM_STR);
-        $stmt->execute();
-        $row = $stmt->fetch(PDO::FETCH_ASSOC);
-        return is_array($row) ? (int) ($row['rx_packets'] ?? 0) : 0;
-    }
-
-    private function interfaceTotalOutboundCount(string $interfaceId): int
-    {
-        $stmt = $this->db->prepare(
-            'SELECT COUNT(*) as cnt FROM outbound_packets WHERE interface_id = :id'
-        );
-        $stmt->bindValue(':id', $interfaceId, PDO::PARAM_STR);
-        $stmt->execute();
-        $row = $stmt->fetch(PDO::FETCH_ASSOC);
-        return is_array($row) ? (int) ($row['cnt'] ?? 0) : 0;
-    }
-
     /**
      * Seed a newly-registered interface with cached announces from other
-     * interfaces. Called once per interface lifetime — only triggers when
-     * the interface has never received inbound traffic and has no outbound
-     * history.
+     * interfaces, once per interface row, on its first exchange. PHP node
+     * peering rows are never seeded.
+     *
+     * "New" is the row's seeded_at marker, claimed by the one UPDATE that
+     * finds it NULL, so of two concurrent exchanges only one seeds. Until
+     * 2026-10-14 it was "no packets received and no outbound rows", and a
+     * live announce relayed to the interface between its registration and
+     * its first exchange gave it an outbound row: it was never seeded
+     * (tests/seed_new_interface_once_test.php). If seeding throws, the
+     * claim is released, so the interface's next exchange seeds it.
      */
     public function seedInterfaceIfNew(string $interfaceId): void
     {
-        if ($this->interfaceRxPackets($interfaceId) > 0) return;
-        if ($this->interfaceTotalOutboundCount($interfaceId) > 0) return;
         if ($this->isPhpPeerInterface($interfaceId)) return;
-        $this->seedInterfaceWithCachedAnnounces($interfaceId);
+        // Read first: on SQLite an UPDATE takes the write lock even when it
+        // matches nothing, and every exchange comes through here.
+        $read = $this->db->prepare('SELECT seeded_at FROM interfaces WHERE interface_id = :id');
+        $read->bindValue(':id', $interfaceId, PDO::PARAM_STR);
+        $read->execute();
+        $seededAt = $read->fetch(PDO::FETCH_NUM);
+        $read->closeCursor();
+        if ($seededAt === false || $seededAt[0] !== null) return;
+        $claim = $this->db->prepare(
+            'UPDATE interfaces SET seeded_at = :now WHERE interface_id = :id AND seeded_at IS NULL'
+        );
+        $claim->bindValue(':now', time(), PDO::PARAM_INT);
+        $claim->bindValue(':id', $interfaceId, PDO::PARAM_STR);
+        Database::executeWithRetry($claim, 'claimInterfaceSeed');
+        if ($claim->rowCount() !== 1) return;
+        try {
+            $this->seedInterfaceWithCachedAnnounces($interfaceId);
+        } catch (\Throwable $e) {
+            $release = $this->db->prepare('UPDATE interfaces SET seeded_at = NULL WHERE interface_id = :id');
+            $release->bindValue(':id', $interfaceId, PDO::PARAM_STR);
+            Database::executeWithRetry($release, 'releaseInterfaceSeed');
+            throw $e;
+        }
     }
 
     /**
@@ -613,30 +618,8 @@ trait RequestOutboundBatchTrait
      */
     private function seedInterfaceWithCachedAnnounces(string $interfaceId): void
     {
-        // Find the most recent accepted announce per unique destination,
-        // excluding announces that originated from this interface (echoes).
-        $stmt = $this->db->prepare(
-            'SELECT DISTINCT destination_hash_hex
-             FROM inbound_packets
-             WHERE packet_type = 1
-               AND filter_status = :accepted
-               AND announce_status IN (:validated, :path_updated)
-               AND interface_id != :self_iface
-             ORDER BY packet_record_id DESC
-             LIMIT 64'
-        );
-        $stmt->bindValue(':accepted', 'accepted', PDO::PARAM_STR);
-        $stmt->bindValue(':validated', 'validated', PDO::PARAM_STR);
-        $stmt->bindValue(':path_updated', 'path_updated', PDO::PARAM_STR);
-        $stmt->bindValue(':self_iface', $interfaceId, PDO::PARAM_STR);
-        $stmt->execute();
-
         $queued = 0;
-        while (($row = $stmt->fetch(PDO::FETCH_ASSOC)) !== false) {
-            if (!is_array($row)) continue;
-            $destHex = (string) ($row['destination_hash_hex'] ?? '');
-            if ($destHex === '') continue;
-
+        foreach ($this->seedDestinations($interfaceId) as $destHex) {
             // The announce the path keeps, by the same rule as a path or cache
             // request and as maintenance keeps one copy of it; with no path,
             // or none of its copies stored, the newest copy. Either way only
@@ -666,6 +649,65 @@ trait RequestOutboundBatchTrait
             // Queue the cached announce for this interface
             $this->queueOutboundPacket($interfaceId, $rawBase64, 'relay_announce', null);
             $queued++;
+        }
+    }
+
+    /**
+     * The up to 64 destinations seeding replays, newest accepted announce
+     * first, excluding announces that came in on this interface (echoes).
+     *
+     * Read newest first in chunks of 256 rows, doubling to 4096, until 64
+     * destinations are found or the history ends. Until 2026-10-15 one
+     * SELECT DISTINCT destination_hash_hex ... ORDER BY packet_record_id
+     * did this; MySQL refuses it under ONLY_FULL_GROUP_BY (8.4's default
+     * sql_mode, error 3065), so every new interface's exchange failed there.
+     * GROUP BY ... ORDER BY MAX(packet_record_id) is standard but reads
+     * every announce: timed 2026-10-15 on 60K rows of retichat.com's width
+     * with 24K destinations, about 95 ms on SQLite and 120 ms on MySQL 8.4
+     * against 0.2 and 0.5 ms this way (one chunk). With fewer than 64
+     * destinations every form reads the whole history: 8 chunks, 90 ms, as
+     * the DISTINCT took.
+     *
+     * @return list<string>
+     */
+    private function seedDestinations(string $interfaceId): array
+    {
+        $stmt = $this->db->prepare(
+            'SELECT packet_record_id, destination_hash_hex
+             FROM inbound_packets
+             WHERE packet_type = 1
+               AND filter_status = :accepted
+               AND announce_status IN (:validated, :path_updated)
+               AND interface_id != :self_iface
+               AND packet_record_id < :before
+             ORDER BY packet_record_id DESC
+             LIMIT :chunk'
+        );
+        $destinations = [];
+        $before = PHP_INT_MAX;
+        $chunk = 256;
+        while (true) {
+            $stmt->bindValue(':accepted', 'accepted', PDO::PARAM_STR);
+            $stmt->bindValue(':validated', 'validated', PDO::PARAM_STR);
+            $stmt->bindValue(':path_updated', 'path_updated', PDO::PARAM_STR);
+            $stmt->bindValue(':self_iface', $interfaceId, PDO::PARAM_STR);
+            $stmt->bindValue(':before', $before, PDO::PARAM_INT);
+            $stmt->bindValue(':chunk', $chunk, PDO::PARAM_INT);
+            $stmt->execute();
+            $rows = $stmt->fetchAll(PDO::FETCH_NUM);
+            foreach ($rows as [$recordId, $destHex]) {
+                $before = (int) $recordId;
+                $destHex = (string) $destHex;
+                if ($destHex === '' || isset($destinations[$destHex])) continue;
+                $destinations[$destHex] = true;
+                if (count($destinations) === 64) {
+                    return array_keys($destinations);
+                }
+            }
+            if (count($rows) < $chunk) {
+                return array_keys($destinations);
+            }
+            $chunk = min($chunk * 2, 4096);
         }
     }
 

@@ -1620,6 +1620,13 @@ function runIndexMigrateOn(Storage $storage, $out, $err): int
     if (($summary['claims_backfilled'] ?? 0) > 0) {
         fwrite($out, sprintf("backfilled claimed_identity_hash on %d row(s)\n", $summary['claims_backfilled']));
     }
+    if (isset($summary['public_keys'])) {
+        fwrite($out, sprintf("truncated public keys: %d repaired from their announce, %d known destination(s) dropped, %d queued packet key(s) cleared\n",
+            $summary['public_keys']['repaired'], $summary['public_keys']['dropped'], $summary['public_keys']['cleared']));
+    }
+    if (($summary['seeded_backfilled'] ?? 0) > 0) {
+        fwrite($out, sprintf("marked %d existing interface row(s) seeded\n", $summary['seeded_backfilled']));
+    }
     if ($summary['errors'] !== []) {
         foreach ($summary['errors'] as $error) {
             fwrite($err, "migrate error: {$error}\n");
