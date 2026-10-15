@@ -50,13 +50,22 @@
  * (i) On samples: plain HTTP is refused except from loopback, and handle()
  *     checks that before anything else; the origin rules; where the
  *     credentials may live (symlinks resolved).
+ * (j) A real browser (Playwright's Chromium, when the test finds it) signs in
+ *     through the form, runs Flush stale sessions and signs out, each POST
+ *     carrying this origin. (c) to (h) write their headers by hand, as no
+ *     browser would have.
  *
  * On ee9c491 this fails (a), where /v1/monitor and the rest answer 200 with
  * debug.enabled and monitor.php exists, and everything after it: there is no
- * admin page and no admin-setup.
+ * admin page and no admin-setup. On 1a2494a it fails (c)'s Referrer-Policy and
+ * all of (j): the page sent no-referrer, so the browser sent `Origin: null`
+ * with the sign-in and sameOrigin() refused it (403); no browser could sign in.
  *
  * Run: php php/tests/admin_console_test.php
  * ADMIN_SRC_DIR points it at another php/src, for mutation checks.
+ * ADMIN_PLAYWRIGHT_DIR is a directory with node_modules/playwright (default:
+ * ../test-harnesses/distro-pipeline beside this repository); without one, (j)
+ * says it was skipped.
  */
 declare(strict_types=1);
 
@@ -396,8 +405,8 @@ check("a CSP of default-src 'none' and the page's own nonce, and no framing",
     str_contains($csp, "default-src 'none'") && $nonce !== '' && str_contains($page['body'], 'nonce="' . $nonce . '"') && str_contains($csp, "frame-ancestors 'none'")
     && header1($page, 'x-frame-options') === 'DENY', $csp);
 check('a new nonce each time', ($m2 = preg_match("/'nonce-([^']+)'/", header1(request('GET', $a['base'] . '/admin'), 'content-security-policy') ?? '', $again)) === 1 && $again[1] !== $nonce);
-check('no-store, nosniff, no-referrer',
-    header1($page, 'cache-control') === 'no-store' && header1($page, 'x-content-type-options') === 'nosniff' && header1($page, 'referrer-policy') === 'no-referrer');
+check('no-store, nosniff, and a referrer for this origin only (no-referrer would make a browser send Origin: null)',
+    header1($page, 'cache-control') === 'no-store' && header1($page, 'x-content-type-options') === 'nosniff' && header1($page, 'referrer-policy') === 'same-origin');
 $r = request('OPTIONS', $a['base'] . '/admin/data', ['Origin: http://evil.example', 'Access-Control-Request-Method: GET']);
 check('a CORS preflight for an admin path is refused (404, no Allow-Origin)', $r['status'] === 404 && !isset($r['headers']['access-control-allow-origin']), (string) $r['status']);
 
@@ -644,6 +653,40 @@ foreach ($placements as $what => [$path, $served, $expected]) {
         $expected === null ? $problem === null : is_string($problem) && str_contains($problem, $expected), (string) $problem);
 }
 exec('rm -rf ' . escapeshellarg($root));
+
+echo "(j) a real browser: the sign-in form, an action, Sign out\n";
+$playwrightDir = getenv('ADMIN_PLAYWRIGHT_DIR') ?: dirname(__DIR__, 3) . '/test-harnesses/distro-pipeline';
+$nodeBinary = trim((string) shell_exec('command -v node'));
+if ($nodeBinary === '' || !is_dir($playwrightDir . '/node_modules/playwright')) {
+    echo "  skipped: no node, or no node_modules/playwright in $playwrightDir (set ADMIN_PLAYWRIGHT_DIR)\n";
+} else {
+    $c = startNode($src, freePort(), null);
+    $r = cli($c, ['admin-setup', 'james'], $password . "\n");
+    check('admin-setup on a fresh node', $r['code'] === 0, trim($r['err']));
+    // The password goes in on stdin, not argv.
+    $proc = proc_open(
+        [$nodeBinary, __DIR__ . '/admin_console_browser.cjs', $playwrightDir, $c['base'], 'james'],
+        [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['file', $c['dir'] . '/browser.err', 'w']],
+        $pipes
+    );
+    fwrite($pipes[0], $password . "\n");
+    fclose($pipes[0]);
+    $out = (string) stream_get_contents($pipes[1]);
+    fclose($pipes[1]);
+    proc_close($proc);
+    $lines = array_values(array_filter(explode("\n", trim($out))));
+    $seen = json_decode((string) end($lines), true) ?: [];
+    $detail = trim($out . ' ' . (string) @file_get_contents($c['dir'] . '/browser.err'));
+    check('the sign-in form posts with this origin, not "null", and signs in (303)',
+        ($seen['signIn']['origin'] ?? null) === $c['base'] && ($seen['signIn']['status'] ?? null) === 303, $detail);
+    check('the console loads', ($seen['console'] ?? false) === true, $detail);
+    check('Flush stale sessions posts with this origin and runs (200)',
+        ($seen['action']['origin'] ?? null) === $c['base'] && ($seen['action']['status'] ?? null) === 200, $detail);
+    check('Sign out posts with this origin, answers 303 and leaves the sign-in form and no cookie',
+        ($seen['signOut']['origin'] ?? null) === $c['base'] && ($seen['signOut']['status'] ?? null) === 303
+        && ($seen['signedOut'] ?? false) === true && ($seen['cookieLeft'] ?? true) === false, $detail);
+    stopNode($c);
+}
 
 echo "\n$pass passed, $fail failed\n";
 exit($fail === 0 ? 0 : 1);

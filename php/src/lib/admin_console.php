@@ -861,7 +861,11 @@ final class AdminConsole
         header('Cache-Control: no-store');
         header('X-Content-Type-Options: nosniff');
         header('X-Frame-Options: DENY');
-        header('Referrer-Policy: no-referrer');
+        // same-origin, not no-referrer: under no-referrer a browser sends
+        // `Origin: null` with the page's own POSTs (the sign-in, every action,
+        // Sign out), and sameOrigin() refuses them. Other sites still get no
+        // referrer.
+        header('Referrer-Policy: same-origin');
         header('Cross-Origin-Opener-Policy: same-origin');
         header('Cross-Origin-Resource-Policy: same-origin');
         header('X-Robots-Tag: noindex, nofollow');
