@@ -9,7 +9,10 @@
  *     name, as header() does); after finish(), nothing does.
  * (b) SwooleNode::serverVars(): Swoole's request as index.php's $_SERVER,
  *     so HttpIo::normalizedPath() strips the base path Passenger passes on,
- *     and the front-secret header is not passed to the node.
+ *     and no X-Front-* header is passed to the node. Only a request that
+ *     carried the front secret gets HTTPS, REQUEST_SCHEME and REMOTE_ADDR
+ *     from X-Front-Https and X-Front-Client, which Apache sets; otherwise
+ *     every request would be plain HTTP from 127.0.0.1, Passenger's view.
  * (c) Under Swoole, exit ends the request as Swoole\ExitException, which a
  *     catch of \Throwable or \Exception takes. Every such catch whose try can
  *     end the request (exit, ->respond(), ->renderMonitorPage(), ->handle(),
@@ -25,7 +28,8 @@
  *     loads.
  * (f) `php index.php runtime` (SwooleSetup): on, it writes the app root
  *     (Passengerfile.json, the front secret, tmp/restart.txt) and the
- *     .htaccess block; again, nothing changes; off, it removes only the
+ *     .htaccess block, which also sets X-Front-Https and X-Front-Client from
+ *     Apache's view; again, nothing changes; off, it removes only the
  *     block. It refuses an app root inside the web directory and a node with
  *     no base path.
  * (g) LoadedCode: /health names the stamp on disk only while the code on
@@ -102,6 +106,31 @@ check('the node routes the path without the base, as under Apache',
     HttpIo::normalizedPath($vars['REQUEST_URI'], $vars) === '/v1/interfaces/exchange', HttpIo::normalizedPath($vars['REQUEST_URI'], $vars));
 $root = SwooleNode::serverVars(['request_method' => 'GET', 'request_uri' => '/health'], [], '');
 check('with no base path, /health is /health', HttpIo::normalizedPath($root['REQUEST_URI'], $root) === '/health');
+$front = static fn (bool $fromFront, array $headers): array => SwooleNode::serverVars(
+    ['request_method' => 'POST', 'request_uri' => '/reticulum/admin/login', 'remote_addr' => '127.0.0.1'],
+    $headers + ['host' => 'example.test', 'origin' => 'https://example.test'],
+    '/reticulum',
+    ['x-front-secret'],
+    $fromFront
+);
+$https = $front(true, ['x-front-secret' => 's3cret', 'x-front-https' => 'on', 'x-front-client' => '203.0.113.7']);
+check('beside the secret, what Apache saw: HTTPS on, REQUEST_SCHEME https, REMOTE_ADDR the client',
+    ($https['HTTPS'] ?? null) === 'on' && ($https['REQUEST_SCHEME'] ?? null) === 'https' && $https['REMOTE_ADDR'] === '203.0.113.7', json_encode($https));
+check('...no X-Front-* header is passed on',
+    !isset($https['HTTP_X_FRONT_SECRET']) && !isset($https['HTTP_X_FRONT_HTTPS']) && !isset($https['HTTP_X_FRONT_CLIENT']));
+check('...the request\'s own Host and Origin are', $https['HTTP_HOST'] === 'example.test' && $https['HTTP_ORIGIN'] === 'https://example.test');
+$plain = $front(true, ['x-front-https' => 'off', 'x-front-client' => '2001:db8::7']);
+check('plain HTTP through Apache: no HTTPS, REQUEST_SCHEME http; an IPv6 client',
+    !isset($plain['HTTPS']) && ($plain['REQUEST_SCHEME'] ?? null) === 'http' && $plain['REMOTE_ADDR'] === '2001:db8::7', json_encode($plain));
+$forged = $front(false, ['x-front-https' => 'on', 'x-front-client' => '203.0.113.7']);
+check('without the secret they are not believed: no HTTPS, Swoole\'s REMOTE_ADDR, and not passed on',
+    !isset($forged['HTTPS']) && !isset($forged['REQUEST_SCHEME']) && $forged['REMOTE_ADDR'] === '127.0.0.1'
+    && !isset($forged['HTTP_X_FRONT_HTTPS']) && !isset($forged['HTTP_X_FRONT_CLIENT']), json_encode($forged));
+$odd = $front(true, ['x-front-https' => 'yes', 'x-front-client' => '203.0.113.7, 10.0.0.1']);
+check('values Apache would not send are ignored: no HTTPS or scheme, Swoole\'s REMOTE_ADDR',
+    !isset($odd['HTTPS']) && !isset($odd['REQUEST_SCHEME']) && $odd['REMOTE_ADDR'] === '127.0.0.1', json_encode($odd));
+$upper = SwooleNode::serverVars(['remote_addr' => '127.0.0.1'], ['X-Front-Https' => 'on', 'X-Front-Client' => '203.0.113.8'], '', [], true);
+check('header names in any case', ($upper['HTTPS'] ?? null) === 'on' && $upper['REMOTE_ADDR'] === '203.0.113.8' && !isset($upper['HTTP_X_FRONT_HTTPS']));
 
 echo "\n(c) no catch-all swallows the exit that ends a request\n";
 
@@ -310,7 +339,9 @@ check('...the .htaccess keeps its rules and ends with the block',
     $htaccess === $existing . "\n" . SwooleSetup::BEGIN . "\nRewriteEngine Off\n"
         . "<FilesMatch \"^(config(\\.local)?\\.(toml|php)|error_log)$|\\.sqlite\">\n    Require all denied\n</FilesMatch>\n"
         . "PassengerAppRoot \"{$appRoot}\"\nPassengerBaseURI \"/reticulum\"\n"
-        . "RequestHeader set X-Front-Secret \"{$secret}\"\n" . SwooleSetup::END . "\n", $htaccess);
+        . "RequestHeader set X-Front-Secret \"{$secret}\"\n"
+        . "RequestHeader set X-Front-Https \"expr=%{HTTPS}\"\nRequestHeader set X-Front-Client \"expr=%{REMOTE_ADDR}\"\n"
+        . SwooleSetup::END . "\n", $htaccess);
 [$code] = $run($config(true));
 check('on again: the same .htaccess and the same secret', $code === 0
     && file_get_contents($web . '/.htaccess') === $htaccess && trim((string) file_get_contents($appRoot . '/front_secret')) === $secret);

@@ -19,7 +19,10 @@ declare(strict_types=1);
  * front secret's path; the secret; tmp/restart.txt) and the block in the web
  * directory's .htaccess that hands requests to Passenger with the secret in
  * X-Front-Secret. A request without it is refused with 403: the loopback
- * port is open to every account on the host. Setting enable_swoole = false
+ * port is open to every account on the host. Beside the secret, the block's
+ * X-Front-Https and X-Front-Client give the node HTTPS and REMOTE_ADDR as
+ * Apache saw them; Passenger's own request is plain HTTP from 127.0.0.1.
+ * Setting enable_swoole = false
  * and running `php index.php runtime` hands the node back to index.php.
  * See SwooleSetup in lib/swoole_node.php.
  *
@@ -134,7 +137,10 @@ $server->on('request', static function (\Swoole\Http\Request $request, \Swoole\H
         $response->end();
         return;
     }
-    $vars = SwooleNode::serverVars(is_array($request->server) ? $request->server : [], $headers, $baseUri, ['x-front-secret']);
+    // With a secret, every request still here came through Apache's block,
+    // so its X-Front-Https and X-Front-Client are Apache's. Without one (a
+    // test), nothing vouches for them.
+    $vars = SwooleNode::serverVars(is_array($request->server) ? $request->server : [], $headers, $baseUri, ['x-front-secret'], $frontSecret !== '');
     try {
         [$status, $answerHeaders, $body] = $node->answer($vars, (string) $request->rawContent());
     } catch (\Throwable $error) {
