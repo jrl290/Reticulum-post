@@ -65,6 +65,11 @@
  * With RETICULUM_TEST_RUNTIME=swoole the nodes run the Swoole entry instead
  * of `php -S` (tests/stubs/node_process.php), which answers with what went
  * through HttpIo only.
+ * With RETICULUM_TEST_BACKEND=mysql each node keeps its data in a MySQL
+ * database of its own, reticulum_admin_<random>, made at start and dropped at
+ * stop, on the server RETICULUM_TEST_MYSQL_HOST and _PORT name (default
+ * 127.0.0.1:3306), as RETICULUM_TEST_MYSQL_USER and _PASS (default root, no
+ * password): a user who may create and drop such databases.
  * ADMIN_SRC_DIR points it at another php/src, for mutation checks.
  * ADMIN_PLAYWRIGHT_DIR is a directory with node_modules/playwright (default:
  * ../test-harnesses/distro-pipeline beside this repository); without one, (j)
@@ -155,13 +160,49 @@ function jsonBody(array $response): array
     return is_array($decoded) ? $decoded : [];
 }
 
+/** @return array{host: string, port: int, user: string, pass: string}|null the MySQL server, under RETICULUM_TEST_BACKEND=mysql */
+function mysqlServer(): ?array
+{
+    if (getenv('RETICULUM_TEST_BACKEND') !== 'mysql') {
+        return null;
+    }
+    return [
+        'host' => getenv('RETICULUM_TEST_MYSQL_HOST') ?: '127.0.0.1',
+        'port' => (int) (getenv('RETICULUM_TEST_MYSQL_PORT') ?: 3306),
+        'user' => getenv('RETICULUM_TEST_MYSQL_USER') ?: 'root',
+        'pass' => (string) getenv('RETICULUM_TEST_MYSQL_PASS'),
+    ];
+}
+
+function mysqlPdo(array $server, ?string $dbname = null): PDO
+{
+    $dsn = sprintf('mysql:host=%s;port=%d;charset=utf8mb4', $server['host'], $server['port']) . ($dbname === null ? '' : ';dbname=' . $dbname);
+    return new PDO($dsn, $server['user'], $server['pass'], [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+}
+
+/** A TOML basic string. */
+function tomlString(string $value): string
+{
+    return '"' . addcslashes($value, "\\\"") . '"';
+}
+
 function writeConfig(array $node, string $credentialsFile): void
 {
+    $mysql = mysqlServer();
+    $storage = $mysql === null
+        ? ['backend = "sqlite"', 'sqlite_path = "' . $node['dir'] . '/node.sqlite"']
+        : [
+            'backend = "mysql"',
+            'mysql_host = ' . tomlString($mysql['host']),
+            'mysql_port = ' . $mysql['port'],
+            'mysql_dbname = ' . tomlString($node['mysql_db']),
+            'mysql_user = ' . tomlString($mysql['user']),
+            'mysql_pass = ' . tomlString($mysql['pass']),
+        ];
     $lines = [
         'host_url = "' . $node['base'] . '"',
         '[storage]',
-        'backend = "sqlite"',
-        'sqlite_path = "' . $node['dir'] . '/node.sqlite"',
+        ...$storage,
         'log_path = "' . $node['dir'] . '/router.log"',
         // On, so that the old operator routes would answer if they existed.
         '[debug]',
@@ -191,7 +232,12 @@ function startNode(string $src, int $port, ?string $peerUrl): array
         // The layout admin-setup uses by default (~/.reticulum-post), in a
         // home of the test's own.
         'credentials' => $dir . '/home/.reticulum-post/admin.json',
+        'mysql_db' => 'reticulum_admin_' . bin2hex(random_bytes(4)),
     ];
+    $mysql = mysqlServer();
+    if ($mysql !== null) {
+        mysqlPdo($mysql)->exec('CREATE DATABASE `' . $node['mysql_db'] . '`');
+    }
     writeConfig($node, $node['credentials']);
     $node['proc'] = startNodeProcess($dir . '/src', $port, $dir . '/server.out');
     // Readiness is the server answering; the bound only turns a server that
@@ -207,6 +253,10 @@ function stopNode(array $node): void
     proc_terminate($node['proc']);
     proc_close($node['proc']);
     exec('rm -rf ' . escapeshellarg($node['dir']));
+    $mysql = mysqlServer();
+    if ($mysql !== null) {
+        mysqlPdo($mysql)->exec('DROP DATABASE IF EXISTS `' . $node['mysql_db'] . '`');
+    }
 }
 
 /**
@@ -233,6 +283,10 @@ function cli(array $node, array $args, string $stdin = ''): array
 
 function db(array $node): PDO
 {
+    $mysql = mysqlServer();
+    if ($mysql !== null) {
+        return mysqlPdo($mysql, $node['mysql_db']);
+    }
     $pdo = new PDO('sqlite:' . $node['dir'] . '/node.sqlite');
     $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
     return $pdo;
@@ -477,11 +531,18 @@ check('the new ones 200 at both ends',
     exchange($a, (string) ($newB['peer_interface_id'] ?? ''), (string) ($newB['peer_session_token'] ?? '')) === 200
     && exchange($b, (string) ($newA['peer_interface_id'] ?? ''), (string) ($newA['peer_session_token'] ?? '')) === 200);
 
-// A second row naming B, as README's step 1 says to stop at.
+// A second row naming B, as README's step 1 says to stop at: a copy of A's
+// row under another id and token of the same length (MySQL's columns hold
+// no more).
 $pdo = db($a);
-$pdo->exec('CREATE TEMP TABLE twin AS SELECT * FROM interfaces WHERE interface_id = ' . $pdo->quote((string) ($newA['interface_id'] ?? '')));
-$pdo->exec("UPDATE twin SET interface_id = 'twin' || interface_id, session_token = 'twin' || session_token");
-$pdo->exec('INSERT INTO interfaces SELECT * FROM twin');
+$select = $pdo->prepare('SELECT * FROM interfaces WHERE interface_id = :id');
+$select->execute([':id' => (string) ($newA['interface_id'] ?? '')]);
+$twin = $select->fetch(PDO::FETCH_ASSOC) ?: [];
+$twin['interface_id'] = 'twin' . substr((string) ($twin['interface_id'] ?? ''), 4);
+$twin['session_token'] = 'twin' . substr((string) ($twin['session_token'] ?? ''), 4);
+$columns = array_keys($twin);
+$pdo->prepare('INSERT INTO interfaces (`' . implode('`, `', $columns) . '`) VALUES (:c' . implode(', :c', array_keys($columns)) . ')')
+    ->execute(array_combine(array_map(static fn (int $i): string => ':c' . $i, array_keys($columns)), array_values($twin)));
 $r = action($a, $cookie, $token, '/admin/peers/rotate', ['peer' => 'B']);
 check('with two rows naming B, Rotate is refused (409) and deletes neither',
     $r['status'] === 409 && (jsonBody($r)['status'] ?? null) === 'refused_duplicate_rows' && count(peerRows($a, $b['base'])) === 2, $r['status'] . ' ' . $r['body']);
@@ -578,8 +639,8 @@ check('admin-setup lifts it: the right password signs in again', $r['code'] === 
 // The hundred-an-hour count is every address's together, so only
 // admin-setup's clear lifts it: an address's own count is keyed by the
 // password hash and goes with the old one anyway.
-db($a)->prepare("INSERT INTO transport_state (state_key, state_value, updated_at) VALUES ('admin-signin:tries:all', '100', :now)
-    ON CONFLICT(state_key) DO UPDATE SET state_value = excluded.state_value, updated_at = excluded.updated_at")->execute([':now' => time()]);
+db($a)->exec("DELETE FROM transport_state WHERE state_key = 'admin-signin:tries:all'");
+db($a)->prepare("INSERT INTO transport_state (state_key, state_value, updated_at) VALUES ('admin-signin:tries:all', '100', :now)")->execute([':now' => time()]);
 $r = signIn($a, 'james', $password);
 check('past a hundred attempts an hour from all addresses, one that signed in within 30 days still may', $r['status'] === 303, (string) $r['status']);
 db($a)->exec("DELETE FROM transport_state WHERE state_key LIKE 'admin-signin:known:%'");
