@@ -68,7 +68,7 @@ trait RequestSchemaTrait
      */
     private function schemaVersion(): string
     {
-        return 'stage1-1';
+        return 'seed-once-1';
     }
 
     private function recordedSchemaFingerprint(): ?string
@@ -146,6 +146,11 @@ trait RequestSchemaTrait
         });
         if ($ceiling && !isset($summary['lock_wait_timeout'])) {
             $this->backfillClaimedIdentityHashes($summary);
+        }
+        // Also when a later statement stopped the migration: the next run
+        // finds the column there and does not come back here.
+        if ($ceiling && isset($summary['seeded_at_added'])) {
+            $this->backfillSeededInterfaces($summary);
         }
 
         return $summary;
@@ -274,6 +279,7 @@ trait RequestSchemaTrait
                     previous_session_token_hash VARCHAR(64) DEFAULT NULL,
                     superseded_logged_hash VARCHAR(64) NOT NULL DEFAULT '',
                     refusal_logged_seq BIGINT NOT NULL DEFAULT -1,
+                    seeded_at INT DEFAULT NULL,
                     PRIMARY KEY (interface_id)
                 ){$engine}",
 
@@ -509,6 +515,8 @@ trait RequestSchemaTrait
             ['interfaces', 'previous_session_token_hash', 'VARCHAR(64) DEFAULT NULL', null],
             ['interfaces', 'superseded_logged_hash', "VARCHAR(64) NOT NULL DEFAULT ''", null],
             ['interfaces', 'refusal_logged_seq', 'BIGINT NOT NULL DEFAULT -1', null],
+            // seedInterfaceIfNew()'s marker: NULL until the row is seeded.
+            ['interfaces', 'seeded_at', 'INT DEFAULT NULL', null],
         ];
 
         // Ask each table for its columns once and add only the missing ones,
@@ -549,6 +557,9 @@ trait RequestSchemaTrait
                     $startedAt = microtime(true);
                     $this->db->exec($sql);
                     $summary['columns_added'] += count($columns);
+                    if ($table === 'interfaces' && in_array('seeded_at', $columns, true)) {
+                        $summary['seeded_at_added'] = true;
+                    }
                     self::noteBuilt($summary, (count($columns) === 1 ? 'column ' : 'columns ') . "{$table}." . implode(', ', $columns), $startedAt);
                 } catch (PDOException $e) {
                     if (self::lockWaitTimedOut($summary, $e, $what)) {
@@ -983,6 +994,24 @@ trait RequestSchemaTrait
             $summary['claims_backfilled'] = $filled;
         } catch (\Throwable $e) {
             $summary['errors'][] = 'backfill claimed_identity_hash: ' . $e->getMessage();
+        }
+    }
+
+    /**
+     * The rows already there when seeded_at is added were registered under
+     * the rule it replaces, which seeded them on their first exchange (or
+     * found them not new): mark them seeded (0, before the marker), so the
+     * first request of this code does not seed every live interface again.
+     * Runs only in the migration that added the column, after the DDL
+     * ceiling like the claim backfill; a row registered later starts NULL
+     * and is seeded once.
+     */
+    private function backfillSeededInterfaces(array &$summary): void
+    {
+        try {
+            $summary['seeded_backfilled'] = (int) $this->db->exec('UPDATE interfaces SET seeded_at = 0 WHERE seeded_at IS NULL');
+        } catch (\Throwable $e) {
+            $summary['errors'][] = 'backfill seeded_at: ' . $e->getMessage();
         }
     }
 

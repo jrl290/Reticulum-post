@@ -1569,6 +1569,9 @@ function runIndexMigrateOn(Storage $storage, $out, $err): int
     if (($summary['claims_backfilled'] ?? 0) > 0) {
         fwrite($out, sprintf("backfilled claimed_identity_hash on %d row(s)\n", $summary['claims_backfilled']));
     }
+    if (($summary['seeded_backfilled'] ?? 0) > 0) {
+        fwrite($out, sprintf("marked %d existing interface row(s) seeded\n", $summary['seeded_backfilled']));
+    }
     if ($summary['errors'] !== []) {
         foreach ($summary['errors'] as $error) {
             fwrite($err, "migrate error: {$error}\n");

@@ -34,8 +34,8 @@ require_once $root . '/src/index.php';
 // if the change alters what migrate() builds, raise schemaVersion() too, so
 // every database that recorded the old version migrates again; then pin the
 // new pair here.
-const PINNED_SCHEMA_VERSION = 'stage1-1';
-const PINNED_SCHEMA_TRAIT_MASKED_SHA1 = '353234e5443ff8a14ce66bbadde7e83b8327ddf2';
+const PINNED_SCHEMA_VERSION = 'seed-once-1';
+const PINNED_SCHEMA_TRAIT_MASKED_SHA1 = '2b87cf7542fef8348c69e2bcbc9ea0ce289ab38f';
 
 $dir = sys_get_temp_dir() . '/reticulum-php-marker-test-' . bin2hex(random_bytes(4));
 mkdir($dir, 0775, true);
@@ -164,6 +164,9 @@ $stage1Columns = [
     'previous_session_token_hash' => ['VARCHAR(64)', 0, 'NULL'],
     'superseded_logged_hash'      => ['VARCHAR(64)', 1, "''"],
     'refusal_logged_seq'          => ['BIGINT', 1, '-1'],
+    // Not §12: seedInterfaceIfNew()'s marker (2026-10-14), also new to a
+    // 50c870b database.
+    'seeded_at'                   => ['INT', 0, 'NULL'],
 ];
 $stage1Indexes = [
     'idx_interfaces_identity_hash'    => ['interfaces', 1, ['identity_hash']],
@@ -229,6 +232,9 @@ $check($missing === [], 'every §12 object is there, with its type, default and 
 $built = array_column($summary['built'] ?? [], 'object');
 $check($built === $stage1Built, 'it builds exactly §12\'s objects, each listed in the summary, and nothing else: ' . implode(', ', $built));
 $check(recordedVersion($live) === PINNED_SCHEMA_VERSION, 'and records this code\'s version');
+$seededAt = array_unique(array_map('strval', $live->query('SELECT seeded_at FROM interfaces')->fetchAll(PDO::FETCH_COLUMN)));
+$check($seededAt === ['0'] && ($summary['seeded_backfilled'] ?? 0) === count($oldRows),
+    'the rows that were there are marked seeded (0), so the next exchange does not seed them again: ' . json_encode($seededAt));
 $check($migrated->schemaMigrated() === true, '(h) schema_migrated is true after it');
 $rows = $live->query('SELECT interface_id, registration_proof, registration_seq, refusal_logged_seq, superseded_logged_hash, identity_hash, metadata_json FROM interfaces ORDER BY interface_id')->fetchAll(PDO::FETCH_ASSOC);
 $check(count($rows) === count($oldRows), 'every row survives');

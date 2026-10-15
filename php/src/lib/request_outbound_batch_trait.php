@@ -570,40 +570,45 @@ trait RequestOutboundBatchTrait
         Database::executeWithRetry($stmt, 'expireOutboundPackets');
     }
 
-    private function interfaceRxPackets(string $interfaceId): int
-    {
-        $stmt = $this->db->prepare(
-            'SELECT rx_packets FROM interfaces WHERE interface_id = :id'
-        );
-        $stmt->bindValue(':id', $interfaceId, PDO::PARAM_STR);
-        $stmt->execute();
-        $row = $stmt->fetch(PDO::FETCH_ASSOC);
-        return is_array($row) ? (int) ($row['rx_packets'] ?? 0) : 0;
-    }
-
-    private function interfaceTotalOutboundCount(string $interfaceId): int
-    {
-        $stmt = $this->db->prepare(
-            'SELECT COUNT(*) as cnt FROM outbound_packets WHERE interface_id = :id'
-        );
-        $stmt->bindValue(':id', $interfaceId, PDO::PARAM_STR);
-        $stmt->execute();
-        $row = $stmt->fetch(PDO::FETCH_ASSOC);
-        return is_array($row) ? (int) ($row['cnt'] ?? 0) : 0;
-    }
-
     /**
      * Seed a newly-registered interface with cached announces from other
-     * interfaces. Called once per interface lifetime — only triggers when
-     * the interface has never received inbound traffic and has no outbound
-     * history.
+     * interfaces, once per interface row, on its first exchange. PHP node
+     * peering rows are never seeded.
+     *
+     * "New" is the row's seeded_at marker, claimed by the one UPDATE that
+     * finds it NULL, so of two concurrent exchanges only one seeds. Until
+     * 2026-10-14 it was "no packets received and no outbound rows", and a
+     * live announce relayed to the interface between its registration and
+     * its first exchange gave it an outbound row: it was never seeded
+     * (tests/seed_new_interface_once_test.php). If seeding throws, the
+     * claim is released, so the interface's next exchange seeds it.
      */
     public function seedInterfaceIfNew(string $interfaceId): void
     {
-        if ($this->interfaceRxPackets($interfaceId) > 0) return;
-        if ($this->interfaceTotalOutboundCount($interfaceId) > 0) return;
         if ($this->isPhpPeerInterface($interfaceId)) return;
-        $this->seedInterfaceWithCachedAnnounces($interfaceId);
+        // Read first: on SQLite an UPDATE takes the write lock even when it
+        // matches nothing, and every exchange comes through here.
+        $read = $this->db->prepare('SELECT seeded_at FROM interfaces WHERE interface_id = :id');
+        $read->bindValue(':id', $interfaceId, PDO::PARAM_STR);
+        $read->execute();
+        $seededAt = $read->fetch(PDO::FETCH_NUM);
+        $read->closeCursor();
+        if ($seededAt === false || $seededAt[0] !== null) return;
+        $claim = $this->db->prepare(
+            'UPDATE interfaces SET seeded_at = :now WHERE interface_id = :id AND seeded_at IS NULL'
+        );
+        $claim->bindValue(':now', time(), PDO::PARAM_INT);
+        $claim->bindValue(':id', $interfaceId, PDO::PARAM_STR);
+        Database::executeWithRetry($claim, 'claimInterfaceSeed');
+        if ($claim->rowCount() !== 1) return;
+        try {
+            $this->seedInterfaceWithCachedAnnounces($interfaceId);
+        } catch (\Throwable $e) {
+            $release = $this->db->prepare('UPDATE interfaces SET seeded_at = NULL WHERE interface_id = :id');
+            $release->bindValue(':id', $interfaceId, PDO::PARAM_STR);
+            Database::executeWithRetry($release, 'releaseInterfaceSeed');
+            throw $e;
+        }
     }
 
     /**
