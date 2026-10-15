@@ -518,7 +518,8 @@ trait RequestRelayRoutingTrait
         // not an error. Unconditionally it wrote one error_log line per accepted
         // packet: 93 MB on selectivesubconscious.com between 21 Jul and 30 Aug
         // 2026, every byte of it this one message. Keep it for diagnosis, behind
-        // the same debug.enabled flag that gates /debug.
+        // debug.enabled (which also opened /debug and the monitor until
+        // 2026-10-14, when the admin page replaced them).
         if ($targets === [] && ($this->config['debug']['enabled'] ?? false) === true) {
             error_log("[relayAcceptedPacket] NO TARGETS for dest=" . substr((string)($packet['destination_hash_hex']??''),0,12) . " type=" . ($packet['packet_type']??'?'));
         }

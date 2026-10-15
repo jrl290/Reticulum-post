@@ -7,7 +7,7 @@ namespace ReticulumPhp;
 use PDO;
 
 // Reticulum-php is request-operated. These reporting helpers expose request
-// path state for /health and /debug inspection only; they do not alter packet
+// path state for /health and the admin page only; they do not alter packet
 // flow or create a second transport mechanism.
 
 trait RequestDebugReportTrait
@@ -79,12 +79,15 @@ trait RequestDebugReportTrait
     }
 
     /**
-     * The only interface fields a public report (/health, /v1/monitor and
-     * /v1/monitor/data, and /debug where debug.enabled is set) may carry. An
-     * allowlist, never a denylist: a field or metadata key that is not named
-     * here does not leave the node, whatever a client puts in its
-     * registration. Which rows a report lists is the caller's choice: /health
-     * lists only nodes and gateways (recentNodeInterfacesByStatus()).
+     * The only interface fields a report may carry: the public /health, and
+     * the admin page behind its sign-in (its live view and debug report),
+     * which gets no more. An allowlist, never a denylist: a field or metadata
+     * key that is not named here does not leave the node, whatever a client
+     * puts in its registration. Which rows a report lists is the caller's
+     * choice: /health lists only nodes and gateways
+     * (recentNodeInterfacesByStatus()). Until 2026-10-14 the reports beside
+     * /health were /v1/monitor, /v1/monitor/data and /debug, public wherever
+     * debug.enabled was set.
      *
      * Until 2026-09-30 the whole metadata_json went out. For a PHP peer that
      * is its registration body, whose peer_interface_id + peer_session_token
@@ -98,8 +101,8 @@ trait RequestDebugReportTrait
      * last_seen_at (staging.sh status, e2e-local/start.sh,
      * OPNS-RNS-Post-Bridge/rnsd-redeploy.sh), metadata client and mode
      * (staging.sh, the bridge check in the gateway notes). peer_url only with
-     * $withPeerUrl: the monitor page labels PHP peers by it, and /debug
-     * shares the view; /health never carries it.
+     * $withPeerUrl: the admin page labels PHP peers by it; /health never
+     * carries it.
      * Pinned by tests/health_allowlist_test.php.
      */
     public static function publicInterfaceView(array $row, bool $withPeerUrl): array
@@ -404,8 +407,8 @@ trait RequestDebugReportTrait
     {
         $limit = max(1, $limit);
 
-        // /debug is public whenever debug.enabled is set, so its interface
-        // rows get the same allowlist as /health and the monitor.
+        // The admin page's debug report. Its interface rows get the same
+        // allowlist as /health: it was the public /debug until 2026-10-14.
         return [
             'recent_interfaces' => array_map(
                 static fn (array $row): array => self::publicInterfaceView($row, true),
@@ -426,9 +429,17 @@ trait RequestDebugReportTrait
         return (int) ($row[0] ?? 0);
     }
 
-    public function monitorData(): array
+    /**
+     * The admin page's live view (GET /admin/data, polled every 5 s while the
+     * page is visible): what /v1/monitor/data carried until 2026-10-14, plus
+     * the queue and storage counts of /health and the configured peers. The
+     * page works out traffic rates from the change in rx/tx between polls.
+     */
+    public function adminLiveData(): array
     {
         return [
+            'queues' => $this->healthSummary(),
+            'peers' => $this->configuredPeerStates(),
             'interfaces' => array_map(
                 static fn (array $row): array => self::publicInterfaceView($row, true),
                 $this->recentInterfaces(50)
@@ -462,22 +473,5 @@ trait RequestDebugReportTrait
         }
 
         return $rows;
-    }
-
-    public function clearAllData(): void
-    {
-        $tables = [
-            'inbound_packets', 'inbound_batches',
-            'outbound_packets', 'outbound_batches',
-            'packet_hashes', 'path_request_tags',
-            'reverse_path_entries', 'link_transport_entries',
-            'path_entries', 'known_destinations', 'local_destinations',
-            'php_peer_sessions',
-            'transport_state',
-            'interfaces',
-        ];
-        foreach ($tables as $table) {
-            $this->db->exec("DELETE FROM {$table}");
-        }
     }
 }

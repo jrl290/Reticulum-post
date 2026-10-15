@@ -576,13 +576,32 @@ function e2eServerLog(array $node): string
     return (string) @\file_get_contents($node['dir'] . '/server.out');
 }
 
+/**
+ * The operator's `php index.php initialize`, run on the node's own copy as it
+ * is run on a host (GET /v1/initialize until 2026-10-14).
+ *
+ * @return array{int, array} exit code and decoded output
+ */
+function e2eInitializeCli(array $node): array
+{
+    $proc = \proc_open(
+        [PHP_BINARY, $node['dir'] . '/src/index.php', 'initialize'],
+        [0 => ['file', '/dev/null', 'r'], 1 => ['pipe', 'w'], 2 => ['file', $node['dir'] . '/cli.err', 'w']],
+        $pipes
+    );
+    $stdout = (string) \stream_get_contents($pipes[1]);
+    \fclose($pipes[1]);
+    $decoded = \json_decode($stdout, true);
+    return [\proc_close($proc), \is_array($decoded) ? $decoded : []];
+}
+
 $e2eSrc = getenv('WAKE_SRC_DIR');
 $e2eSrc = ($e2eSrc !== false && $e2eSrc !== '') ? $e2eSrc : $root . '/src';
 $b = e2eStartNode($e2eSrc, e2eFreePort(), null);
 $a = e2eStartNode($e2eSrc, e2eFreePort(), $b['base']);
 
-[$status, $init] = e2eHttp('GET', $a['base'] . '/v1/initialize');
-check('A registers at B on /v1/initialize', $status === 200 && ($init['peers'][0]['status'] ?? null) === 'connected', (string) json_encode($init));
+[$code, $init] = e2eInitializeCli($a);
+check('A registers at B on `php index.php initialize`', $code === 0 && ($init['peers'][0]['status'] ?? null) === 'connected', (string) json_encode($init));
 
 foreach ([
     "B's URL exactly" => $b['base'],

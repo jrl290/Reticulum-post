@@ -61,9 +61,9 @@ Use this list to confirm the exact fixes that were just made before running full
 - [ ] Bidirectional registration happens in a single `/v1/interfaces/register`: the initiator pre-generates `peer_interface_id` + `peer_session_token` and sends them in metadata (`client: "reticulum-php"`); the receiver stores them and echoes them back.
 - [ ] `dispatchWakes()` only wakes peers that have pending outbound packets, rate-limited by `min_wake_interval_ms` (default 1000ms) via `last_wake_sent_at` — wake is traffic-driven, not a heartbeat. Zero pending outbound = zero wakes (expected when idle).
 - [ ] Wake HTTP call is truly fire-and-forget: `CURLOPT_TIMEOUT_MS` short (default 500ms), response ignored — a slow/down peer must not add latency to the triggering request.
-- [ ] Stale peer credentials after a redeploy/wipe: `DELETE FROM interfaces WHERE peer_url IS NOT NULL` on both nodes, then re-run `/v1/initialize` to re-handshake fresh credentials.
+- [ ] Stale peer credentials after a redeploy/wipe: `DELETE FROM interfaces WHERE peer_url IS NOT NULL` on both nodes, then run `php index.php initialize` on the host to re-handshake fresh credentials (`GET /v1/initialize` until 2026-10-14).
 - [ ] `dispatchWakes()` is wired into the request lifecycle via `register_shutdown_function(fn() => $this->dispatchWakes())` at the top of `handle()` — NOT called inline in `respond()` (curl output leaks into the JSON response body). The shutdown function runs after the response is fully sent, so wake dispatch latency and any curl errors never corrupt client-facing JSON.
-- [ ] Verify zero output leak: `curl -sk https://host/reticulum/v1/monitor/data | python3 -c "import sys,json; json.load(sys.stdin); print('clean')"` — must parse without `JSONDecodeError: Extra data`.
+- [ ] Verify zero output leak: `curl -sk https://host/reticulum/health | python3 -c "import sys,json; json.load(sys.stdin); print('clean')"` — must parse without `JSONDecodeError: Extra data` (`/v1/monitor/data` until 2026-10-14; the admin page's `/admin/data` is behind its sign-in).
 - [ ] `peer_url` in the `interfaces` table must be the remote peer's **base URL** (`https://otherhost/reticulum`), NOT the wake URL (`.../v1/wake`). The exchange protocol calls `$peerUrl . '/v1/interfaces/exchange'` — if peer_url includes `/v1/wake`, the exchange URL becomes `.../v1/wake/v1/interfaces/exchange` which routes to the wrong host. Verify: `SELECT interface_id, name, peer_url FROM interfaces WHERE peer_url IS NOT NULL;` — no `/v1/wake` suffix.
 - [ ] The exchange protocol is a **pull** model: the waker pulls from the woken. When node A has packets queued for node B (in A's outbound), A's `dispatchWakes()` fires a wake to B, then B calls A's exchange endpoint and A returns the packets. Verify direction: wake the node that needs to RECEIVE, not the node that HAS the packets.
 - [ ] `decodeJson()` in `request_json_codec_trait.php` must NOT use `JSON_PARTIAL_OUTPUT_ON_ERROR` on `json_decode()` — that flag is only valid for `json_encode`. On `json_decode` it causes PHP 8.3 to throw `JsonException: Control character error, possibly incorrectly encoded` when decoding data containing certain byte sequences (e.g., binary RNS packet payloads stored in `payload_json`). Symptom: `/v1/wake` returns 500; `exchangeWithPhpPeer` crashes inside `decodeJson` → `drainPeerAckBatchIds` or `appendPeerAckBatchId` when reading `pending_ack_batch_ids_json` from the DB. Fix: remove `JSON_PARTIAL_OUTPUT_ON_ERROR` from all `json_decode` calls, add try-catch to both `decodeJson()` and `encodeJson()`, use `JSON_INVALID_UTF8_SUBSTITUTE` on `json_encode`. Grep check: `grep -rn "json_decode.*JSON_PARTIAL" lib/` must return nothing.
@@ -88,21 +88,22 @@ Use this list to confirm the exact fixes that were just made before running full
 
 - [ ] `.htaccess` present in the reticulum dir with the `RewriteRule ^(.*)$ index.php/$1` front-controller rule — without it every `/v1/*` route returns Apache 404.
 - [ ] `var/` directory exists and is writable (SQLite DB + router.log).
-- [ ] Run schema migration once (`$s->migrate()`), then `/v1/initialize` to connect peers.
+- [ ] Run schema migration once (`$s->migrate()`), then `php index.php initialize` on the host to connect peers.
 
-### J) `/v1/initialize` bootstrap endpoint
+### J) `php index.php initialize` bootstrap command
 
-- [ ] `GET /v1/initialize` runs `migrate()`, resets opcache, and connects to every configured peer — one browser-callable call, no separate config section.
+- [ ] `php index.php initialize` runs `migrate()` and connects to every configured peer, from a shell on the host — no separate config section. `GET /v1/initialize` did this (and reset the opcache) for any browser until 2026-10-14; it answers 404 now.
 - [ ] Peer URLs come from the existing `[[Interfaces]]` config (`node_url`, falling back to `peer_url`) — do NOT add an `[initialize]` section.
 - [ ] `connectToPeer()` is idempotent: returns `already_connected` if a row already exists for that `peer_url`; only registers when missing.
 - [ ] Requires `host_url` set in config — without it the handshake can't tell the peer where to call back (`status: no_host_url`).
 
-### K) `/v1/monitor` dashboard
+### K) Admin page (`/v1/monitor` dashboard until 2026-10-14)
 
-- [ ] `GET /v1/monitor` renders a self-refreshing (5s) HTML page; `GET /v1/monitor/data` returns the same as JSON.
-- [ ] Splits interfaces into **Connected Peers** (rows with `peer_url`) and **Active Clients** (online, non-peer) — stale/offline client rows are filtered out to cut noise.
+- [ ] `GET /admin` answers 404 until `php index.php admin-setup <username>` has run on the host; then a sign-in, then a page that refreshes from `GET /admin/data` every 5 s while its tab is visible (README "Admin page"; `php/tests/admin_console_test.php`).
+- [ ] `/v1/monitor`, `/v1/monitor/data|json`, `POST /v1/monitor/clear`, `POST /v1/maintenance/flush`, `/debug` and `monitor.php` are gone: 404, and deploy.sh retires `monitor.php`.
+- [ ] Shows the configured **Peers** (with Reconnect and Rotate) and the **Connections**: rows with `peer_url` always, other rows only while online — stale/offline client rows are filtered out to cut noise.
 - [ ] Packet tables are labeled by direction from the node's view: **Received** (inbound from clients/peers) and **Queued Outbound** — never label node-received packets as "inbound" in the operator UI.
-- [ ] `exchangeWithPhpPeer()` calls `touchInterface(..., 'online')` after a successful exchange so the peer shows online on the monitor.
+- [ ] `exchangeWithPhpPeer()` calls `touchInterface(..., 'online')` after a successful exchange so the peer shows online on the admin page.
 
 ### L) Retichat-js exchange-only refactor
 

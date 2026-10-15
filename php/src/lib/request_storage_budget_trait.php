@@ -156,7 +156,8 @@ trait RequestStorageBudgetTrait
             ],
 
             // 2. Acknowledged outbound packets are delivered history. The peer
-            //    has confirmed receipt; only /debug still reads them.
+            //    has confirmed receipt; only the admin page's debug report
+            //    still reads them.
             [
                 'name' => 'outbound_packets_acked',
                 'table_name' => 'outbound_packets',

@@ -160,6 +160,8 @@ RETIRED=(
   post_interface.php                     # e3c05ea
   lib/request_post_interface_trait.php   # e3c05ea
   lib/request_wake_dispatch_trait.php    # e3c05ea
+  opcache_reset.php                      # after 0128a31: anyone could reset the opcache
+  monitor.php                            # the admin page replaced it: it had no sign-in
 )
 
 die() { echo "${RED}✗ $*${NC}" >&2; exit 1; }

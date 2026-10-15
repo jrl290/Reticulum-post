@@ -59,8 +59,8 @@ namespace ReticulumPhp;
  * What it gives up: a database the full path cannot reach is a 500 to every
  * request, and a marked client's empty polls still get "nothing" until its
  * mark runs out (seconds()). An operator who edits the interfaces table in
- * SQL is seen by marked browsers seconds() late too; the operator wipes
- * (/v1/monitor/clear, monitor.php) remove every mark, and peers have none.
+ * SQL is seen by marked browsers seconds() late too; the admin page's forced
+ * flush removes every mark, and peers have none.
  */
 final class EmptyPoll
 {
@@ -260,7 +260,7 @@ final class EmptyPoll
         self::removeMarks($dir, $now - self::SWEEP_SECONDS);
     }
 
-    /** Remove every idle mark (the operator's forced maintenance flush). */
+    /** Remove every idle mark (the admin page's forced flush). */
     public static function clearAll(array $config): void
     {
         $dir = self::dir($config);
@@ -286,7 +286,8 @@ final class EmptyPoll
     /** One directory per node, beside its maintenance lock file. */
     private static function dir(array $config): string
     {
-        // Config::load's host_url, or monitor.php's raw one: same directory.
+        // Config::load's host_url; the rtrim kept monitor.php's raw one (gone
+        // 2026-10-14) on the same directory.
         $host = rtrim((string) ($config['host_url'] ?? $config['http']['advertise_url'] ?? 'default'), '/');
         $hostHash = substr(hash('sha256', $host), 0, 16);
         return sys_get_temp_dir() . '/reticulum-php-idle-' . $hostHash;

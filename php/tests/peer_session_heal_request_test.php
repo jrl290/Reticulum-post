@@ -20,7 +20,8 @@
  * Two nodes under `php -S`, each a copy of php/src with its own SQLite and
  * the config.toml layout of the live nodes (as in
  * live_interfaces_peering_test.php: one [interfaces] entry naming the other
- * node), peer on GET /v1/initialize. Then A's session to B dies twice:
+ * node), peer on `php index.php initialize`. Then A's session to B dies
+ * twice:
  *
  *   (a) the 2026-08-17 shape: A's row for B offline for two hours, and B
  *       holding no row for A, so B refuses A's credentials. A browser's
@@ -185,6 +186,25 @@ function stopNode(array $node): void
     exec('rm -rf ' . escapeshellarg($node['dir']));
 }
 
+/**
+ * The operator's `php index.php initialize`, run on the node's own copy as it
+ * is run on a host (GET /v1/initialize until 2026-10-14).
+ *
+ * @return array{int, array} exit code and decoded output
+ */
+function initializeCli(array $node): array
+{
+    $proc = proc_open(
+        [PHP_BINARY, $node['dir'] . '/src/index.php', 'initialize'],
+        [0 => ['file', '/dev/null', 'r'], 1 => ['pipe', 'w'], 2 => ['file', $node['dir'] . '/cli.err', 'w']],
+        $pipes
+    );
+    $stdout = (string) stream_get_contents($pipes[1]);
+    fclose($pipes[1]);
+    $decoded = json_decode($stdout, true);
+    return [proc_close($proc), is_array($decoded) ? $decoded : []];
+}
+
 function db(array $node): PDO
 {
     $pdo = new PDO('sqlite:' . $node['dir'] . '/node.sqlite');
@@ -292,10 +312,10 @@ $b = startNode($src, $portB, 'Retichat', $portA);
 $a = startNode($src, $portA, 'Selective Subconscious', $portB);
 
 echo "the two nodes peer as the live ones do\n";
-[$status, $init] = http('GET', $a['base'] . '/v1/initialize');
-check('A registers at B on /v1/initialize', $status === 200 && ($init['peers'][0]['status'] ?? null) === 'connected', (string) json_encode($init));
-[$status, $init] = http('GET', $b['base'] . '/v1/initialize');
-check('B finds the session A made', $status === 200 && ($init['peers'][0]['status'] ?? null) === 'already_connected', (string) json_encode($init));
+[$code, $init] = initializeCli($a);
+check('A registers at B on `php index.php initialize`', $code === 0 && ($init['peers'][0]['status'] ?? null) === 'connected', (string) json_encode($init));
+[$code, $init] = initializeCli($b);
+check('B finds the session A made', $code === 0 && ($init['peers'][0]['status'] ?? null) === 'already_connected', (string) json_encode($init));
 
 echo "(a) A's row for B offline for two hours, B holding no row for A; a browser's exchange on A\n";
 $markA = logMark($a);
