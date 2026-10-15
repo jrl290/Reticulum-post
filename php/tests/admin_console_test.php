@@ -62,12 +62,17 @@
  * with the sign-in and sameOrigin() refused it (403); no browser could sign in.
  *
  * Run: php php/tests/admin_console_test.php
+ * With RETICULUM_TEST_RUNTIME=swoole the nodes run the Swoole entry instead
+ * of `php -S` (tests/stubs/node_process.php), which answers with what went
+ * through HttpIo only.
  * ADMIN_SRC_DIR points it at another php/src, for mutation checks.
  * ADMIN_PLAYWRIGHT_DIR is a directory with node_modules/playwright (default:
  * ../test-harnesses/distro-pipeline beside this repository); without one, (j)
  * says it was skipped.
  */
 declare(strict_types=1);
+
+require_once __DIR__ . '/stubs/node_process.php';
 
 $src = getenv('ADMIN_SRC_DIR') ?: dirname(__DIR__) . '/src';
 $deployScript = dirname(__DIR__, 2) . '/deploy.sh';
@@ -167,6 +172,10 @@ function writeConfig(array $node, string $credentialsFile): void
     if ($node['peer_url'] !== null) {
         array_push($lines, '[interfaces]', '[[B]]', 'node_url = "' . $node['peer_url'] . '"');
     }
+    if (getenv('RETICULUM_TEST_RUNTIME') === 'swoole') {
+        // As startNodeProcess() writes it; (b) rewrites the file while the node runs.
+        array_push($lines, '[swoole]', 'enable_swoole = true');
+    }
     file_put_contents($node['dir'] . '/src/config.toml', implode("\n", $lines) . "\n");
 }
 
@@ -184,11 +193,7 @@ function startNode(string $src, int $port, ?string $peerUrl): array
         'credentials' => $dir . '/home/.reticulum-post/admin.json',
     ];
     writeConfig($node, $node['credentials']);
-    $node['proc'] = proc_open(
-        [PHP_BINARY, '-S', '127.0.0.1:' . $port, '-t', $dir . '/src', $dir . '/src/index.php'],
-        [0 => ['file', '/dev/null', 'r'], 1 => ['file', $dir . '/server.out', 'w'], 2 => ['file', $dir . '/server.out', 'a']],
-        $pipes
-    );
+    $node['proc'] = startNodeProcess($dir . '/src', $port, $dir . '/server.out');
     // Readiness is the server answering; the bound only turns a server that
     // never starts into a test failure instead of a hang.
     for ($i = 0; $i < 50 && request('GET', $node['base'] . '/health')['status'] !== 200; $i++) {

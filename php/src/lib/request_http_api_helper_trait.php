@@ -97,12 +97,15 @@ final class HttpIo
         self::$exchange = null;
     }
 
-    public static function requestBody(): string
+    /** The body, or its first $maxBytes bytes. */
+    public static function requestBody(?int $maxBytes = null): string
     {
         if (self::$exchange !== null) {
-            return self::$exchange->body;
+            return $maxBytes === null ? self::$exchange->body : substr(self::$exchange->body, 0, $maxBytes);
         }
-        $raw = file_get_contents('php://input');
+        $raw = $maxBytes === null
+            ? file_get_contents('php://input')
+            : file_get_contents('php://input', false, null, 0, $maxBytes);
 
         return is_string($raw) ? $raw : '';
     }

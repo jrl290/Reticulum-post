@@ -508,10 +508,16 @@ final class AdminConsole
         'POST /admin/peers/rotate',
     ];
 
+    /**
+     * $loaded: the code a resident process loaded (the Swoole entry), whose
+     * build the page names, as /health does; null under a web SAPI, where
+     * the stamp in $codeDir names the code answering.
+     */
     public function __construct(
         private readonly array $config,
         private readonly Storage $storage,
-        private readonly string $codeDir
+        private readonly string $codeDir,
+        private readonly ?LoadedCode $loaded = null
     ) {
     }
 
@@ -548,7 +554,7 @@ final class AdminConsole
             if (!self::sameOrigin($server)) {
                 self::json(403, ['error' => 'not from this page']);
             }
-            setcookie(self::cookieName($server), '', self::cookieOptions($server, $admin, 1));
+            self::sendCookie($server, $admin, '', 1);
             self::redirect($admin);
         }
 
@@ -638,11 +644,26 @@ final class AdminConsole
         return str_ends_with($requestPath, $path) ? substr($requestPath, 0, strlen($requestPath) - strlen($path)) : '';
     }
 
+    // The page reads and answers through HttpIo, never php://input, $_POST,
+    // $_COOKIE, header() or setcookie(): under the Swoole entry those are
+    // empty or go nowhere, and the entry answers with what HttpIo holds.
+
     private static function requestBody(): array
     {
-        $raw = file_get_contents('php://input', false, null, 0, 8192);
-        $decoded = is_string($raw) && $raw !== '' ? json_decode($raw, true) : null;
+        $raw = HttpIo::requestBody(8192);
+        $decoded = $raw !== '' ? json_decode($raw, true) : null;
         return is_array($decoded) ? $decoded : [];
+    }
+
+    /** The sign-in form's fields, as $_POST has them: from a urlencoded body only. */
+    private static function formBody(array $server): array
+    {
+        $type = strtolower(trim(explode(';', (string) ($server['CONTENT_TYPE'] ?? ''), 2)[0]));
+        if ($type !== 'application/x-www-form-urlencoded') {
+            return [];
+        }
+        parse_str(HttpIo::requestBody(8192), $form);
+        return $form;
     }
 
     // ─── Sessions ────────────────────────────────────────────────────────
@@ -652,15 +673,38 @@ final class AdminConsole
         return (self::https($server) ? '__Secure-' : '') . self::COOKIE;
     }
 
-    private static function cookieOptions(array $server, string $admin, int $expires): array
+    /** A cookie from the request's Cookie header: the first of that name, decoded, as $_COOKIE has it. */
+    private static function cookie(array $server, string $name): ?string
     {
-        return [
-            'expires' => $expires,
-            'path' => $admin,
-            'secure' => self::https($server),
-            'httponly' => true,
-            'samesite' => 'Strict',
+        foreach (explode(';', (string) ($server['HTTP_COOKIE'] ?? '')) as $pair) {
+            $pair = explode('=', trim($pair), 2);
+            if (count($pair) === 2 && $pair[0] === $name) {
+                return urldecode($pair[1]);
+            }
+        }
+        return null;
+    }
+
+    /**
+     * The Set-Cookie header setcookie() writes, with the page's attributes:
+     * Path=/admin (under the node's base), HttpOnly, SameSite=Strict, Secure
+     * over HTTPS. An empty value deletes the cookie, as setcookie()'s does.
+     */
+    private static function sendCookie(array $server, string $admin, string $value, int $expires): void
+    {
+        $deleting = $value === '';
+        $attributes = [
+            self::cookieName($server) . '=' . ($deleting ? 'deleted' : rawurlencode($value)),
+            'expires=' . gmdate('D, d M Y H:i:s', $deleting ? 1 : $expires) . ' GMT',
+            'Max-Age=' . ($deleting ? 0 : max(0, $expires - time())),
+            'path=' . $admin,
         ];
+        if (self::https($server)) {
+            $attributes[] = 'secure';
+        }
+        $attributes[] = 'HttpOnly';
+        $attributes[] = 'SameSite=Strict';
+        HttpIo::header('Set-Cookie', implode('; ', $attributes));
     }
 
     private static function base64Url(string $bytes): string
@@ -676,7 +720,7 @@ final class AdminConsole
     /** @return ?array{payload: string, expires_at: int} */
     private function session(AdminCredentials $credentials, array $server): ?array
     {
-        $cookie = $_COOKIE[self::cookieName($server)] ?? null;
+        $cookie = self::cookie($server, self::cookieName($server));
         if (!is_string($cookie) || strlen($cookie) > 512 || substr_count($cookie, '.') !== 1) {
             return null;
         }
@@ -723,7 +767,8 @@ final class AdminConsole
 
     private function login(AdminCredentials $credentials, array $server, string $admin): never
     {
-        $username = $_POST['username'] ?? '';
+        $form = self::formBody($server);
+        $username = $form['username'] ?? '';
         $username = is_string($username) ? substr($username, 0, 64) : '';
         if (!self::sameOrigin($server)) {
             $this->loginPage(403, $admin, 'That sign-in did not come from this page.', $username);
@@ -749,11 +794,11 @@ final class AdminConsole
             if ($attempt['address']['count'] === self::TRIES_PER_ADDRESS + 1 || $attempt['all']['count'] === self::TRIES_PER_HOUR + 1) {
                 error_log('ReticulumPhp: admin sign-in paused after too many attempts');
             }
-            header('Retry-After: ' . max(1, $retryAt - $now));
+            HttpIo::header('Retry-After', (string) max(1, $retryAt - $now));
             $this->loginPage(429, $admin, 'Too many sign-in attempts. Try again after ' . gmdate('H:i', $retryAt) . ' UTC; running admin-setup on the host lifts this at once.', $username);
         }
 
-        $password = $_POST['password'] ?? '';
+        $password = $form['password'] ?? '';
         $password = is_string($password) ? substr($password, 0, 1024) : '';
         // Both checks always run, so a wrong username takes as long as a
         // wrong password.
@@ -770,11 +815,7 @@ final class AdminConsole
             'exp' => $now + self::SESSION_SECONDS,
             'n' => bin2hex(random_bytes(8)),
         ], JSON_THROW_ON_ERROR));
-        setcookie(
-            self::cookieName($server),
-            $payload . '.' . $this->sign($credentials, 'session', $payload),
-            self::cookieOptions($server, $admin, $now + self::SESSION_SECONDS)
-        );
+        self::sendCookie($server, $admin, $payload . '.' . $this->sign($credentials, 'session', $payload), $now + self::SESSION_SECONDS);
         self::redirect($admin);
     }
 
@@ -789,7 +830,7 @@ final class AdminConsole
                 'host_url' => $this->config['host_url'] ?? null,
                 'backend' => $this->config['storage']['backend'] ?? null,
                 'php_version' => PHP_VERSION,
-                'build' => BuildStamp::read($this->codeDir),
+                'build' => $this->loaded?->buildStamp() ?? BuildStamp::read($this->codeDir),
             ],
         ] + $this->storage->adminLiveData());
     }
@@ -856,21 +897,21 @@ final class AdminConsole
     /** No CORS, no caching, no framing; scripts and styles only with the page's nonce. */
     private static function sendHeaders(int $status, string $contentType, ?string $nonce = null): void
     {
-        http_response_code($status);
-        header('Content-Type: ' . $contentType);
-        header('Cache-Control: no-store');
-        header('X-Content-Type-Options: nosniff');
-        header('X-Frame-Options: DENY');
+        HttpIo::status($status);
+        HttpIo::header('Content-Type', $contentType);
+        HttpIo::header('Cache-Control', 'no-store');
+        HttpIo::header('X-Content-Type-Options', 'nosniff');
+        HttpIo::header('X-Frame-Options', 'DENY');
         // same-origin, not no-referrer: under no-referrer a browser sends
         // `Origin: null` with the page's own POSTs (the sign-in, every action,
         // Sign out), and sameOrigin() refuses them. Other sites still get no
         // referrer.
-        header('Referrer-Policy: same-origin');
-        header('Cross-Origin-Opener-Policy: same-origin');
-        header('Cross-Origin-Resource-Policy: same-origin');
-        header('X-Robots-Tag: noindex, nofollow');
+        HttpIo::header('Referrer-Policy', 'same-origin');
+        HttpIo::header('Cross-Origin-Opener-Policy', 'same-origin');
+        HttpIo::header('Cross-Origin-Resource-Policy', 'same-origin');
+        HttpIo::header('X-Robots-Tag', 'noindex, nofollow');
         $sources = $nonce === null ? '' : "script-src 'nonce-{$nonce}'; style-src 'nonce-{$nonce}'; ";
-        header("Content-Security-Policy: default-src 'none'; {$sources}img-src 'self' data:; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'");
+        HttpIo::header('Content-Security-Policy', "default-src 'none'; {$sources}img-src 'self' data:; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'");
     }
 
     private static function json(int $status, array $payload): never
@@ -883,7 +924,7 @@ final class AdminConsole
     private static function redirect(string $location): never
     {
         self::sendHeaders(303, 'text/plain; charset=utf-8');
-        header('Location: ' . $location);
+        HttpIo::header('Location', $location);
         exit;
     }
 

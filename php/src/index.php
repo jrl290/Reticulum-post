@@ -1236,7 +1236,7 @@ final class HttpApi
             // The admin page answers with its own headers (no CORS) and its
             // own sign-in, preflight included.
             if ($path === '/admin' || str_starts_with($path, '/admin/')) {
-                (new AdminConsole($this->config, $this->storage, $this->buildStampDir))->handle($method, $path, $uri, $server);
+                (new AdminConsole($this->config, $this->storage, $this->buildStampDir, $this->loaded))->handle($method, $path, $uri, $server);
             }
 
             // Handle CORS preflight
