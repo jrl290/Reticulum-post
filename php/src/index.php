@@ -29,6 +29,7 @@ require_once __DIR__ . '/lib/empty_poll.php';
 require_once __DIR__ . '/lib/registration_protocol.php';
 require_once __DIR__ . '/lib/request_registration_trait.php';
 require_once __DIR__ . '/lib/request_announce_guard_trait.php';
+require_once __DIR__ . '/lib/admin_console.php';
 
 // Reticulum-php is request-operated. Queued transport bytes only move during
 // authenticated request/response exchanges. Wake helpers exist to prompt the
@@ -528,6 +529,21 @@ final class Config
             }
         }
         $config['swoole'] = $swooleConfig;
+
+        // [admin] credentials_file: where admin-setup keeps the admin page's
+        // sign-in (AdminCredentials::path()). Unset is the account's home.
+        $adminConfig = $config['admin'] ?? [];
+        if (!is_array($adminConfig)) {
+            throw new RuntimeException('admin configuration must be an object');
+        }
+
+        $credentialsFile = self::optionalConfigString($adminConfig, 'credentials_file');
+        if ($credentialsFile !== null && !str_starts_with($credentialsFile, '/')) {
+            throw new RuntimeException('admin.credentials_file must be an absolute path');
+        }
+
+        $adminConfig['credentials_file'] = $credentialsFile;
+        $config['admin'] = $adminConfig;
 
         // [interfaces] is the PHP peering (one [[Name]] per peer: type =
         // PostInterface, node_url, wake_url), read by initializeNode() and
@@ -1119,6 +1135,7 @@ final class Storage
     use RequestStorageBudgetTrait;
     use RequestPhpWakeTrait;
     use RequestRegistrationTrait;
+    use RequestAdminStateTrait;
 
     private PDO $db;
     private string $backend;
@@ -1186,116 +1203,49 @@ final class HttpApi
         ];
     }
 
-    /**
-     * Routes that only an operator should reach: the monitor page, its JSON,
-     * its clear-all button and the forced maintenance flush. None of them
-     * authenticates. Until 2026-09-30 they answered on every node: anyone
-     * could POST /v1/monitor/clear {"confirm":"YES"} and delete every table
-     * (the transport identity and every peer session included), or POST
-     * /v1/maintenance/flush {"force":true} and drop every browser session.
-     * They now answer only where config debug.enabled is true, the gate
-     * /debug always had. Pinned by tests/operator_routes_gated_test.php.
+    /*
+     * The operator console is the admin page, /admin (AdminConsole): a
+     * sign-in that only someone on the host can set up
+     * (`php index.php admin-setup`), and a 404 until then. Until 2026-10-14
+     * the console was /v1/monitor, /v1/monitor/data|json, POST
+     * /v1/monitor/clear, POST /v1/maintenance/flush, /debug and monitor.php,
+     * none of which authenticated. Every node answered them until
+     * 2026-09-30: anyone could POST /v1/monitor/clear {"confirm":"YES"} and
+     * delete every table (the transport identity and every peer session
+     * included), or POST /v1/maintenance/flush {"force":true} and drop every
+     * browser session. After that they answered wherever config
+     * debug.enabled was true. They are gone, the clear-all with them; the
+     * flush and the debug report are admin actions. Pinned by
+     * tests/admin_console_test.php.
+     *
+     * GET /v1/initialize answered everyone until 2026-10-14: migrate() in
+     * full, an opcache reset, and a registration at every configured peer
+     * whose row was not online. Phase 1 marks that row offline after a quiet
+     * spell, so one anonymous request then rotated the live peering, and a
+     * stalled peer held the request for curl's 10 s. It is the operator's
+     * `php index.php initialize` now (runIndexCli), and no route can reach
+     * initializeNode(); the admin page's Reconnect does the peering part
+     * without the migration. Pinned by
+     * tests/initialize_is_operator_only_test.php.
      */
-    private const OPERATOR_PATHS = ['/v1/monitor', '/v1/monitor/data', '/v1/monitor/json', '/v1/monitor/clear', '/v1/maintenance/flush'];
-
-    private function debugRoutesEnabled(): bool
-    {
-        return ($this->config['debug']['enabled'] ?? false) === true;
-    }
-
     public function handle(string $method, string $uri, array $server): never
     {
         try {
             $path = $this->normalizedPath($uri, $server);
+
+            // The admin page answers with its own headers (no CORS) and its
+            // own sign-in, preflight included.
+            if ($path === '/admin' || str_starts_with($path, '/admin/')) {
+                (new AdminConsole($this->config, $this->storage, $this->buildStampDir, $this->loaded))->handle($method, $path, $uri, $server);
+            }
 
             // Handle CORS preflight
             if ($method === 'OPTIONS') {
                 $this->respond(204, []);
             }
 
-            if ($method === 'GET' && $path === '/v1/initialize') {
-                $t0 = microtime(true);
-                $summary = $this->storage->initializeNode();
-
-                // Clear opcache so the new code is picked up.
-                if (function_exists('opcache_reset')) {
-                    opcache_reset();
-                }
-
-                $elapsed = round((microtime(true) - $t0) * 1000);
-                $this->log('debug', "[perf] initialize total={$elapsed}ms");
-
-                $this->respond(200, $summary);
-            }
-
-            // The operator console and its buttons have no authentication, so
-            // they answer only where debug.enabled is set, like /debug.
-            if (in_array($path, self::OPERATOR_PATHS, true) && !$this->debugRoutesEnabled()) {
-                throw new ApiError(404, 'Not found', ['error' => 'not found']);
-            }
-
-            if ($method === 'GET' && $path === '/v1/monitor') {
-                $this->renderMonitorPage();
-            }
-
-            if ($method === 'GET' && ($path === '/v1/monitor/data' || $path === '/v1/monitor/json')) {
-                $this->respond(200, $this->storage->monitorData());
-            }
-
-            if ($method === 'POST' && $path === '/v1/monitor/clear') {
-                $body = $this->readJsonBody();
-                if (($body['confirm'] ?? '') !== 'YES') {
-                    $this->respond(400, ['status' => 'error', 'error' => 'Type YES to confirm']);
-                }
-                $this->storage->clearAllData();
-                // The wiped interfaces must get their 401 at the next poll.
-                EmptyPoll::clearAll($this->config);
-                $this->respond(200, ['status' => 'ok']);
-            }
-
-            if ($method === 'POST' && $path === '/v1/maintenance/flush') {
-                $body = $this->readJsonBody();
-                $force = !empty($body['force']);
-
-                if ($force) {
-                    // Force: mark ALL non-peer interfaces as stale immediately
-                    $interfaceStaleSeconds = 0;
-                } else {
-                    $interfaceStaleSeconds = $this->maintenanceInt('interface_stale_after_seconds', 15);
-                }
-
-                $results = $this->storage->runMaintenance(
-                    $interfaceStaleSeconds,
-                    $this->maintenanceInt('batch_ttl_seconds', 86400),
-                );
-                if ($force) {
-                    // Every client is stale now; its next poll must say so.
-                    EmptyPoll::clearAll($this->config);
-                }
-                $this->respond(200, ['status' => 'ok', 'force' => $force, 'flushed' => $results]);
-            }
-
             if ($method === 'GET' && $path === '/health') {
                 $this->respond(200, $this->healthBody());
-            }
-
-            if ($method === 'GET' && $path === '/debug') {
-                if (!$this->debugRoutesEnabled()) {
-                    throw new ApiError(404, 'Not found', ['error' => 'not found']);
-                }
-
-                $maxRows = (int) ($this->config['debug']['max_rows'] ?? 20);
-                $this->respond(200, [
-                    'status' => 'ok',
-                    'transport_basis' => requestTransportMechanism(),
-                    'environment' => Environment::verify(),
-                    'queues' => $this->storage->healthSummary(),
-                    'debug' => [
-                        'enabled' => true,
-                        'max_rows' => $maxRows,
-                        'report' => $this->storage->debugReport($maxRows),
-                    ],
-                ]);
             }
 
             // REGISTRATION-STAGE1.md §3: stateless, and no-store, since a
@@ -1555,6 +1505,33 @@ function runIndexCli(string $projectRoot, array $argv): int
         $result = $reticulumPhpStorage->reclaimStorage();
         fwrite(STDOUT, json_encode($result, JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR) . PHP_EOL);
         return 0;
+    }
+
+    if ($mode === 'initialize') {
+        // An operator on the host, never a web request: GET /v1/initialize
+        // did this for anyone until 2026-10-14 (see HttpApi::handle()).
+        // migrate() in full, then a registration at each configured peer
+        // whose row is not online. Exits 1 unless the schema migrated and
+        // every peer is connected. The opcache reset went with the route:
+        // the cache it emptied was the web server's, which no CLI reaches.
+        $summary = $reticulumPhpStorage->initializeNode();
+        fwrite(STDOUT, json_encode($summary, JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR) . PHP_EOL);
+        $peersDown = array_filter(
+            $summary['peers'],
+            static fn (array $peer): bool => !in_array($peer['status'] ?? '', ['connected', 'already_connected'], true)
+        );
+        return ($summary['status'] === 'ok' && $summary['migrated'] && $peersDown === []) ? 0 : 1;
+    }
+
+    if ($mode === 'admin-setup') {
+        // The only way to open the admin page: a username and password typed
+        // (or piped) on the host. Until it has run, /admin answers 404.
+        return AdminSetup::run($reticulumPhpConfig, $reticulumPhpStorage, [$projectRoot, __DIR__], $argv);
+    }
+
+    if ($mode === 'admin-remove') {
+        // Closes the admin page again (404), every session with it.
+        return AdminSetup::remove($reticulumPhpConfig);
     }
 
     fwrite(STDERR, "Unsupported index mode: {$mode}\n");

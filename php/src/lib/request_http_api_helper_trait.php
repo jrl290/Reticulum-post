@@ -97,12 +97,15 @@ final class HttpIo
         self::$exchange = null;
     }
 
-    public static function requestBody(): string
+    /** The body, or its first $maxBytes bytes. */
+    public static function requestBody(?int $maxBytes = null): string
     {
         if (self::$exchange !== null) {
-            return self::$exchange->body;
+            return $maxBytes === null ? self::$exchange->body : substr(self::$exchange->body, 0, $maxBytes);
         }
-        $raw = file_get_contents('php://input');
+        $raw = $maxBytes === null
+            ? file_get_contents('php://input')
+            : file_get_contents('php://input', false, null, 0, $maxBytes);
 
         return is_string($raw) ? $raw : '';
     }
@@ -488,181 +491,5 @@ trait RequestHttpApiHelperTrait
         }
         $line = sprintf("[%s] [%s] %s\n", date('Y-m-d H:i:s'), strtoupper($level), $message);
         @file_put_contents($logPath, $line, FILE_APPEND | LOCK_EX);
-    }
-
-    public function renderMonitorPage(): never
-    {
-        $data = $this->storage->monitorData();
-        $interfaces = $data['interfaces'] ?? [];
-        $outbound = $data['outbound_pending'] ?? [];
-        $packets = $data['recent_inbound'] ?? [];
-        $outboundPkts = $data['recent_outbound'] ?? [];
-        $hostUrl = $this->config['host_url'] ?? ($this->config['http']['advertise_url'] ?? '');
-        $now = date('Y-m-d H:i:s');
-
-        $peerRows = '';
-        $ifaceRows = '';
-        foreach ($interfaces as $iface) {
-            $name = htmlspecialchars((string) ($iface['name'] ?? ''), ENT_QUOTES);
-            $status = htmlspecialchars((string) ($iface['status'] ?? ''), ENT_QUOTES);
-            $peer = htmlspecialchars((string) ($iface['peer_url'] ?? ''), ENT_QUOTES);
-            $rx = (int) ($iface['rx_packets'] ?? 0);
-            $tx = (int) ($iface['tx_packets'] ?? 0);
-            $lastSeen = isset($iface['last_seen_at']) ? date('H:i:s', (int) $iface['last_seen_at']) : '-';
-            $isPhpPeer = $peer !== '';
-
-            if ($isPhpPeer) {
-                $ifaceId = substr((string) ($iface['interface_id'] ?? ''), 0, 12);
-                $peerRows .= "<tr><td class=\"mono\">{$ifaceId}</td><td class=\"mono\">{$peer}</td><td>{$rx}</td><td>{$tx}</td><td>{$lastSeen}</td></tr>";
-            } elseif ($status === 'online') {
-                $ifaceId = substr((string) ($iface['interface_id'] ?? ''), 0, 12);
-                $ifaceRows .= "<tr><td class=\"mono\">{$ifaceId}</td><td>{$rx}</td><td>{$tx}</td><td>{$lastSeen}</td></tr>";
-            }
-        }
-
-        $outboundRows = '';
-        foreach ($outbound as $ob) {
-            $name = htmlspecialchars((string) ($ob['name'] ?? ''), ENT_QUOTES);
-            $pending = (int) ($ob['pending'] ?? 0);
-            $oldest = isset($ob['oldest_queued_at']) ? date('H:i:s', (int) $ob['oldest_queued_at']) : '-';
-            $op = htmlspecialchars((string) ($ob['peer_url'] ?? ''), ENT_QUOTES);
-            $outboundRows .= "<tr><td>{$name}</td><td class=\"mono\">{$op}</td><td class=\"count\">{$pending}</td><td>{$oldest}</td></tr>";
-        }
-
-        $packetRows = '';
-        $typeNames = ['DATA', 'ANNOUNCE', 'LINK', 'PROOF'];
-        foreach ($packets as $pkt) {
-            $pktType = (int) ($pkt['packet_type'] ?? -1);
-            $typeName = $typeNames[$pktType] ?? "?{$pktType}";
-            $destHash = htmlspecialchars(substr((string) ($pkt['destination_hash_hex'] ?? ''), 0, 12), ENT_QUOTES);
-            $st = htmlspecialchars((string) ($pkt['filter_status'] ?? ($pkt['status'] ?? '')), ENT_QUOTES);
-            $size = (int) ($pkt['packet_size'] ?? 0);
-            $ts = isset($pkt['created_at']) ? date('H:i:s', (int) $pkt['created_at']) : '-';
-            $packetRows .= "<tr><td class=\"mono\">{$typeName}</td><td class=\"mono\">{$destHash}</td><td>{$st}</td><td>{$size}</td><td>{$ts}</td></tr>";
-        }
-
-        $outPktRows = '';
-        foreach ($outboundPkts as $pkt) {
-            $destHash = htmlspecialchars(substr((string) ($pkt['destination_hash_hex'] ?? ''), 0, 12), ENT_QUOTES);
-            $reason = htmlspecialchars((string) ($pkt['queue_reason'] ?? ''), ENT_QUOTES);
-            $acked = ($pkt['acked_at'] ?? null) !== null ? 'acked' : 'pending';
-            $ts = isset($pkt['queued_at']) ? date('H:i:s', (int) $pkt['queued_at']) : '-';
-            $outPktRows .= "<tr><td class=\"mono\">{$destHash}</td><td>{$reason}</td><td>{$acked}</td><td>{$ts}</td></tr>";
-        }
-
-        $totalPending = array_sum(array_column($outbound, 'pending'));
-        $ifaceCount = count($interfaces);
-        $pktCount = count($packets);
-
-        echo <<<HTML
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Reticulum-php Monitor</title>
-<style>
-  body { font-family: -apple-system, system-ui, sans-serif; margin: 0; padding: 16px; background: #111; color: #ddd; }
-  h1 { font-size: 18px; margin: 0 0 4px; }
-  .sub { color: #888; font-size: 12px; margin-bottom: 16px; }
-  .grid { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
-  .card { background: #1a1a1a; border: 1px solid #333; border-radius: 6px; padding: 10px 14px; min-width: 100px; }
-  .card .val { font-size: 24px; font-weight: bold; color: #4af; }
-  .card .lbl { font-size: 10px; color: #888; text-transform: uppercase; }
-  table { width: 100%; border-collapse: collapse; margin-bottom: 20px; font-size: 13px; }
-  th { text-align: left; padding: 6px 8px; border-bottom: 2px solid #333; color: #888; font-size: 11px; text-transform: uppercase; }
-  td { padding: 5px 8px; border-bottom: 1px solid #222; }
-  .mono { font-family: 'SF Mono', monospace; font-size: 12px; }
-  .count { text-align: right; font-weight: bold; }
-  h2 { font-size: 14px; color: #888; margin: 20px 0 8px; text-transform: uppercase; }
-  .refresh { font-size: 10px; color: #555; }
-  .btn-flush { background: #c44; color: #fff; border: none; border-radius: 4px; padding: 6px 14px; font-size: 12px; cursor: pointer; margin-left: 12px; }
-  .btn-flush:hover { background: #d55; }
-  .btn-flush:disabled { background: #555; cursor: default; }
-  .flush-msg { font-size: 11px; margin-left: 12px; padding: 4px 8px; border-radius: 3px; display: inline-block; }
-  .flush-msg.ok { background: #153; color: #4f8; }
-  .flush-msg.err { background: #531; color: #f84; }
-</style>
-</head>
-<body>
-<h1>Reticulum-php</h1>
-<div class="sub">{$hostUrl} &mdash; {$now} <span class="refresh">(auto-refresh 5s)</span><button class="btn-flush" id="btn-flush" onclick="flushStale()">Flush Stale</button><button class="btn-flush" id="btn-clear" style="background:#900" onclick="clearAll()">Clear All Data</button><span id="flush-msg"></span></div>
-
-<div class="grid">
-  <div class="card"><div class="val">{$totalPending}</div><div class="lbl">Pending Outbound</div></div>
-  <div class="card"><div class="val">{$ifaceCount}</div><div class="lbl">Interfaces</div></div>
-  <div class="card"><div class="val">{$pktCount}</div><div class="lbl">Recent Packets</div></div>
-</div>
-
-<h2>Connected Peers</h2>
-<table><thead><tr><th>Interface ID</th><th>Peer URL</th><th>RX</th><th>TX</th><th>Last Seen</th></tr></thead><tbody>{$peerRows}</tbody></table>
-
-<h2>Active Clients</h2>
-<table><thead><tr><th>Interface ID</th><th>RX</th><th>TX</th><th>Last Seen</th></tr></thead><tbody>{$ifaceRows}</tbody></table>
-
-<h2>Pending Outbound</h2>
-<table><thead><tr><th>Interface</th><th>Peer</th><th>Pending</th><th>Oldest</th></tr></thead><tbody>{$outboundRows}</tbody></table>
-
-<h2>Received</h2>
-<table><thead><tr><th>Type</th><th>Dest Hash</th><th>Status</th><th>Size</th><th>Time</th></tr></thead><tbody>{$packetRows}</tbody></table>
-
-<h2>Queued Outbound</h2>
-<table><thead><tr><th>Dest Hash</th><th>Reason</th><th>State</th><th>Queued</th></tr></thead><tbody>{$outPktRows}</tbody></table>
-
-<script>
-var autoRefresh = setTimeout(function(){ location.reload(); }, 5000);
-
-function flushStale() {
-  var btn = document.getElementById('btn-flush');
-  var msg = document.getElementById('flush-msg');
-  btn.disabled = true;
-  btn.textContent = 'Flushing...';
-  msg.className = 'flush-msg';
-  msg.textContent = '';
-
-  clearTimeout(autoRefresh);
-
-  fetch('/v1/maintenance/flush', { method: 'POST' })
-    .then(function(r) { return r.json(); })
-    .then(function(data) {
-      var f = data.flushed || {};
-      var parts = [];
-      if (f.interfaces_marked_offline) parts.push(f.interfaces_marked_offline + ' ifaces offline');
-      if (f.trimmed_outbound_packets) parts.push(f.trimmed_outbound_packets + ' pkts flushed');
-      if (f.trimmed_expired_paths) parts.push(f.trimmed_expired_paths + ' paths');
-      if (f.trimmed_link_transport_entries) parts.push(f.trimmed_link_transport_entries + ' links');
-      if (parts.length === 0) parts.push('nothing to flush');
-      msg.textContent = parts.join(', ');
-      msg.className = 'flush-msg ok';
-    })
-    .catch(function(err) {
-      msg.textContent = 'Error: ' + err.message;
-      msg.className = 'flush-msg err';
-    })
-    .finally(function() {
-      btn.disabled = false;
-      btn.textContent = 'Flush Stale';
-      autoRefresh = setTimeout(function(){ location.reload(); }, 3000);
-    });
-}
-
-function clearAll() {
-  if (!confirm('Delete ALL rows from ALL tables? This cannot be undone.')) return;
-  var btn = document.getElementById('btn-clear');
-  var msg = document.getElementById('flush-msg');
-  btn.disabled = true; btn.textContent = 'Clearing...';
-  clearTimeout(autoRefresh);
-  fetch('/reticulum/v1/monitor/clear', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({confirm:'YES'}) })
-    .then(function(r) { return r.json(); })
-    .then(function(d) { msg.textContent = d.status === 'ok' ? 'All tables cleared' : (d.error || 'Failed'); msg.className = d.status === 'ok' ? 'flush-msg ok' : 'flush-msg err'; })
-    .catch(function(e) { msg.textContent = 'Error: ' + e.message; msg.className = 'flush-msg err'; })
-    .finally(function() { btn.disabled = false; btn.textContent = 'Clear All Data'; autoRefresh = setTimeout(function(){ location.reload(); }, 2000); });
-}
-</script>
-</body>
-</html>
-HTML;
-
-        exit;
     }
 }

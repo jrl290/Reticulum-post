@@ -140,17 +140,30 @@ final class SwooleNode
         }
     }
 
+    /** What the .htaccess block tells the app (SwooleSetup), never passed on to the node. */
+    private const FRONT_HEADERS = ['x-front-secret', 'x-front-https', 'x-front-client'];
+
     /**
      * A request's $_SERVER from Swoole's request: $swooleServer is
      * Swoole\Http\Request::$server, $headers its ::$header (lower-case
      * names). SCRIPT_NAME is $baseUri/index.php, so HttpIo::normalizedPath()
      * strips the base path as it does under Apache (Passenger passes the
-     * full path). $dropHeaders are not passed on.
+     * full path). $dropHeaders are not passed on, nor are the X-Front-*
+     * headers.
+     *
+     * Passenger hands every request over in plain HTTP from 127.0.0.1, so
+     * Swoole's own view gives every request REMOTE_ADDR 127.0.0.1 and no
+     * HTTPS. $fromFront says the request carried the front secret, so it came
+     * through the .htaccess block, which sets X-Front-Https and
+     * X-Front-Client on every request, replacing any a client sent: then
+     * HTTPS, REQUEST_SCHEME and REMOTE_ADDR are what Apache saw, as index.php
+     * gets them there. Without it they stay Swoole's, whatever the headers say.
      *
      * @param list<string> $dropHeaders lower-case names
      */
-    public static function serverVars(array $swooleServer, array $headers, string $baseUri, array $dropHeaders = []): array
+    public static function serverVars(array $swooleServer, array $headers, string $baseUri, array $dropHeaders = [], bool $fromFront = false): array
     {
+        $headers = array_change_key_case($headers, CASE_LOWER);
         $path = (string) ($swooleServer['request_uri'] ?? '/');
         $query = (string) ($swooleServer['query_string'] ?? '');
         $server = [
@@ -163,9 +176,24 @@ final class SwooleNode
             'REQUEST_TIME_FLOAT' => (float) ($swooleServer['request_time_float'] ?? microtime(true)),
             'REMOTE_ADDR' => (string) ($swooleServer['remote_addr'] ?? ''),
         ];
+        if ($fromFront) {
+            // Apache's %{HTTPS} is "on" or "off"; under Apache, PHP has HTTPS
+            // only when it is on.
+            $https = (string) ($headers['x-front-https'] ?? '');
+            if ($https === 'on' || $https === 'off') {
+                $server['REQUEST_SCHEME'] = $https === 'on' ? 'https' : 'http';
+            }
+            if ($https === 'on') {
+                $server['HTTPS'] = 'on';
+            }
+            $client = (string) ($headers['x-front-client'] ?? '');
+            if (filter_var($client, FILTER_VALIDATE_IP) !== false) {
+                $server['REMOTE_ADDR'] = $client;
+            }
+        }
         foreach ($headers as $name => $value) {
-            $name = strtolower((string) $name);
-            if (in_array($name, $dropHeaders, true)) {
+            $name = (string) $name;
+            if (in_array($name, $dropHeaders, true) || in_array($name, self::FRONT_HEADERS, true)) {
                 continue;
             }
             $key = strtoupper(str_replace('-', '_', $name));
@@ -276,7 +304,9 @@ final class SwooleLifecycle
  * Everything else in .htaccess is left as it is, but while the block stands
  * mod_rewrite is off in that directory (index.php's rewrite would take every
  * request from Passenger), so the block refuses the config, error_log and
- * SQLite files itself.
+ * SQLite files itself. The block also passes on Apache's HTTPS and client
+ * address (X-Front-Https, X-Front-Client), which the node would otherwise
+ * not have under Passenger.
  */
 final class SwooleSetup
 {
@@ -442,6 +472,11 @@ final class SwooleSetup
         // stands. A file that exists is still served by Apache itself, not
         // Passenger, so the config, logs and databases are refused here
         // rather than by a rewrite rule that is now off.
+        // Passenger hands the request over in plain HTTP from 127.0.0.1, so
+        // Apache also says whether it came over HTTPS and from where. `set`
+        // replaces a header a client sent under the same name, and
+        // swoole_server.php believes these only beside the secret
+        // (SwooleNode::serverVars()). expr= needs Apache 2.4.10.
         return self::BEGIN . "\n"
             . 'RewriteEngine Off' . "\n"
             . '<FilesMatch "^(config(\.local)?\.(toml|php)|error_log)$|\.sqlite">' . "\n"
@@ -450,6 +485,8 @@ final class SwooleSetup
             . 'PassengerAppRoot "' . $appRoot . '"' . "\n"
             . 'PassengerBaseURI "' . ($baseUri === '' ? '/' : $baseUri) . '"' . "\n"
             . 'RequestHeader set X-Front-Secret "' . $secret . '"' . "\n"
+            . 'RequestHeader set X-Front-Https "expr=%{HTTPS}"' . "\n"
+            . 'RequestHeader set X-Front-Client "expr=%{REMOTE_ADDR}"' . "\n"
             . self::END . "\n";
     }
 

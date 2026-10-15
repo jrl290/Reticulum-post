@@ -34,7 +34,7 @@
  * (d) a fresh database has neither wake_events nor post_interface_peers, and
  *     a database that has them (both live nodes do) keeps them and their
  *     rows through the migration, with no error;
- * (e) /health's queues and /debug carry no wake_events counts.
+ * (e) /health's queues and the debug report carry no wake_events counts.
  *
  * Every process-starting function is replaced in namespace ReticulumPhp (the
  * traits call them unqualified, so these answer first): a call is recorded
@@ -357,13 +357,13 @@ check('and leaves the old wake_events row alone (nothing touches the table)', ta
 check('maintenance runs on the fresh database too', \is_array($storage->runMaintenance(300, 86400)));
 check('and none of it started a process', Spawned::$calls === [], \implode(' | ', Spawned::$calls));
 
-echo "(e) /health and /debug report no wake events\n";
+echo "(e) /health and the debug report carry no wake events\n";
 $queues = $storage->healthSummary();
 $wakeKeys = \array_values(\array_filter(\array_keys($queues), static fn (string $k): bool => \str_starts_with($k, 'wake_events')));
 check('/health queues has no wake_events_* key', $wakeKeys === [], \implode(',', $wakeKeys));
 check('/health queues still has its consumers\' keys', isset($queues['interfaces'], $queues['interfaces_online'], $queues['storage_bytes']));
 $debug = $storage->debugReport(5);
-check('/debug has no recent_wake_events', !\array_key_exists('recent_wake_events', $debug), \implode(',', \array_keys($debug)));
+check('the debug report has no recent_wake_events', !\array_key_exists('recent_wake_events', $debug), \implode(',', \array_keys($debug)));
 
 \fclose($trap);
 \fclose($peerSock);

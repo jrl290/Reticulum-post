@@ -7,20 +7,22 @@
  * metadata and peer_session_token, so both halves of the retichat.com <->
  * selectiv peering's credentials were public. Rotating them means: on the
  * node whose config.toml has the [interfaces] block, DELETE its row for the
- * peer, then GET /v1/initialize there. connectToPeer() finds no row, makes a
+ * peer, then run `php index.php initialize` there (GET /v1/initialize until
+ * 2026-10-14, when anyone could run it). connectToPeer() finds no row, makes a
  * new interface id and token, and registers at the peer, whose
  * registerInterface() re-binds its row in place with a new session token.
  *
  * The first draft of that procedure marked the row dead instead
  * (UPDATE ... status='offline', last_seen_at=0). Ordinary traffic undoes
- * that before the GET arrives: the peer's next exchange authenticates with
+ * that before the command runs: the peer's next exchange authenticates with
  * the leaked token and authenticateInterface() touches the row online again,
  * so connectToPeer() answers "already_connected" and rotates nothing. This
  * test puts exactly such an exchange between the two steps.
  *
  * Two real nodes, each a copy of php/src under `php -S` with its own SQLite:
- * A has an [interfaces] block for B, as an initiator does. Driven over HTTP;
- * the SQL step runs on A's database, as `node.sh sql-<node>` runs it.
+ * A has an [interfaces] block for B, as an initiator does. Driven over HTTP
+ * and A's CLI; the SQL step runs on A's database, as `node.sh sql-<node>`
+ * runs it.
  *
  * The same credentials leaked a second way until 2026-10-03: POST /v1/wake
  * sent a row's peer_interface_id + peer_session_token to any waker_url the
@@ -169,14 +171,33 @@ function exchange(array $node, string $interfaceId, string $token): int
     ])[0];
 }
 
+/**
+ * The procedure's second step, run on the node's own copy as it is run on a
+ * host: `php index.php initialize`.
+ *
+ * @return array{int, array} exit code and decoded output
+ */
+function initializeCli(array $node): array
+{
+    $proc = proc_open(
+        [PHP_BINARY, $node['dir'] . '/src/index.php', 'initialize'],
+        [0 => ['file', '/dev/null', 'r'], 1 => ['pipe', 'w'], 2 => ['file', $node['dir'] . '/cli.err', 'w']],
+        $pipes
+    );
+    $stdout = (string) stream_get_contents($pipes[1]);
+    fclose($pipes[1]);
+    $decoded = json_decode($stdout, true);
+    return [proc_close($proc), is_array($decoded) ? $decoded : []];
+}
+
 $portA = freePort();
 $portB = freePort();
 $b = startNode($src, $portB, null);
 $a = startNode($src, $portA, $b['base']);
 
 echo "(a) the peering, and what /health used to publish\n";
-[$status, $init] = http('GET', $a['base'] . '/v1/initialize');
-check('A registers at B on /v1/initialize', $status === 200 && ($init['peers'][0]['status'] ?? null) === 'connected', json_encode($init));
+[$code, $init] = initializeCli($a);
+check('A registers at B on `php index.php initialize`', $code === 0 && ($init['peers'][0]['status'] ?? null) === 'connected', json_encode($init));
 $rowA = peerRows($a, $b['base']);
 $rowB = peerRows($b, $a['base']);
 check('each node holds one row for the other', count($rowA) === 1 && count($rowB) === 1, count($rowA) . '/' . count($rowB));
@@ -200,17 +221,17 @@ check('B accepts an exchange with the credential A\'s monitor leaked', exchange(
 check('a wake into B sends A the credential B\'s /health leaked, and A accepts it',
     $status === 200 && ($woke['exchange']['status'] ?? null) === 'ok', json_encode($woke));
 
-echo "(b) rotate: the SQL step on A, peer traffic, then GET /v1/initialize\n";
+echo "(b) rotate: the SQL step on A, peer traffic, then `php index.php initialize` on A\n";
 $stmt = db($a)->prepare(ROTATE_SQL);
 $stmt->execute([':peer_url' => $b['base']]);
 check('the SQL step touches exactly one row', $stmt->rowCount() === 1, (string) $stmt->rowCount());
 // Between the operator's two commands the peering keeps running: B's next
 // exchange arrives with the credential it holds, which is the leaked one.
 check('B\'s next exchange with the old credential is refused at once (401)', exchange($a, ...$leakedAtA) === 401);
-[$status, $init] = http('GET', $a['base'] . '/v1/initialize');
+[$code, $init] = initializeCli($a);
 $newId = (string) ($init['peers'][0]['interface_id'] ?? '');
-check('/v1/initialize re-registers: connected, under a new interface id',
-    $status === 200 && ($init['peers'][0]['status'] ?? null) === 'connected' && $newId !== '' && $newId !== $leakedAtA[0], json_encode($init));
+check('`php index.php initialize` re-registers: connected, under a new interface id',
+    $code === 0 && ($init['peers'][0]['status'] ?? null) === 'connected' && $newId !== '' && $newId !== $leakedAtA[0], json_encode($init));
 
 echo "(c) the leaked credentials are dead, the new ones work\n";
 check('A refuses the credential B\'s /health leaked (401)', exchange($a, ...$leakedAtA) === 401);
@@ -242,8 +263,10 @@ $sectionAt = strpos($readme, "## Rotating a PHP peering's credentials");
 $stepOneAt = $sectionAt === false ? false : strpos($readme, "\n1. **Read", $sectionAt);
 $gate = ($sectionAt !== false && $stepOneAt !== false) ? substr($readme, $sectionAt, $stepOneAt - $sectionAt) : '';
 check('README has the rotation section, with its gate before step 1', $gate !== '', $readmePath);
-check('the gate: /health and /v1/monitor publish no peer_session_token',
-    str_contains($gate, 'grep -c peer_session_token') && str_contains($gate, '/v1/monitor/data'));
+// /v1/monitor/data was the gate's second URL until 2026-10-14; the admin page
+// that replaced it is behind a sign-in (tests/admin_console_test.php).
+check('the gate: /health publishes no peer_session_token',
+    str_contains($gate, 'grep -c peer_session_token') && str_contains($gate, '/reticulum/health'));
 check('the gate: every node runs the /v1/wake fix, by build stamp, failing on an empty ref',
     str_contains($gate, '`POST /v1/wake`') && str_contains($gate, GATE_FIX_LINE) && str_contains($gate, GATE_STAMP_LINE));
 // The gate finds the fix by the first commit that added canonicalPeerBaseUrl

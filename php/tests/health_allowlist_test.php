@@ -229,25 +229,27 @@ check('bridge row is listed under recent_offline', in_array('RNS PostInterface (
 check('metadata is a JSON object on every row (staging.sh calls .get on it)',
     !str_contains($json, '"metadata":[]'));
 
-// ── (d) the monitor has the same leak, same fix ─────────────────────────
-echo "(d) /v1/monitor/data carries no credential either\n";
-$monitorJson = json_encode($storage->monitorData(), JSON_THROW_ON_ERROR);
+// ── (d) the admin page gets no more than /health ────────────────────────
+// Its live view replaced /v1/monitor/data, which had the same leak, and its
+// debug report replaced /debug; both were public wherever debug.enabled was
+// set, until 2026-10-14. Behind the admin sign-in now, and still allowlisted.
+echo "(d) the admin page's live view and debug report carry no credential either\n";
+$liveJson = json_encode($storage->adminLiveData(), JSON_THROW_ON_ERROR);
 foreach ($secrets as $what => $value) {
-    check("monitor omits the $what", !str_contains($monitorJson, $value));
+    check("the live view omits the $what", !str_contains($liveJson, $value));
 }
-$monitorRows = $storage->monitorData()['interfaces'];
-$peerUrls = array_values(array_filter(array_column($monitorRows, 'peer_url')));
+$liveRows = $storage->adminLiveData()['interfaces'];
+$peerUrls = array_values(array_filter(array_column($liveRows, 'peer_url')));
 sort($peerUrls);
-check('monitor still shows each PHP peer\'s peer_url (the page labels peers by it)',
+check('the live view still shows each PHP peer\'s peer_url (the page labels peers by it)',
     $peerUrls === ['http://gateway.example:4371', 'https://other.example/reticulum', 'https://peer.example/reticulum'], implode(',', $peerUrls));
-$first = $monitorRows[0] ?? [];
-check('monitor rows keep name, status, rx/tx, last_seen_at, interface_id',
+$first = $liveRows[0] ?? [];
+check('its rows keep name, status, rx/tx, last_seen_at, interface_id',
     isset($first['name'], $first['status'], $first['rx_packets'], $first['tx_packets'], $first['last_seen_at'], $first['interface_id']));
 
-// /debug is public whenever a node sets debug.enabled.
 $debugJson = json_encode($storage->debugReport(20), JSON_THROW_ON_ERROR);
 foreach ($secrets as $what => $value) {
-    check("/debug omits the $what", !str_contains($debugJson, $value));
+    check("the debug report omits the $what", !str_contains($debugJson, $value));
 }
 
 // ── (e) Stage 1's registration object ───────────────────────────────────
@@ -286,7 +288,7 @@ foreach ($signedSecrets as $what => $value) {
 }
 check('/health still has no row with client rns-js', !str_contains($signedJson, '"rns-js"'));
 foreach (['signed identity hash', 'signed public key', 'signed session token', 'node secret'] as $what) {
-    check("monitor and /debug omit the $what", !str_contains(json_encode($storage->monitorData(), JSON_THROW_ON_ERROR), $signedSecrets[$what])
+    check("the admin page's live view and debug report omit the $what", !str_contains(json_encode($storage->adminLiveData(), JSON_THROW_ON_ERROR), $signedSecrets[$what])
         && !str_contains(json_encode($storage->debugReport(20), JSON_THROW_ON_ERROR), $signedSecrets[$what]));
 }
 

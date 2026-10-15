@@ -9,7 +9,10 @@
  *     name, as header() does); after finish(), nothing does.
  * (b) SwooleNode::serverVars(): Swoole's request as index.php's $_SERVER,
  *     so HttpIo::normalizedPath() strips the base path Passenger passes on,
- *     and the front-secret header is not passed to the node.
+ *     and no X-Front-* header is passed to the node. Only a request that
+ *     carried the front secret gets HTTPS, REQUEST_SCHEME and REMOTE_ADDR
+ *     from X-Front-Https and X-Front-Client, which Apache sets; otherwise
+ *     every request would be plain HTTP from 127.0.0.1, Passenger's view.
  * (c) Under Swoole, exit ends the request as Swoole\ExitException, which a
  *     catch of \Throwable or \Exception takes. Every such catch whose try can
  *     end the request (exit, ->respond(), ->renderMonitorPage(), ->handle(),
@@ -25,11 +28,20 @@
  *     loads.
  * (f) `php index.php runtime` (SwooleSetup): on, it writes the app root
  *     (Passengerfile.json, the front secret, tmp/restart.txt) and the
- *     .htaccess block; again, nothing changes; off, it removes only the
+ *     .htaccess block, which also sets X-Front-Https and X-Front-Client from
+ *     Apache's view; again, nothing changes; off, it removes only the
  *     block. It refuses an app root inside the web directory and a node with
  *     no base path.
  * (g) LoadedCode: /health names the stamp on disk only while the code on
  *     disk is the code the process loaded.
+ * (h) Inside a function or class, only class HttpIo uses the web SAPI's own
+ *     request I/O: header(), setcookie(), http_response_code(), $_POST,
+ *     $_GET, $_COOKIE, $_REQUEST, $_FILES, php://input. Under Swoole those go
+ *     nowhere or are empty. Top-level code runs only as a web SAPI's own
+ *     script (index.php's last resort, swoole_server.php's 404). The admin
+ *     page used them until f2605cb, and under Swoole lost its statuses,
+ *     headers, session cookie and sign-in form. The scanner is first run on
+ *     samples.
  *
  * The node's answers under Swoole are held to index.php's by running the
  * HTTP tests on it: RETICULUM_TEST_RUNTIME=swoole (tests/stubs/node_process.php).
@@ -102,6 +114,31 @@ check('the node routes the path without the base, as under Apache',
     HttpIo::normalizedPath($vars['REQUEST_URI'], $vars) === '/v1/interfaces/exchange', HttpIo::normalizedPath($vars['REQUEST_URI'], $vars));
 $root = SwooleNode::serverVars(['request_method' => 'GET', 'request_uri' => '/health'], [], '');
 check('with no base path, /health is /health', HttpIo::normalizedPath($root['REQUEST_URI'], $root) === '/health');
+$front = static fn (bool $fromFront, array $headers): array => SwooleNode::serverVars(
+    ['request_method' => 'POST', 'request_uri' => '/reticulum/admin/login', 'remote_addr' => '127.0.0.1'],
+    $headers + ['host' => 'example.test', 'origin' => 'https://example.test'],
+    '/reticulum',
+    ['x-front-secret'],
+    $fromFront
+);
+$https = $front(true, ['x-front-secret' => 's3cret', 'x-front-https' => 'on', 'x-front-client' => '203.0.113.7']);
+check('beside the secret, what Apache saw: HTTPS on, REQUEST_SCHEME https, REMOTE_ADDR the client',
+    ($https['HTTPS'] ?? null) === 'on' && ($https['REQUEST_SCHEME'] ?? null) === 'https' && $https['REMOTE_ADDR'] === '203.0.113.7', json_encode($https));
+check('...no X-Front-* header is passed on',
+    !isset($https['HTTP_X_FRONT_SECRET']) && !isset($https['HTTP_X_FRONT_HTTPS']) && !isset($https['HTTP_X_FRONT_CLIENT']));
+check('...the request\'s own Host and Origin are', $https['HTTP_HOST'] === 'example.test' && $https['HTTP_ORIGIN'] === 'https://example.test');
+$plain = $front(true, ['x-front-https' => 'off', 'x-front-client' => '2001:db8::7']);
+check('plain HTTP through Apache: no HTTPS, REQUEST_SCHEME http; an IPv6 client',
+    !isset($plain['HTTPS']) && ($plain['REQUEST_SCHEME'] ?? null) === 'http' && $plain['REMOTE_ADDR'] === '2001:db8::7', json_encode($plain));
+$forged = $front(false, ['x-front-https' => 'on', 'x-front-client' => '203.0.113.7']);
+check('without the secret they are not believed: no HTTPS, Swoole\'s REMOTE_ADDR, and not passed on',
+    !isset($forged['HTTPS']) && !isset($forged['REQUEST_SCHEME']) && $forged['REMOTE_ADDR'] === '127.0.0.1'
+    && !isset($forged['HTTP_X_FRONT_HTTPS']) && !isset($forged['HTTP_X_FRONT_CLIENT']), json_encode($forged));
+$odd = $front(true, ['x-front-https' => 'yes', 'x-front-client' => '203.0.113.7, 10.0.0.1']);
+check('values Apache would not send are ignored: no HTTPS or scheme, Swoole\'s REMOTE_ADDR',
+    !isset($odd['HTTPS']) && !isset($odd['REQUEST_SCHEME']) && $odd['REMOTE_ADDR'] === '127.0.0.1', json_encode($odd));
+$upper = SwooleNode::serverVars(['remote_addr' => '127.0.0.1'], ['X-Front-Https' => 'on', 'X-Front-Client' => '203.0.113.8'], '', [], true);
+check('header names in any case', ($upper['HTTPS'] ?? null) === 'on' && $upper['REMOTE_ADDR'] === '203.0.113.8' && !isset($upper['HTTP_X_FRONT_HTTPS']));
 
 echo "\n(c) no catch-all swallows the exit that ends a request\n";
 
@@ -310,7 +347,9 @@ check('...the .htaccess keeps its rules and ends with the block',
     $htaccess === $existing . "\n" . SwooleSetup::BEGIN . "\nRewriteEngine Off\n"
         . "<FilesMatch \"^(config(\\.local)?\\.(toml|php)|error_log)$|\\.sqlite\">\n    Require all denied\n</FilesMatch>\n"
         . "PassengerAppRoot \"{$appRoot}\"\nPassengerBaseURI \"/reticulum\"\n"
-        . "RequestHeader set X-Front-Secret \"{$secret}\"\n" . SwooleSetup::END . "\n", $htaccess);
+        . "RequestHeader set X-Front-Secret \"{$secret}\"\n"
+        . "RequestHeader set X-Front-Https \"expr=%{HTTPS}\"\nRequestHeader set X-Front-Client \"expr=%{REMOTE_ADDR}\"\n"
+        . SwooleSetup::END . "\n", $htaccess);
 [$code] = $run($config(true));
 check('on again: the same .htaccess and the same secret', $code === 0
     && file_get_contents($web . '/.htaccess') === $htaccess && trim((string) file_get_contents($appRoot . '/front_secret')) === $secret);
@@ -343,6 +382,99 @@ rename($web . '/lib/b.tmp', $web . '/lib/a.php');
 check('a lib file renamed over (as the swap does): unknown, whatever the stamp says', $loaded->buildStamp() === ['commit' => null, 'stamped_at' => null]);
 check('...and a process that loads it now names the stamp', (new \ReticulumPhp\LoadedCode($web))->buildStamp()['commit'] === str_repeat('a', 40));
 exec('rm -rf ' . escapeshellarg($tmp));
+
+echo "\n(h) inside a function or class, only HttpIo reads the request and writes the answer\n";
+
+/**
+ * Each use of the web SAPI's own request I/O inside a function or class body,
+ * outside class HttpIo. $_SERVER is not one: SwooleNode::answer() sets it for
+ * each request.
+ *
+ * @return list<string> "<file>:<line> <what>"
+ */
+function rawSapiIo(string $code, string $file): array
+{
+    $calls = ['header', 'header_remove', 'setcookie', 'setrawcookie', 'http_response_code'];
+    $superglobals = ['$_POST', '$_GET', '$_COOKIE', '$_REQUEST', '$_FILES'];
+    $tokens = array_values(array_filter(
+        token_get_all($code),
+        static fn ($t) => !is_array($t) || !in_array($t[0], [T_WHITESPACE, T_COMMENT, T_DOC_COMMENT], true)
+    ));
+    $found = [];
+    $scopes = [];   // brace depth => the class, or '' for a function, whose body opened there
+    $depth = 0;
+    $pending = null; // a class or function declared, its body not open yet
+    foreach ($tokens as $i => $t) {
+        $id = is_array($t) ? $t[0] : $t;
+        $previous = $tokens[$i - 1] ?? null;
+        $previousId = is_array($previous) ? $previous[0] : $previous;
+        if (in_array($id, [T_CLASS, T_TRAIT, T_INTERFACE, T_ENUM], true) && $previousId !== T_DOUBLE_COLON) {
+            $name = $tokens[$i + 1] ?? null;
+            $pending = is_array($name) && $name[0] === T_STRING ? $name[1] : '';
+            continue;
+        }
+        if ($id === T_FUNCTION) {
+            $pending = '';
+            continue;
+        }
+        if ($id === ';' && $pending !== null) {
+            $pending = null; // a function without a body
+            continue;
+        }
+        if ($id === '{' || $id === T_CURLY_OPEN || $id === T_DOLLAR_OPEN_CURLY_BRACES) {
+            $depth++;
+            if ($id === '{' && $pending !== null) {
+                $scopes[$depth] = $pending;
+                $pending = null;
+            }
+            continue;
+        }
+        if ($id === '}') {
+            unset($scopes[$depth]);
+            $depth--;
+            continue;
+        }
+        if ($scopes === [] || in_array('HttpIo', $scopes, true)) {
+            continue;
+        }
+        if (($id === T_STRING || $id === T_NAME_FULLY_QUALIFIED) && in_array(strtolower(ltrim($t[1], '\\')), $calls, true)
+            && ($tokens[$i + 1] ?? null) === '('
+            && !in_array($previousId, [T_OBJECT_OPERATOR, T_NULLSAFE_OBJECT_OPERATOR, T_DOUBLE_COLON, T_FUNCTION, T_NEW], true)) {
+            $found[] = "{$file}:{$t[2]} {$t[1]}()";
+        } elseif ($id === T_VARIABLE && in_array($t[1], $superglobals, true)) {
+            $found[] = "{$file}:{$t[2]} {$t[1]}";
+        } elseif (($id === T_CONSTANT_ENCAPSED_STRING || $id === T_ENCAPSED_AND_WHITESPACE) && str_contains(strtolower($t[1]), 'php://input')) {
+            $found[] = "{$file}:{$t[2]} php://input";
+        }
+    }
+    return $found;
+}
+
+$ioSamples = [
+    'header() in a method' => ['<?php class A { function f() { header("X-A: 1"); } }', 1],
+    'setcookie() and http_response_code() in a function' => ['<?php function f() { setcookie("a", "b"); http_response_code(403); }', 2],
+    '\header() in a closure' => ['<?php $f = function () { \header("X-A: 1"); };', 1],
+    '$_POST and $_COOKIE in a trait' => ['<?php trait T { function f() { return [$_POST["a"] ?? null, $_COOKIE["b"] ?? null]; } }', 2],
+    'php://input in a method' => ['<?php class A { function f() { return file_get_contents("php://input", false, null, 0, 10); } }', 1],
+    'a method after a bodiless one' => ['<?php abstract class A { abstract function g(); function f() { header("X-A: 1"); } }', 1],
+    'a call after an interpolated string' => ['<?php class A { function f($x) { $s = "a{$x}b"; header("X-A: 1"); } }', 1],
+    'class HttpIo itself' => ['<?php final class HttpIo { public static function header(string $n, string $v): void { header($n . ": " . $v); http_response_code(200); file_get_contents("php://input"); } }', 0],
+    'top-level code, the web SAPI\'s own script' => ['<?php if (PHP_SAPI !== "cli") { http_response_code(404); header("X-A: 1"); exit; }', 0],
+    'top-level code after a class' => ['<?php class A { function f() {} } header("X-A: 1");', 0],
+    'HttpIo::header(), a method and a static of those names' => ['<?php class A { function f() { HttpIo::header("A", "b"); $this->header("x"); self::setcookie(); } function header($x) {} }', 0],
+    '$_SERVER, which SwooleNode::answer() sets' => ['<?php class A { function f() { return $_SERVER["REQUEST_METHOD"]; } }', 0],
+];
+foreach ($ioSamples as $label => [$code, $expected]) {
+    $got = rawSapiIo($code, 'sample');
+    check("finds $expected in: $label", count($got) === $expected, implode(', ', $got));
+}
+
+$ioFiles = array_merge([$src . '/index.php', $src . '/swoole_server.php'], glob($src . '/lib/*.php'));
+$rawIo = [];
+foreach ($ioFiles as $path) {
+    $rawIo = array_merge($rawIo, rawSapiIo((string) file_get_contents($path), substr($path, strlen($src) + 1)));
+}
+check('none in php/src (' . count($ioFiles) . ' files)', count($ioFiles) > 20 && $rawIo === [], implode(', ', $rawIo));
 
 echo "\n$pass passed, $fail failed\n";
 exit($fail > 0 ? 1 : 0);

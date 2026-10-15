@@ -190,9 +190,9 @@ sent. The challenge is **stateless**: no table of codes, no expiry, no sweep.
 **The node secret** is 32 random bytes, made on first use and kept as hex in
 `transport_state` under `registration_challenge_secret_hex` (INSERT-or-ignore,
 then SELECT, so concurrent first requests agree); checking a challenge never
-creates it. It never appears in `/health`, `/debug`, the monitor, a log line
-or an answer. A database reset rotates it (`clearAllData()` empties
-`transport_state`), and every outstanding challenge dies with it.
+creates it. It never appears in `/health`, the admin page, a log line or an
+answer. A database reset rotates it (emptying `transport_state`), and every
+outstanding challenge dies with it.
 
 **Single use.** A successful signed registration moves the row from `count`
 to `count + 1` (§4.4), so every challenge made at the old count fails for
@@ -758,10 +758,9 @@ before the exact check of the decoded `client` (§14).
   rotation of the node secret, in the same session:
   `DELETE FROM transport_state WHERE state_key = 'registration_challenge_secret_hex'`.
   Otherwise its count would restart at 0, and a body already used at a low
-  count would work once more. `clearAllData()` does both.
-- **`monitor.php`'s clear MUST stop at the first failed `DELETE`**, so it
-  never empties `interfaces` while `transport_state` survives. Today it goes
-  on (it answers only where `[debug] enabled` is set).
+  count would work once more. No route empties `interfaces` or
+  `transport_state`: the admin page, which replaced `clearAllData()` (`POST
+  /v1/monitor/clear`) and `monitor.php` on 2026-10-14, has no clear-all.
 - **SQL:** every value bound; no backslash in a SQL string literal; no named
   placeholder twice in one statement (MySQL's native prepares fail with HY093
   where SQLite accepts it: the 2026-09-23 outage); every statement runs on
@@ -1088,10 +1087,9 @@ with a bound that only fails it.
   file's SHA-1, and the seeded case skips the migration.
 - **`health_allowlist_test.php`:** §12's object, and still no identity hash,
   token or browser row. *Today:* no `registration`.
-- **`clear_all_data_test.php`:** `clearAllData()` empties `transport_state`
-  and `interfaces` (passes today: it pins); with a SQLite trigger failing only
-  the `transport_state` `DELETE`, `monitor.php`'s clear leaves `interfaces`
-  alone. *Today:* it goes on.
+- **`clear_all_data_test.php`:** retired with `clearAllData()` and
+  `monitor.php` (the admin page, 2026-10-14); `admin_console_test.php` (a)
+  checks that the old routes answer 404 and leave the database alone.
 - **`deploy_never_mixes_releases_test.php`** (extended): a failing pre-swap
   migrate stops the deploy with nothing swapped and the stamps and rollback
   copies unchanged; a ref without the migrate mode skips the step; a ref that

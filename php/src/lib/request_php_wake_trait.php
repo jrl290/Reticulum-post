@@ -557,6 +557,12 @@ trait RequestPhpWakeTrait
         }
     }
 
+    /**
+     * The operator's `php index.php initialize`, its only caller (runIndexCli).
+     * Until 2026-10-14 it was GET /v1/initialize, open to anyone; see
+     * HttpApi::handle(). The admin page's Reconnect is the same for one peer,
+     * without the migration (reconnectConfiguredPeer()).
+     */
     public function initializeNode(): array
     {
         $summary = [
@@ -565,23 +571,42 @@ trait RequestPhpWakeTrait
             'peers' => [],
         ];
 
-        // Schema migration.
-        $this->migrate();
-        $summary['migrated'] = true;
+        // Schema migration. Until 2026-10-14 this said migrated whatever
+        // migrate() reported; its errors are the answer now.
+        $migration = $this->migrate();
+        $summary['migrated'] = $migration['errors'] === [];
+        $summary['migration'] = $migration;
 
-        // Connect to configured peer interfaces.
-        $interfaces = $this->config['interfaces'] ?? [];
-        if (!is_array($interfaces)) {
-            return $summary;
-        }
-
-        $hostUrl = $this->config['host_url'] ?? ($this->config['http']['advertise_url'] ?? null);
-        if (!is_string($hostUrl) || trim($hostUrl) === '') {
+        $hostUrl = $this->configuredHostUrl();
+        if ($hostUrl === null) {
             $summary['status'] = 'no_host_url';
             return $summary;
         }
-        $hostUrl = rtrim(trim($hostUrl), '/');
 
+        // Connect to configured peer interfaces.
+        foreach ($this->configuredPeerEndpoints() as $ifaceName => $endpoint) {
+            $summary['peers'][] = $this->connectToPeer($endpoint['exchange_url'], $endpoint['wake_url'], $hostUrl, (string) $ifaceName);
+        }
+
+        return $summary;
+    }
+
+    /**
+     * The peers [interfaces] configures, by name: the URL to register and
+     * exchange at (node_url, or peer_url) and the one to wake (wake_url, or
+     * <node_url>/v1/wake). initialize, the heal in maintenance and the admin
+     * page all read them here, so they cannot disagree about a URL.
+     *
+     * @return array<string|int, array{exchange_url: string, wake_url: string}>
+     */
+    private function configuredPeerEndpoints(): array
+    {
+        $interfaces = $this->config['interfaces'] ?? [];
+        if (!is_array($interfaces)) {
+            return [];
+        }
+
+        $endpoints = [];
         foreach ($interfaces as $ifaceName => $ifaceConfig) {
             if (!is_array($ifaceConfig)) {
                 continue;
@@ -596,17 +621,123 @@ trait RequestPhpWakeTrait
             // Wake URL: explicit config field takes precedence, otherwise
             // the standard PHP node convention (<base>/v1/wake).
             $wakeUrl = $ifaceConfig['wake_url'] ?? null;
-            if (is_string($wakeUrl) && trim($wakeUrl) !== '') {
-                $wakeUrl = trim($wakeUrl);
-            } else {
-                $wakeUrl = $exchangeUrl . '/v1/wake';
-            }
-
-            $result = $this->connectToPeer($exchangeUrl, $wakeUrl, $hostUrl, (string) $ifaceName);
-            $summary['peers'][] = $result;
+            $endpoints[$ifaceName] = [
+                'exchange_url' => $exchangeUrl,
+                'wake_url' => is_string($wakeUrl) && trim($wakeUrl) !== '' ? trim($wakeUrl) : $exchangeUrl . '/v1/wake',
+            ];
         }
 
-        return $summary;
+        return $endpoints;
+    }
+
+    private function configuredHostUrl(): ?string
+    {
+        $hostUrl = $this->config['host_url'] ?? ($this->config['http']['advertise_url'] ?? null);
+        return is_string($hostUrl) && trim($hostUrl) !== '' ? rtrim(trim($hostUrl), '/') : null;
+    }
+
+    /**
+     * The configured peers and this node's row for each, for the admin page.
+     * The row goes out through publicInterfaceView(), so no credential does;
+     * 'rows' counts every row that names the peer, because README's rotation
+     * stops when there is more than one.
+     */
+    public function configuredPeerStates(): array
+    {
+        $now = time();
+        $states = [];
+        foreach ($this->configuredPeerEndpoints() as $ifaceName => $endpoint) {
+            $rows = $this->interfaceRowsNamingPeer($endpoint['exchange_url']);
+            $row = $rows[0] ?? null;
+            $states[] = [
+                'name' => (string) $ifaceName,
+                'node_url' => $endpoint['exchange_url'],
+                'rows' => count($rows),
+                'live' => self::phpPeerRowIsLive($row, $now),
+                'interface' => $row === null ? null : self::publicInterfaceView($row, true),
+            ];
+        }
+
+        return $states;
+    }
+
+    /**
+     * The admin page's Reconnect for one configured peer: what `php index.php
+     * initialize` does for it, without the migration. connectToPeer() leaves
+     * a live row alone and replaces any other, so a row that is only quiet
+     * gets new credentials, as a rotation would.
+     */
+    public function reconnectConfiguredPeer(string $name): array
+    {
+        $endpoint = $this->configuredPeerEndpoints()[$name] ?? null;
+        $hostUrl = $this->configuredHostUrl();
+        if ($endpoint === null || $hostUrl === null) {
+            return ['peer' => $name, 'status' => $endpoint === null ? 'not_configured' : 'no_host_url'];
+        }
+
+        return ['peer' => $name] + $this->connectToPeer($endpoint['exchange_url'], $endpoint['wake_url'], $hostUrl, $name);
+    }
+
+    /**
+     * The admin page's Rotate: README "Rotating a PHP peering's credentials"
+     * step 2 as one action. This node's row for the peer is deleted, not
+     * marked dead (the peer's next exchange with the old token would revive
+     * a merely-offline row), so connectToPeer() finds none and registers
+     * afresh: a new id and token here, and the peer re-binds its row with a
+     * new token of its own. Refused, with nothing deleted, when more than one
+     * row names the peer, where README's step 1 stops too.
+     */
+    public function rotateConfiguredPeer(string $name): array
+    {
+        $endpoint = $this->configuredPeerEndpoints()[$name] ?? null;
+        $hostUrl = $this->configuredHostUrl();
+        if ($endpoint === null || $hostUrl === null) {
+            return ['peer' => $name, 'status' => $endpoint === null ? 'not_configured' : 'no_host_url'];
+        }
+
+        $rows = $this->interfaceRowsNamingPeer($endpoint['exchange_url']);
+        if (count($rows) > 1) {
+            return ['peer' => $name, 'peer_url' => $endpoint['exchange_url'], 'status' => 'refused_duplicate_rows', 'rows' => count($rows)];
+        }
+
+        $previous = isset($rows[0]) ? (string) $rows[0]['interface_id'] : null;
+        if ($previous !== null) {
+            $delete = $this->db->prepare('DELETE FROM interfaces WHERE interface_id = :id');
+            $delete->bindValue(':id', $previous, PDO::PARAM_STR);
+            Database::executeWithRetry($delete, 'rotatePeerRow');
+            EmptyPoll::clear($this->config, $previous);
+        }
+
+        return ['peer' => $name, 'previous_interface_id' => $previous]
+            + $this->connectToPeer($endpoint['exchange_url'], $endpoint['wake_url'], $hostUrl, $name);
+    }
+
+    /**
+     * Every interface row whose peer_url is $exchangeUrl, as is or with
+     * /v1/wake (the forms phpPeerInterfaceByPeerUrl() looks up), most recently
+     * seen first, with metadata decoded for publicInterfaceView().
+     */
+    private function interfaceRowsNamingPeer(string $exchangeUrl): array
+    {
+        $stmt = $this->db->prepare(
+            'SELECT interface_id, name, bitrate, mtu, status, metadata_json, peer_url,
+                    created_at, last_seen_at, rx_packets, rx_bytes, tx_packets, tx_bytes
+             FROM interfaces
+             WHERE peer_url IN (:peer_url, :wake_url)
+             ORDER BY last_seen_at DESC, created_at DESC'
+        );
+        $stmt->bindValue(':peer_url', $exchangeUrl, PDO::PARAM_STR);
+        $stmt->bindValue(':wake_url', $exchangeUrl . '/v1/wake', PDO::PARAM_STR);
+        $stmt->execute();
+
+        $rows = [];
+        while (($row = $stmt->fetch(PDO::FETCH_ASSOC)) !== false) {
+            $row['metadata'] = self::decodeJson((string) ($row['metadata_json'] ?? '{}'));
+            unset($row['metadata_json']);
+            $rows[] = $row;
+        }
+
+        return $rows;
     }
 
     /**
@@ -645,12 +776,9 @@ trait RequestPhpWakeTrait
      */
     public function ensureConfiguredPeerSessions(int $now, array &$summary): void
     {
-        $interfaces = $this->config['interfaces'] ?? [];
-        if (!is_array($interfaces) || $interfaces === []) {
-            return;
-        }
-        $hostUrl = $this->config['host_url'] ?? ($this->config['http']['advertise_url'] ?? null);
-        if (!is_string($hostUrl) || trim($hostUrl) === '') {
+        $endpoints = $this->configuredPeerEndpoints();
+        $hostUrl = $this->configuredHostUrl();
+        if ($endpoints === [] || $hostUrl === null) {
             return;
         }
 
@@ -676,16 +804,8 @@ trait RequestPhpWakeTrait
         $up->bindValue(':t', $now, PDO::PARAM_INT);
         Database::executeWithRetry($up, 'claimPeerSessionWindow');
 
-        $hostUrl = rtrim(trim($hostUrl), '/');
-        foreach ($interfaces as $ifaceName => $ifaceConfig) {
-            if (!is_array($ifaceConfig)) {
-                continue;
-            }
-            $exchangeUrl = $ifaceConfig['node_url'] ?? $ifaceConfig['peer_url'] ?? null;
-            if (!is_string($exchangeUrl) || trim($exchangeUrl) === '') {
-                continue;
-            }
-            $exchangeUrl = rtrim(trim($exchangeUrl), '/');
+        foreach ($endpoints as $ifaceName => $endpoint) {
+            $exchangeUrl = $endpoint['exchange_url'];
             $existing = $this->phpPeerInterfaceByPeerUrl($exchangeUrl);
 
             // Heal on: no row at all, or a row that has been offline for a
@@ -708,12 +828,7 @@ trait RequestPhpWakeTrait
                 }
             }
 
-            $wakeUrl = $ifaceConfig['wake_url'] ?? null;
-            $wakeUrl = (is_string($wakeUrl) && trim($wakeUrl) !== '')
-                ? trim($wakeUrl)
-                : $exchangeUrl . '/v1/wake';
-
-            $result = $this->connectToPeer($exchangeUrl, $wakeUrl, $hostUrl, (string) $ifaceName);
+            $result = $this->connectToPeer($exchangeUrl, $endpoint['wake_url'], $hostUrl, (string) $ifaceName);
             $summary['peer_sessions_healed'][] = $result;
             // error_log(), as every line Storage writes: log() is HttpApi's
             // (RequestHttpApiHelperTrait), and this trait runs as Storage.
