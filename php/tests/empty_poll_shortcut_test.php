@@ -17,6 +17,8 @@
  */
 declare(strict_types=1);
 
+require_once __DIR__ . '/stubs/node_process.php';
+
 $src = dirname(__DIR__) . '/src';
 
 $pass = 0;
@@ -96,11 +98,7 @@ file_put_contents($dir . '/src/config.toml', implode("\n", [
     'interface_stale_after_seconds = 30',
     '',
 ]));
-$proc = proc_open(
-    [PHP_BINARY, '-S', '127.0.0.1:' . $port, '-t', $dir . '/src', $dir . '/src/index.php'],
-    [0 => ['file', '/dev/null', 'r'], 1 => ['file', $dir . '/server.out', 'w'], 2 => ['file', $dir . '/server.out', 'a']],
-    $pipes
-);
+$proc = startNodeProcess($dir . '/src', $port, $dir . '/server.out');
 $base = 'http://127.0.0.1:' . $port;
 // Readiness is the server answering; the bound only turns a server that
 // never starts into a test failure instead of a hang.

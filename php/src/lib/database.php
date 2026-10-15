@@ -85,7 +85,11 @@ final class CountingPdo extends \PDO
             : parent::query($query, $fetchMode, ...$fetchModeArgs), $fetchMode);
     }
 
-    /** Append this request's tally to $path (called from a shutdown function). */
+    /**
+     * Append this request's tally to $path and start the next one. A web
+     * request calls it from a shutdown function; the Swoole entry, whose
+     * process outlives many requests, after each one.
+     */
     public static function flush(string $path, float $startedAt): void
     {
         if (self::$total === 0) {
@@ -100,6 +104,8 @@ final class CountingPdo extends \PDO
             'top'     => array_slice(self::$counts, 0, 8, true),
         ], JSON_UNESCAPED_SLASHES);
         @file_put_contents($path, $line . "\n", FILE_APPEND | LOCK_EX);
+        self::$counts = [];
+        self::$total = 0;
     }
 }
 
@@ -343,12 +349,18 @@ final class Database
      *   - ATTR_STRINGIFY_FETCHES = false: return native types
      *   - ATTR_ERRMODE = EXCEPTION: all errors throw, including deadlocks
      */
+    /** Where CountingPdo appends each request's tally; '' = off. */
+    public static function queryLogPath(array $config): string
+    {
+        return (string) (($config['storage'] ?? [])['query_log_path'] ?? (getenv('RETICULUM_PHP_QUERY_LOG') ?: ''));
+    }
+
     public static function connect(array $config): PDO
     {
         $storage = $config['storage'] ?? [];
         $backend = self::backend($config);
         self::$logPath = (string) ($storage['log_path'] ?? '') ?: null;
-        $queryLog = (string) ($storage['query_log_path'] ?? (getenv('RETICULUM_PHP_QUERY_LOG') ?: ''));
+        $queryLog = self::queryLogPath($config);
         $pdoClass = \PDO::class;
         if ($queryLog !== '') {
             $pdoClass = CountingPdo::class;

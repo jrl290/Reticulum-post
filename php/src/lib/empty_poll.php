@@ -108,8 +108,8 @@ final class EmptyPoll
             return;
         }
 
-        $raw = file_get_contents('php://input');
-        $body = is_string($raw) && $raw !== '' ? json_decode($raw, true) : null;
+        $raw = HttpIo::requestBody();
+        $body = $raw !== '' ? json_decode($raw, true) : null;
         if (!is_array($body)) {
             return;
         }

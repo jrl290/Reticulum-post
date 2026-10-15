@@ -72,12 +72,60 @@ require_once __DIR__ . '/empty_poll.php';
  */
 
 /**
- * The request path and the response headers, shared by HttpApi and by the
+ * The request path, body and response headers, shared by HttpApi and by the
  * empty-poll shortcut (EmptyPoll), which answers before HttpApi exists and
  * must route and answer exactly as HttpApi would.
+ *
+ * Under a web SAPI the body is php://input and the status and headers go to
+ * PHP. The Swoole entry (swoole_server.php) has neither: it hands each
+ * request in as an HttpExchange, which takes the body in and the status and
+ * headers out, for that request only. Code that answers a request reads and
+ * writes through here, never php://input, header() or http_response_code().
  */
 final class HttpIo
 {
+    private static ?HttpExchange $exchange = null;
+
+    /** The Swoole entry's request, until finish(). */
+    public static function begin(HttpExchange $exchange): void
+    {
+        self::$exchange = $exchange;
+    }
+
+    public static function finish(): void
+    {
+        self::$exchange = null;
+    }
+
+    public static function requestBody(): string
+    {
+        if (self::$exchange !== null) {
+            return self::$exchange->body;
+        }
+        $raw = file_get_contents('php://input');
+
+        return is_string($raw) ? $raw : '';
+    }
+
+    public static function status(int $statusCode): void
+    {
+        if (self::$exchange !== null) {
+            self::$exchange->status = $statusCode;
+            return;
+        }
+        http_response_code($statusCode);
+    }
+
+    /** One header, replacing any earlier one of the same name, as header() does. */
+    public static function header(string $name, string $value): void
+    {
+        if (self::$exchange !== null) {
+            self::$exchange->headers[strtolower($name)] = [$name, $value];
+            return;
+        }
+        header($name . ': ' . $value);
+    }
+
     public static function normalizedPath(string $uri, array $server): string
     {
         $path = parse_url($uri, PHP_URL_PATH);
@@ -116,12 +164,27 @@ final class HttpIo
 
     public static function sendHeaders(int $statusCode): void
     {
-        http_response_code($statusCode);
-        header('Content-Type: application/json');
-        header('Access-Control-Allow-Origin: *');
-        header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
-        header('Access-Control-Allow-Headers: Content-Type, X-Interface-Id, X-Session-Token');
-        header('Access-Control-Max-Age: 86400');
+        self::status($statusCode);
+        self::header('Content-Type', 'application/json');
+        self::header('Access-Control-Allow-Origin', '*');
+        self::header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+        self::header('Access-Control-Allow-Headers', 'Content-Type, X-Interface-Id, X-Session-Token');
+        self::header('Access-Control-Max-Age', '86400');
+    }
+}
+
+/**
+ * One request as the Swoole entry hands it to HttpIo: the body in, the status
+ * and headers out. Headers are keyed by lower-case name: [name, value].
+ */
+final class HttpExchange
+{
+    public int $status = 200;
+    /** @var array<string, array{0: string, 1: string}> */
+    public array $headers = [];
+
+    public function __construct(public readonly string $body)
+    {
     }
 }
 
@@ -229,8 +292,8 @@ trait RequestHttpApiHelperTrait
 
     private function readJsonBody(): array
     {
-        $raw = file_get_contents('php://input');
-        if (!is_string($raw) || $raw === '') {
+        $raw = HttpIo::requestBody();
+        if ($raw === '') {
             throw new ApiError(400, 'Empty request body', ['error' => 'empty request body']);
         }
 
@@ -258,8 +321,8 @@ trait RequestHttpApiHelperTrait
 
             return $fields;
         }
-        $raw = file_get_contents('php://input');
-        $decoded = is_string($raw) && $raw !== '' ? json_decode($raw, true) : null;
+        $raw = HttpIo::requestBody();
+        $decoded = $raw !== '' ? json_decode($raw, true) : null;
 
         return is_array($decoded) ? $decoded : [];
     }

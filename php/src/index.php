@@ -1105,10 +1105,15 @@ final class Storage
     private PDO $db;
     private string $backend;
 
-    public function __construct(private readonly array $config)
+    /**
+     * $db: an open connection to reuse (the Swoole entry keeps one per
+     * worker); otherwise one is opened. Either way a Storage lives for one
+     * request, so its traits' per-request caches start empty each time.
+     */
+    public function __construct(private readonly array $config, ?PDO $db = null)
     {
         $this->backend = Database::backend($config);
-        $this->db = Database::connect($config);
+        $this->db = $db ?? Database::connect($config);
     }
 
 }
@@ -1117,10 +1122,17 @@ final class HttpApi
 {
     use RequestHttpApiHelperTrait;
 
+    /**
+     * $build: the build stamp as it was when this code was loaded, from a
+     * process that serves many requests (the Swoole entry). /health must name
+     * the code that answers, and a deploy replaces the files under a running
+     * process; otherwise the stamp is read from $buildStampDir.
+     */
     public function __construct(
         private readonly array $config,
         private readonly Storage $storage,
-        private readonly string $buildStampDir = __DIR__
+        private readonly string $buildStampDir = __DIR__,
+        private readonly ?array $build = null
     ) {
     }
 
@@ -1140,7 +1152,7 @@ final class HttpApi
             'status' => 'ok',
             'transport_basis' => requestTransportMechanism(),
             'environment' => Environment::verify(),
-            'build' => BuildStamp::read($this->buildStampDir),
+            'build' => $this->build ?? BuildStamp::read($this->buildStampDir),
             'queues' => $this->storage->healthSummary(),
             'php_interface_registry' => $this->storage->healthInterfaceRegistry(5),
             'registration' => $this->storage->registrationHealth(),
@@ -1263,7 +1275,7 @@ final class HttpApi
             // cached challenge would turn into two 409s. The browser POSTs;
             // GET is for operators.
             if (($method === 'POST' || $method === 'GET') && $path === '/v1/interfaces/challenge') {
-                header('Cache-Control: no-store');
+                HttpIo::header('Cache-Control', 'no-store');
                 $this->respond(200, $this->storage->issueChallenge($this->challengeRequest($method, $uri), $method === 'POST'));
             }
 
@@ -1420,6 +1432,12 @@ final class HttpApi
             }
             $this->respond($error->statusCode, $payload);
         } catch (\Throwable $error) {
+            // Under the Swoole entry, respond()'s exit arrives here as this
+            // exception: the answer is already written, so let it end the
+            // request. Swallowing it turned every answer into a 500.
+            if ($error instanceof \Swoole\ExitException) {
+                throw $error;
+            }
             $this->log('error', 'Unhandled HTTP exception: ' . $error->getMessage());
             $this->respond(500, ['error' => 'internal error', 'message' => 'The PHP node failed to answer this request.']);
         }
@@ -1613,6 +1631,9 @@ if (realpath($_SERVER['SCRIPT_FILENAME'] ?? '') === __FILE__) {
 
         runIndexHttp($projectRoot);
     } catch (\Throwable $error) {
+        if ($error instanceof \Swoole\ExitException) {
+            throw $error;
+        }
         if (PHP_SAPI === 'cli') {
             fwrite(STDERR, $error->getMessage() . PHP_EOL);
             exit(1);

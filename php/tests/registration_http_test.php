@@ -19,6 +19,7 @@
 declare(strict_types=1);
 
 require_once __DIR__ . '/stubs/registration_fixture.php';
+require_once __DIR__ . '/stubs/node_process.php';
 
 const SUPERSEDED_MESSAGE = 'This identity connected from another tab or device. Reload to connect here.';
 
@@ -114,11 +115,7 @@ function startNode(string $src, array $registrationLines = []): array
         '[http]',
         'max_packet_bytes = 500',
     ], $registrationLines === [] ? [] : array_merge(['[registration]'], $registrationLines))) . "\n");
-    $proc = proc_open(
-        [PHP_BINARY, '-S', '127.0.0.1:' . $port, '-t', $dir . '/src', $dir . '/src/index.php'],
-        [0 => ['file', '/dev/null', 'r'], 1 => ['file', $dir . '/server.out', 'w'], 2 => ['file', $dir . '/server.out', 'a']],
-        $pipes
-    );
+    $proc = startNodeProcess($dir . '/src', $port, $dir . '/server.out');
     // A test that dies before it stops this server (a fatal error, say under
     // a mutation) must not leave it running, holding its port: stop it at
     // shutdown unless it was stopped already.

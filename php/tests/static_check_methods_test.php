@@ -829,6 +829,8 @@ check('every call it reads in php/src is checked: none is listed NOT CHECKED',
 $composed = json_decode($json, true);
 check('--methods lists php/src\'s classes', $code === 0 && is_array($composed) && $composed !== [], $json);
 require_once $src . '/index.php';
+// swoole_server.php's (index.php does not load it).
+require_once $src . '/lib/swoole_node.php';
 $reflected = [];
 foreach (get_declared_classes() as $class) {
     if (str_starts_with($class, 'ReticulumPhp\\')) {
