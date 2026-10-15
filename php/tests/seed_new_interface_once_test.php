@@ -32,6 +32,11 @@
  *       while a row registered after it is.
  *
  * Run: php tests/seed_new_interface_once_test.php
+ * On MySQL (every table in the database is dropped first):
+ *   SEED_TEST_MYSQL=user:pass@127.0.0.1:3306/dbname php tests/seed_new_interface_once_test.php
+ * There (f) starts from this code's schema with seeded_at dropped and the
+ * version before it recorded, the stage1-1 schema, since the 50c870b stub
+ * is SQLite.
  */
 declare(strict_types=1);
 
@@ -126,8 +131,51 @@ function sameSet(array $a, array $b): bool
     return $a === $b;
 }
 
+$mysql = getenv('SEED_TEST_MYSQL') ?: null;
+if ($mysql !== null) {
+    $u = parse_url('mysql://' . $mysql);
+    $mysql = [
+        'backend' => 'mysql', 'mysql_host' => $u['host'] ?? '127.0.0.1', 'mysql_port' => $u['port'] ?? 3306,
+        'mysql_dbname' => ltrim($u['path'] ?? '', '/'), 'mysql_user' => rawurldecode($u['user'] ?? 'root'), 'mysql_pass' => rawurldecode($u['pass'] ?? ''),
+    ];
+    echo 'MySQL ' . $mysql['mysql_host'] . ':' . $mysql['mysql_port'] . '/' . $mysql['mysql_dbname'] . "\n";
+}
+
+/** A migrated Storage on the SQLite file $path, or on the MySQL database. */
+function storageAt(string $path): Storage
+{
+    global $mysql;
+    $config = RegFixture::config([], $path);
+    if ($mysql !== null) {
+        $config['storage'] = $mysql;
+    }
+    $storage = new Storage($config);
+    $summary = $storage->migrateIfNeeded();
+    if (($summary['errors'] ?? []) !== []) {
+        throw new RuntimeException('migration failed: ' . json_encode($summary['errors']));
+    }
+
+    return $storage;
+}
+
+/** MySQL: an empty database. */
+function dropAllTables(): void
+{
+    global $mysql;
+    $pdo = new PDO(sprintf('mysql:host=%s;port=%d;dbname=%s', $mysql['mysql_host'], $mysql['mysql_port'], $mysql['mysql_dbname']),
+        $mysql['mysql_user'], $mysql['mysql_pass'], [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+    echo '  sql_mode: ' . $pdo->query('SELECT @@SESSION.sql_mode')->fetchColumn() . "\n";
+    $pdo->exec('SET FOREIGN_KEY_CHECKS = 0');
+    foreach ($pdo->query('SHOW TABLES')->fetchAll(PDO::FETCH_COLUMN) as $table) {
+        $pdo->exec("DROP TABLE `{$table}`");
+    }
+}
+
 $path = $dir . '/node.sqlite';
-$node = RegFixture::storage([], $path);
+if ($mysql !== null) {
+    dropAllTables();
+}
+$node = storageAt($path);
 $db = RegFixture::db($node);
 $gateway = row($node, RegFixture::pollGatewayMetadata(), 'gateway');
 
@@ -145,7 +193,7 @@ echo "\n(b) seeded once\n";
 $before = queuedAnnounces($db, $browser);
 firstExchange($node, $browser);
 check('its next exchange queues nothing more', queuedAnnounces($db, $browser) === $before, json_encode(queuedAnnounces($db, $browser)));
-$other = RegFixture::storage([], $path);
+$other = storageAt($path);
 $other->seedInterfaceIfNew($browser);
 check("another request's exchange queues nothing more", queuedAnnounces($db, $browser) === $before, json_encode(queuedAnnounces($db, $browser)));
 // Its rows gone, as maintenance prunes them once acked, it still has had
@@ -174,14 +222,22 @@ check('with 74 destinations cached, a new browser gets 64', $count === 64, (stri
 
 echo "\n(f) rows from before the marker\n";
 $oldPath = $dir . '/live.sqlite';
-$oldDb = new PDO('sqlite:' . $oldPath);
-$oldDb->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-$oldDb->exec((string) file_get_contents(__DIR__ . '/stubs/50c870b_schema.sql'));
+if ($mysql === null) {
+    $oldDb = new PDO('sqlite:' . $oldPath);
+    $oldDb->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+    $oldDb->exec((string) file_get_contents(__DIR__ . '/stubs/50c870b_schema.sql'));
+} else {
+    unset($node, $other, $db);
+    dropAllTables();
+    $oldDb = RegFixture::db(storageAt($oldPath));
+    $oldDb->exec('ALTER TABLE interfaces DROP COLUMN seeded_at');
+    $oldDb->exec("UPDATE schema_meta SET fingerprint = 'stage1-1' WHERE meta_key = 'migration'");
+}
 $oldBrowser = bin2hex(random_bytes(16));
 $oldDb->prepare("INSERT INTO interfaces (interface_id, name, session_token, status, metadata_json, created_at, last_seen_at)
-                 VALUES (:i, 'browser', :t, 'online', :m, :now, :now)")
-    ->execute([':i' => $oldBrowser, ':t' => bin2hex(random_bytes(32)), ':m' => json_encode(['client' => 'rns-js', 'mode' => 1]), ':now' => time()]);
-$migrated = RegFixture::storage([], $oldPath);
+                 VALUES (:i, 'browser', :t, 'online', :m, :created, :seen)")
+    ->execute([':i' => $oldBrowser, ':t' => bin2hex(random_bytes(32)), ':m' => json_encode(['client' => 'rns-js', 'mode' => 1]), ':created' => time(), ':seen' => time()]);
+$migrated = storageAt($oldPath);
 $migratedDb = RegFixture::db($migrated);
 $oldGateway = row($migrated, RegFixture::pollGatewayMetadata(), 'gateway');
 $oldCached = announceThrough($migrated, $oldGateway, 3);
