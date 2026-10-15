@@ -26,6 +26,8 @@ declare(strict_types=1);
  *      ALGORITHM=INSTANT, and each of the seven §12 indexes by a CREATE
  *      [UNIQUE] INDEX asking for ALGORITHM=INPLACE LOCK=NONE; the database
  *      ends with every one of them, and no error;
+ *      The two public key columns are widened by one ALTER ... MODIFY each
+ *      asking for ALGORITHM=INPLACE, LOCK=NONE;
  *  (c) a re-run issues no ALTER and no CREATE INDEX, and migrateIfNeeded()
  *      then records the version;
  *  (d) a statement that waits out the 2 s (1205) is issued once and stops
@@ -118,6 +120,8 @@ const STAGE1_COLUMNS = ['identity_hash', 'identity_public_key', 'registration_se
     'seeded_at'];
 const STAGE1_INDEXES = ['idx_interfaces_identity_hash', 'idx_interfaces_claimed_identity', 'idx_outbound_packets_iface',
     'idx_path_entries_iface', 'idx_reverse_path_received', 'idx_link_transport_received', 'idx_link_transport_outbound'];
+// A 50c870b database declared these VARCHAR(64); a key is 128 hex (2026-10-15).
+const KEY_COLUMNS = [['known_destinations', 'public_key_hex'], ['outbound_packets', 'destination_public_key_hex']];
 const LIVE_VERSION = '08783e676eaffc963b06f372247408bd7503c24a';
 
 /** @return list<string> the §12 columns and indexes the file lacks */
@@ -165,12 +169,16 @@ check('and before the backfill, whose UPDATE runs at the session\'s own value',
 
 // ── (b) one ALTER, and the online algorithms asked for ───────────────────
 echo "(b) one ALTER for interfaces' columns; ALGORITHM=INSTANT and INPLACE LOCK=NONE asked for\n";
-$altersA = statements($logA, '/\AALTER TABLE /');
+$altersA = statements($logA, '/\AALTER TABLE `\w+` ADD COLUMN /');
 $adds = preg_match_all('/ADD COLUMN `(\w+)`/', $altersA[0] ?? '', $added) === false ? [] : $added[1];
 check('one ALTER adds interfaces\' nine new columns',
     count($altersA) === 1 && str_starts_with($altersA[0], 'ALTER TABLE `interfaces` ') && $adds === STAGE1_COLUMNS,
     json_encode($altersA));
 check('asking for ALGORITHM=INSTANT', str_ends_with($altersA[0] ?? '', ', ALGORITHM=INSTANT'), (string) ($altersA[0] ?? ''));
+$modifiesA = statements($logA, '/\AALTER TABLE `\w+` MODIFY /');
+check('the two public key columns are widened to VARCHAR(128) in place, each by one ALTER',
+    $modifiesA === array_map(static fn (array $c): string => "ALTER TABLE `{$c[0]}` MODIFY `{$c[1]}` VARCHAR(128) DEFAULT NULL, ALGORITHM=INPLACE, LOCK=NONE", KEY_COLUMNS),
+    json_encode($modifiesA));
 $indexesA = statements($logA, '/\ACREATE (UNIQUE )?INDEX /');
 $indexNames = array_map(static fn (string $sql): string => preg_match('/\ACREATE (?:UNIQUE )?INDEX (\w+) /', $sql, $m) === 1 ? $m[1] : $sql, $indexesA);
 $online = array_filter($indexesA, static fn (string $sql): bool => str_ends_with($sql, ') ALGORITHM=INPLACE LOCK=NONE'));
@@ -181,7 +189,9 @@ check('the UNIQUE one too',
 $builtA = array_column($summaryA['built'] ?? [], 'object');
 check('no error; the summary counts nine columns and names each object built',
     ($summaryA['errors'] ?? ['?']) === [] && ($summaryA['columns_added'] ?? 0) === 9
-    && $builtA === array_merge(['columns interfaces.' . implode(', ', STAGE1_COLUMNS)], array_map(static fn (string $i): string => "index {$i}", STAGE1_INDEXES)),
+    && $builtA === array_merge(['columns interfaces.' . implode(', ', STAGE1_COLUMNS)],
+        array_map(static fn (array $c): string => "widened {$c[0]}.{$c[1]} to VARCHAR(128)", KEY_COLUMNS),
+        array_map(static fn (string $i): string => "index {$i}", STAGE1_INDEXES)),
     json_encode(['errors' => $summaryA['errors'] ?? null, 'built' => $builtA]));
 check('the database has every §12 column and index', missingObjects($plainA) === [], json_encode(missingObjects($plainA)));
 

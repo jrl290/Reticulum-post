@@ -68,7 +68,7 @@ trait RequestSchemaTrait
      */
     private function schemaVersion(): string
     {
-        return 'seed-once-1';
+        return 'key-width-1';
     }
 
     private function recordedSchemaFingerprint(): ?string
@@ -151,6 +151,10 @@ trait RequestSchemaTrait
         // finds the column there and does not come back here.
         if ($ceiling && isset($summary['seeded_at_added'])) {
             $this->backfillSeededInterfaces($summary);
+        }
+        // Only once every column is wide enough to take a whole key.
+        if ($ceiling && !isset($summary['lock_wait_timeout']) && $summary['errors'] === []) {
+            $this->repairTruncatedPublicKeys($summary);
         }
 
         return $summary;
@@ -343,7 +347,7 @@ trait RequestSchemaTrait
                     packet_hash_hex VARCHAR(64),
                     proof_destination_hash_hex VARCHAR(32),
                     destination_hash_hex VARCHAR(64),
-                    destination_public_key_hex VARCHAR(64),
+                    destination_public_key_hex VARCHAR(128),
                     packet_base64 LONGTEXT NOT NULL,
                     queued_at INT NOT NULL DEFAULT 0,
                     delivered_at INT DEFAULT NULL,
@@ -419,7 +423,7 @@ trait RequestSchemaTrait
                 CREATE TABLE IF NOT EXISTS known_destinations (
                     destination_hash_hex VARCHAR(64) NOT NULL,
                     packet_hash_hex VARCHAR(64) DEFAULT NULL,
-                    public_key_hex VARCHAR(64) DEFAULT NULL,
+                    public_key_hex VARCHAR(128) DEFAULT NULL,
                     identity_hash_hex VARCHAR(64) DEFAULT NULL,
                     app_data_base64 TEXT,
                     ratchet_hex VARCHAR(128) DEFAULT NULL,
@@ -652,6 +656,43 @@ trait RequestSchemaTrait
                     }
                     $summary['errors'][] = "widen_column {$table}.{$column}: " . $e->getMessage();
                 }
+            }
+        }
+
+        // A public key is 128 hex characters. Until 2026-10-15 a fresh
+        // install declared these VARCHAR(64): MySQL in strict mode refused
+        // every announce's key, and with an empty sql_mode cut it to 64,
+        // after which every later announce of that destination was refused
+        // as a key conflict (repairTruncatedPublicKeys()). retichat.com's
+        // tables, built by older code, have 255 and are left as they are.
+        // A longer VARCHAR keeps its length bytes, so InnoDB widens it in
+        // place.
+        $keys = [
+            ['known_destinations', 'public_key_hex'],
+            ['outbound_packets', 'destination_public_key_hex'],
+        ];
+        foreach ($keys as [$table, $column]) {
+            $what = "widen_column {$table}.{$column}";
+            try {
+                $stmt = $this->db->prepare(
+                    'SELECT DATA_TYPE, CHARACTER_MAXIMUM_LENGTH FROM information_schema.COLUMNS
+                      WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :t AND COLUMN_NAME = :c'
+                );
+                $stmt->execute([':t' => $table, ':c' => $column]);
+                $row = $stmt->fetch(PDO::FETCH_NUM);
+                $stmt->closeCursor();
+                if ($row === false || strtolower((string) $row[0]) !== 'varchar' || (int) $row[1] >= 128) {
+                    continue;
+                }
+                $startedAt = microtime(true);
+                $this->db->exec("ALTER TABLE `{$table}` MODIFY `{$column}` VARCHAR(128) DEFAULT NULL, ALGORITHM=INPLACE, LOCK=NONE");
+                $summary['columns_widened'] = ($summary['columns_widened'] ?? 0) + 1;
+                self::noteBuilt($summary, "widened {$table}.{$column} to VARCHAR(128)", $startedAt);
+            } catch (PDOException $e) {
+                if (self::lockWaitTimedOut($summary, $e, $what)) {
+                    return;
+                }
+                $summary['errors'][] = "{$what}: " . $e->getMessage();
             }
         }
     }
@@ -1012,6 +1053,75 @@ trait RequestSchemaTrait
             $summary['seeded_backfilled'] = (int) $this->db->exec('UPDATE interfaces SET seeded_at = 0 WHERE seeded_at IS NULL');
         } catch (\Throwable $e) {
             $summary['errors'][] = 'backfill seeded_at: ' . $e->getMessage();
+        }
+    }
+
+    /**
+     * Public keys a VARCHAR(64) column cut short (ensureColumnTypes()). A
+     * known destination's key is rebuilt from its stored announce: the first
+     * 64 bytes of the payload, taken only when they and the announce's name
+     * hash give the destination's hash and the stored half is their prefix.
+     * With no such announce the row goes, and the destination's next
+     * announce makes it again; until then its truncated key refused that
+     * announce. A queued packet's truncated key is cleared: its proof is
+     * then checked against the known destination's key, as for a packet
+     * queued with none. Each migration; a database with no short key reads
+     * known_destinations once and changes nothing.
+     */
+    private function repairTruncatedPublicKeys(array &$summary): void
+    {
+        try {
+            $short = $this->db->query(
+                'SELECT destination_hash_hex, packet_hash_hex, public_key_hex FROM known_destinations
+                  WHERE public_key_hex IS NOT NULL AND LENGTH(public_key_hex) <> 128'
+            )->fetchAll(PDO::FETCH_ASSOC);
+            $repaired = 0;
+            $dropped = 0;
+            if ($short !== []) {
+                $announces = $this->db->prepare(
+                    'SELECT payload_base64 FROM inbound_packets
+                      WHERE packet_hash_hex = :h AND packet_type = 1 AND payload_base64 IS NOT NULL'
+                );
+                $fix = $this->db->prepare(
+                    'UPDATE known_destinations SET public_key_hex = :key WHERE destination_hash_hex = :d AND public_key_hex = :old'
+                );
+                $drop = $this->db->prepare('DELETE FROM known_destinations WHERE destination_hash_hex = :d AND public_key_hex = :old');
+                foreach ($short as $row) {
+                    $destHex = strtolower((string) $row['destination_hash_hex']);
+                    $old = (string) $row['public_key_hex'];
+                    $key = null;
+                    $announces->execute([':h' => (string) ($row['packet_hash_hex'] ?? '')]);
+                    foreach ($announces->fetchAll(PDO::FETCH_COLUMN) as $payloadBase64) {
+                        $payload = base64_decode((string) $payloadBase64, true);
+                        if (!is_string($payload) || strlen($payload) < 74) {
+                            continue;
+                        }
+                        $candidate = substr($payload, 0, 64);
+                        $identityHash = substr(hash('sha256', $candidate, true), 0, 16);
+                        $destination = substr(hash('sha256', substr($payload, 64, 10) . $identityHash, true), 0, 16);
+                        if (bin2hex($destination) === $destHex && str_starts_with(bin2hex($candidate), strtolower($old))) {
+                            $key = bin2hex($candidate);
+                            break;
+                        }
+                    }
+                    if ($key !== null) {
+                        $fix->execute([':key' => $key, ':d' => (string) $row['destination_hash_hex'], ':old' => $old]);
+                        $repaired += $fix->rowCount();
+                    } else {
+                        $drop->execute([':d' => (string) $row['destination_hash_hex'], ':old' => $old]);
+                        $dropped += $drop->rowCount();
+                    }
+                }
+            }
+            $cleared = (int) $this->db->exec(
+                'UPDATE outbound_packets SET destination_public_key_hex = NULL
+                  WHERE destination_public_key_hex IS NOT NULL AND LENGTH(destination_public_key_hex) <> 128'
+            );
+            if ($repaired + $dropped + $cleared > 0) {
+                $summary['public_keys'] = ['repaired' => $repaired, 'dropped' => $dropped, 'cleared' => $cleared];
+            }
+        } catch (\Throwable $e) {
+            $summary['errors'][] = 'repair truncated public keys: ' . $e->getMessage();
         }
     }
 

@@ -34,8 +34,8 @@ require_once $root . '/src/index.php';
 // if the change alters what migrate() builds, raise schemaVersion() too, so
 // every database that recorded the old version migrates again; then pin the
 // new pair here.
-const PINNED_SCHEMA_VERSION = 'seed-once-1';
-const PINNED_SCHEMA_TRAIT_MASKED_SHA1 = '2b87cf7542fef8348c69e2bcbc9ea0ce289ab38f';
+const PINNED_SCHEMA_VERSION = 'key-width-1';
+const PINNED_SCHEMA_TRAIT_MASKED_SHA1 = 'cf0e054753caec93121ea2fdd9559a92d433dc85';
 
 $dir = sys_get_temp_dir() . '/reticulum-php-marker-test-' . bin2hex(random_bytes(4));
 mkdir($dir, 0775, true);

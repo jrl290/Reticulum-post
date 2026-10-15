@@ -6,8 +6,10 @@
  * the MySQL-only statements the node issues as MySQL would: the session's
  * lock_wait_timeout and SET SESSION, information_schema, SHOW INDEX, ON
  * DUPLICATE KEY, the ENGINE, ALGORITHM and LOCK clauses, an ALTER adding
- * several columns, OPTIMIZE and ANALYZE TABLE (a table's failure as rows of
- * the answer). It can fail one statement with 1205, MySQL's lock wait
+ * several columns, an ALTER ... MODIFY of a column's type (kept in the
+ * table stand_in_column_types, which information_schema's answers read,
+ * since SQLite cannot change a declared type), OPTIMIZE and ANALYZE TABLE
+ * (a table's failure as rows of the answer). It can fail one statement with 1205, MySQL's lock wait
  * timeout, or with any other exception. Used by
  * schema_migration_lock_wait_test.php and storage_reclaim_lock_wait_test.php.
  *
@@ -55,6 +57,12 @@ final class MysqlStandInPdo extends PDO
 
             return 0;
         }
+        if (preg_match('/\AALTER TABLE `(\w+)` MODIFY `(\w+)` (\w+(?:\(\d+\))?)[^,]*, ALGORITHM=INPLACE, LOCK=NONE\z/', $sql, $m) === 1) {
+            $this->columnTypes();
+            parent::prepare('INSERT OR REPLACE INTO stand_in_column_types (tbl, col, type) VALUES (?, ?, ?)')->execute([$m[1], $m[2], $m[3]]);
+
+            return 0;
+        }
         $rows = 0;
         foreach (self::sqlite($sql) as $sqlite) {
             $rows += (int) parent::exec($sqlite);
@@ -83,8 +91,17 @@ final class MysqlStandInPdo extends PDO
     public function prepare(string $query, array $options = []): PDOStatement|false
     {
         [$sqlite] = self::sqlite($this->note($query, 'prepare'));
+        if (str_contains($sqlite, 'stand_in_column_types')) {
+            $this->columnTypes();
+        }
 
         return parent::prepare($sqlite, $options);
+    }
+
+    /** The types MODIFY gave, by table and column. */
+    private function columnTypes(): void
+    {
+        parent::exec('CREATE TABLE IF NOT EXISTS stand_in_column_types (tbl TEXT NOT NULL, col TEXT NOT NULL, type TEXT NOT NULL, PRIMARY KEY (tbl, col))');
     }
 
     private function note(string $statement, string $via): string
@@ -141,6 +158,11 @@ final class MysqlStandInPdo extends PDO
                 => 'SELECT name AS COLUMN_NAME FROM pragma_table_info(:table)',
             'SELECT DATA_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :t AND COLUMN_NAME = :c'
                 => 'SELECT lower(type) AS DATA_TYPE FROM pragma_table_info(:t) WHERE name = :c',
+            'SELECT DATA_TYPE, CHARACTER_MAXIMUM_LENGTH FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :t AND COLUMN_NAME = :c'
+                => "SELECT lower(CASE WHEN instr(type, '(') > 0 THEN substr(type, 1, instr(type, '(') - 1) ELSE type END) AS DATA_TYPE,
+                           CASE WHEN instr(type, '(') > 0 THEN CAST(substr(type, instr(type, '(') + 1) AS INTEGER) END AS CHARACTER_MAXIMUM_LENGTH
+                      FROM (SELECT COALESCE((SELECT m.type FROM stand_in_column_types AS m WHERE m.tbl = :t AND m.col = p.name), p.type) AS type
+                              FROM pragma_table_info(:t) AS p WHERE p.name = :c)",
             'SELECT TABLE_NAME, INDEX_NAME FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE()'
                 => "SELECT m.name AS TABLE_NAME, il.name AS INDEX_NAME FROM sqlite_master AS m, pragma_index_list(m.name) AS il WHERE m.type = 'table'",
             'SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE()'
