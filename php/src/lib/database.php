@@ -80,9 +80,9 @@ final class CountingPdo extends \PDO
     public function query(string $query, ?int $fetchMode = null, mixed ...$fetchModeArgs): \PDOStatement|false
     {
         self::note($query);
-        return $fetchMode === null
+        return BufferedSqliteStatement::finish($fetchMode === null
             ? parent::query($query)
-            : parent::query($query, $fetchMode, ...$fetchModeArgs);
+            : parent::query($query, $fetchMode, ...$fetchModeArgs), $fetchMode);
     }
 
     /** Append this request's tally to $path (called from a shutdown function). */
@@ -100,6 +100,183 @@ final class CountingPdo extends \PDO
             'top'     => array_slice(self::$counts, 0, 8, true),
         ], JSON_UNESCAPED_SLASHES);
         @file_put_contents($path, $line . "\n", FILE_APPEND | LOCK_EX);
+    }
+}
+
+/**
+ * The SQLite connection: query() results are finished like prepared ones.
+ *
+ * PDO::query() executes inside PDO, without calling the statement's execute(),
+ * so BufferedSqliteStatement has to be told to read its result here.
+ */
+final class SqlitePdo extends \PDO
+{
+    public function query(string $query, ?int $fetchMode = null, mixed ...$fetchModeArgs): \PDOStatement|false
+    {
+        return BufferedSqliteStatement::finish($fetchMode === null
+            ? parent::query($query)
+            : parent::query($query, $fetchMode, ...$fetchModeArgs), $fetchMode);
+    }
+}
+
+/**
+ * A SQLite statement that reads its whole result at execute().
+ *
+ * In WAL mode a read keeps its snapshot until its statement finishes. The node
+ * mostly reads one row with fetch() and moves on, which leaves the statement
+ * open; the next write on that connection must then upgrade the snapshot to a
+ * write lock, and SQLite refuses at once with "database is locked" when another
+ * process committed in between. busy_timeout does not apply: waiting cannot
+ * make a stale snapshot current. That is why selectiv left SQLite in July
+ * (6dc8486); reproduced 2026-10-14 at 12% of exchanges with nine interfaces,
+ * from acknowledgeOutboundBatches() and new-interface seeding.
+ *
+ * Finishing every read at execute() means no statement holds a snapshot past
+ * the call that ran it, which is what PDO MySQL's default buffered queries
+ * already do. Results are small (every node query is bounded), so the copy is
+ * cheap. Fetch modes the node does not use are refused rather than imitated.
+ * See tests/sqlite_reads_hold_no_snapshot_test.php.
+ */
+final class BufferedSqliteStatement extends \PDOStatement
+{
+    /** @var list<list<mixed>>|null rows not yet fetched; null = not a read */
+    private ?array $rows = null;
+    /** @var list<string> */
+    private array $names = [];
+    private int $next = 0;
+
+    protected function __construct()
+    {
+    }
+
+    /** Read the result of a statement PDO::query() has just executed. */
+    public static function finish(\PDOStatement|false $statement, ?int $fetchMode = null): \PDOStatement|false
+    {
+        if ($statement instanceof self) {
+            if ($fetchMode !== null) {
+                throw new \LogicException('Pass the fetch mode to fetch(), not to query(), on SQLite');
+            }
+            $statement->readResult();
+        }
+
+        return $statement;
+    }
+
+    public function execute(?array $params = null): bool
+    {
+        $this->rows = null;
+        $ok = parent::execute($params);
+        $this->readResult();
+
+        return $ok;
+    }
+
+    private function readResult(): void
+    {
+        $this->rows = null;
+        $this->next = 0;
+        $columns = $this->columnCount();
+        if ($columns === 0) {
+            return; // a write: nothing to read, and rowCount() stays PDO's
+        }
+        $names = [];
+        for ($i = 0; $i < $columns; $i++) {
+            $names[] = (string) ($this->getColumnMeta($i)['name'] ?? $i);
+        }
+        $rows = parent::fetchAll(PDO::FETCH_NUM);
+        parent::closeCursor();
+        $this->names = $names;
+        $this->rows = $rows;
+    }
+
+    private static function supported(int $mode): void
+    {
+        if (!in_array($mode, [PDO::FETCH_DEFAULT, PDO::FETCH_ASSOC, PDO::FETCH_NUM, PDO::FETCH_BOTH], true)) {
+            throw new \LogicException('Fetch mode ' . $mode . ' is not supported on SQLite statements');
+        }
+    }
+
+    private function shape(array $row, int $mode): array
+    {
+        self::supported($mode);
+        return match ($mode) {
+            PDO::FETCH_DEFAULT, PDO::FETCH_ASSOC => array_combine($this->names, $row),
+            PDO::FETCH_NUM => $row,
+            PDO::FETCH_BOTH => array_combine($this->names, $row) + $row,
+        };
+    }
+
+    public function fetch(int $mode = PDO::FETCH_DEFAULT, int $cursorOrientation = PDO::FETCH_ORI_NEXT, int $cursorOffset = 0): mixed
+    {
+        if ($this->rows === null) {
+            return parent::fetch($mode, $cursorOrientation, $cursorOffset);
+        }
+        if ($cursorOrientation !== PDO::FETCH_ORI_NEXT) {
+            throw new \LogicException('Only forward fetches are supported on SQLite statements');
+        }
+        $row = $this->rows[$this->next] ?? null;
+        if ($row === null) {
+            self::supported($mode); // refuse an unsupported mode on an empty result too
+            return false;
+        }
+        $this->next++;
+
+        return $this->shape($row, $mode);
+    }
+
+    public function fetchColumn(int $column = 0): mixed
+    {
+        if ($this->rows === null) {
+            return parent::fetchColumn($column);
+        }
+        $row = $this->rows[$this->next] ?? null;
+        if ($row === null) {
+            return false;
+        }
+        if (!array_key_exists($column, $row)) {
+            throw new \ValueError('Column index ' . $column . ' is out of range');
+        }
+        $this->next++;
+
+        return $row[$column];
+    }
+
+    public function fetchAll(int $mode = PDO::FETCH_DEFAULT, mixed ...$args): array
+    {
+        if ($this->rows === null) {
+            return parent::fetchAll($mode, ...$args);
+        }
+        $rest = array_slice($this->rows, $this->next);
+        $this->next = count($this->rows);
+        if ($mode === PDO::FETCH_COLUMN) {
+            $column = (int) ($args[0] ?? 0);
+            return array_map(static fn(array $row): mixed => $row[$column], $rest);
+        }
+
+        return array_map(fn(array $row): array => $this->shape($row, $mode), $rest);
+    }
+
+    public function closeCursor(): bool
+    {
+        if ($this->rows !== null) {
+            $this->next = count($this->rows);
+            return true;
+        }
+
+        return parent::closeCursor();
+    }
+
+    public function getIterator(): \Iterator
+    {
+        if ($this->rows === null) {
+            return parent::getIterator();
+        }
+
+        return (function (): \Generator {
+            while (($row = $this->fetch()) !== false) {
+                yield $row;
+            }
+        })();
     }
 }
 
@@ -222,11 +399,14 @@ final class Database
             throw new RuntimeException('Unable to create SQLite directory: ' . $dir);
         }
 
-        $pdo = new $pdoClass('sqlite:' . $sqlitePath, null, null, [
+        $pdo = new ($pdoClass === \PDO::class ? SqlitePdo::class : $pdoClass)('sqlite:' . $sqlitePath, null, null, [
             PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
             PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
             PDO::ATTR_EMULATE_PREPARES   => false,
         ]);
+        // Every read finishes at execute(), so no statement keeps a WAL
+        // snapshot open into the next write (see BufferedSqliteStatement).
+        $pdo->setAttribute(PDO::ATTR_STATEMENT_CLASS, [BufferedSqliteStatement::class]);
 
         // SQLite busy timeout: wait up to 5s instead of immediately failing
         // when another connection holds a write lock. SQLite serializes writes,
