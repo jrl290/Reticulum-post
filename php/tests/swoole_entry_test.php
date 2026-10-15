@@ -303,8 +303,13 @@ check('...Passengerfile.json starts swoole_server.php with the secret\'s path',
         === ['app_start_command' => '/usr/local/bin/php -d extension=swoole.so ' . $web . '/swoole_server.php ' . $appRoot . '/front_secret'],
     (string) @file_get_contents($appRoot . '/Passengerfile.json'));
 check('...restart.txt is touched', is_file($appRoot . '/tmp/restart.txt'));
+check('...Apache can pass through to Passengerfile.json (dirs 711, file 644), not list or read the secret',
+    (fileperms($appRoot) & 0777) === 0711 && (fileperms($appRoot . '/tmp') & 0777) === 0711
+    && (fileperms($appRoot . '/Passengerfile.json') & 0777) === 0644);
 check('...the .htaccess keeps its rules and ends with the block',
-    $htaccess === $existing . "\n" . SwooleSetup::BEGIN . "\nPassengerAppRoot \"{$appRoot}\"\nPassengerBaseURI \"/reticulum\"\n"
+    $htaccess === $existing . "\n" . SwooleSetup::BEGIN . "\nRewriteEngine Off\n"
+        . "<FilesMatch \"^(config(\\.local)?\\.(toml|php)|error_log)$|\\.sqlite\">\n    Require all denied\n</FilesMatch>\n"
+        . "PassengerAppRoot \"{$appRoot}\"\nPassengerBaseURI \"/reticulum\"\n"
         . "RequestHeader set X-Front-Secret \"{$secret}\"\n" . SwooleSetup::END . "\n", $htaccess);
 [$code] = $run($config(true));
 check('on again: the same .htaccess and the same secret', $code === 0

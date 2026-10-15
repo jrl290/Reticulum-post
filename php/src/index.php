@@ -1141,18 +1141,16 @@ final class HttpApi
     use RequestHttpApiHelperTrait;
 
     /**
-     * $build: the build stamp, from a process that serves many requests (the
-     * Swoole entry, LoadedCode::buildStamp()). /health must name the code that
-     * answers, and a deploy replaces the files under a running process;
-     * otherwise the stamp is read from $buildStampDir.
-     *
-     * @param (\Closure(): array{commit: ?string, stamped_at: ?string})|null $build
+     * $loaded: the code a resident process loaded (the Swoole entry; null
+     * under Apache). /health must name the code that answers, and a deploy
+     * replaces the files under a running process, so the stamp comes from
+     * LoadedCode::buildStamp() there; otherwise from $buildStampDir.
      */
     public function __construct(
         private readonly array $config,
         private readonly Storage $storage,
         private readonly string $buildStampDir = __DIR__,
-        private readonly ?\Closure $build = null
+        private readonly ?LoadedCode $loaded = null
     ) {
     }
 
@@ -1172,12 +1170,15 @@ final class HttpApi
             'status' => 'ok',
             'transport_basis' => requestTransportMechanism(),
             'environment' => Environment::verify(),
-            'build' => $this->build !== null ? ($this->build)() : BuildStamp::read($this->buildStampDir),
+            'build' => $this->loaded?->buildStamp() ?? BuildStamp::read($this->buildStampDir),
             // Which server answered and on which database: what the config's
-            // swoole.enable_swoole and storage.backend asked for, as running.
+            // swoole.enable_swoole and storage.backend asked for, as running;
+            // and when the Swoole process loaded its code (null under
+            // Apache), which `php index.php runtime` waits on after a restart.
             'runtime' => [
-                'server' => PHP_SAPI === 'cli' && extension_loaded('swoole') ? 'swoole' : 'php',
+                'server' => $this->loaded !== null ? 'swoole' : 'php',
                 'storage' => Database::backend($this->config),
+                'started_at' => $this->loaded?->loadedAt,
             ],
             'queues' => $this->storage->healthSummary(),
             'php_interface_registry' => $this->storage->healthInterfaceRegistry(5),

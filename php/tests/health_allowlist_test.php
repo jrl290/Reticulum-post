@@ -33,9 +33,10 @@
  * browsers_online {signed, legacy} and hash_only_challenges, and still no
  * identity hash, token, key or browser row, a signed browser's included (e).
  *
- * `runtime` (2026-10-14) is exactly server (swoole or php) and storage (mysql
- * or sqlite): what the config's swoole.enable_swoole and storage.backend
- * asked for, as running; `php index.php runtime` reads server back.
+ * `runtime` (2026-10-14) is exactly server (swoole or php), storage (mysql
+ * or sqlite) and started_at (when a Swoole process loaded its code; null
+ * here): what the config's swoole.enable_swoole and storage.backend asked
+ * for, as running; `php index.php runtime` reads server and started_at back.
  *
  * Run: php tests/health_allowlist_test.php
  */
@@ -188,8 +189,9 @@ $topKeys = array_keys($decoded);
 sort($topKeys);
 check('top level is status, transport_basis, environment, build, runtime, queues, php_interface_registry, registration',
     $topKeys === ['build', 'environment', 'php_interface_registry', 'queues', 'registration', 'runtime', 'status', 'transport_basis'], implode(',', $topKeys));
-check('runtime is exactly server and storage, as this node runs (php, here)',
-    ($decoded['runtime'] ?? null) === ['server' => 'php', 'storage' => \ReticulumPhp\Database::backend($config)], json_encode($decoded['runtime'] ?? null));
+check('runtime is exactly server, storage and started_at, as this node runs (php, here)',
+    ($decoded['runtime'] ?? null) === ['server' => 'php', 'storage' => \ReticulumPhp\Database::backend($config), 'started_at' => null],
+    json_encode($decoded['runtime'] ?? null));
 check('build is exactly commit and stamped_at (tests/build_stamp_test.php covers the stamp)',
     array_keys($decoded['build'] ?? []) === ['commit', 'stamped_at'], json_encode($decoded['build'] ?? null));
 

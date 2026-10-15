@@ -69,7 +69,7 @@ final class SwooleNode
         try {
             EmptyPoll::answer($this->config, $method, $uri, $server);
             $storage = new Storage($this->config, $this->connection());
-            (new HttpApi($this->config, $storage, build: $this->code->buildStamp(...)))->handle($method, $uri, $server);
+            (new HttpApi($this->config, $storage, loaded: $this->code))->handle($method, $uri, $server);
         } catch (\Swoole\ExitException) {
             // respond() and EmptyPoll::answer() end with exit, which Swoole
             // turns into this exception: the answer is in the buffer.
@@ -191,10 +191,13 @@ final class LoadedCode
 {
     /** @var array<string, string> */
     private array $fingerprint;
+    /** Unix time the code was loaded: /health's runtime.started_at. */
+    public readonly int $loadedAt;
 
     public function __construct(private readonly string $dir)
     {
         $this->fingerprint = self::fingerprint($dir);
+        $this->loadedAt = time();
     }
 
     /** @return array{commit: ?string, stamped_at: ?string} */
@@ -233,7 +236,10 @@ final class LoadedCode
  * the code now on disk at the next request. Off: removes that block, and
  * Apache serves index.php again; the app root stays, unused.
  * Then GET host_url/health must say runtime.server is swoole, or php.
- * Everything else in .htaccess is left as it is.
+ * Everything else in .htaccess is left as it is, but while the block stands
+ * mod_rewrite is off in that directory (index.php's rewrite would take every
+ * request from Passenger), so the block refuses the config, error_log and
+ * SQLite files itself.
  */
 final class SwooleSetup
 {
@@ -293,6 +299,7 @@ final class SwooleSetup
             } else {
                 fwrite($out, $htaccessPath . ($enabled ? ' already routes to Passenger' : ' has no Passenger block') . "\n");
             }
+            $touchedAt = time();
             if ($enabled) {
                 $restart = self::appRoot($config) . '/tmp/restart.txt';
                 if (!@touch($restart)) {
@@ -313,17 +320,32 @@ final class SwooleSetup
 
             return 0;
         }
-        [$status, $server] = self::healthRuntime($hostUrl . '/health');
-        if ($status === 200 && $server === $expected) {
-            fwrite($out, 'runtime: ' . $hostUrl . '/health answers from ' . $server . "\n");
+        // Apache reads .htaccess per request, so php answers at once; Passenger
+        // notices restart.txt within its stat throttle (seconds on selectiv)
+        // and keeps the old process until then, so swoole must answer from a
+        // process started after the touch. This is an operator's command, not
+        // a request: it may wait, within a bound.
+        $deadline = microtime(true) + self::RESTART_WAIT_SECONDS;
+        do {
+            [$status, $server, $startedAt] = self::healthRuntime($hostUrl . '/health');
+            $current = $status === 200 && $server === $expected && ($expected === 'php' || ($startedAt ?? 0) >= $touchedAt);
+            if ($current) {
+                fwrite($out, 'runtime: ' . $hostUrl . '/health answers from ' . $server
+                    . ($expected === 'swoole' ? ', started ' . (time() - (int) $startedAt) . ' s ago, after the restart' : '') . "\n");
 
-            return 0;
-        }
-        fwrite($err, 'runtime: ' . $expected . ' configured, but ' . $hostUrl . '/health answered '
-            . ($status === 0 ? 'nothing' : $status . ' from ' . ($server ?? 'an unknown server')) . "\n");
+                return 0;
+            }
+            usleep(500_000);
+        } while (microtime(true) < $deadline);
+        fwrite($err, 'runtime: ' . $expected . ' configured, but after ' . self::RESTART_WAIT_SECONDS . ' s ' . $hostUrl . '/health answered '
+            . ($status === 0 ? 'nothing' : $status . ' from ' . ($server ?? 'an unknown server')
+                . ($server === 'swoole' && $expected === 'swoole' ? ' started before the restart' : '')) . "\n");
 
         return 1;
     }
+
+    /** How long `runtime` waits for Passenger to restart the app. */
+    private const RESTART_WAIT_SECONDS = 30;
 
     /** Writes the app root and returns the .htaccess block. */
     private static function enable(array $config, string $webDir, $out): string
@@ -354,8 +376,14 @@ final class SwooleSetup
         if (!is_file($server)) {
             throw new \RuntimeException($server . ' is missing');
         }
-        if (!is_dir($appRoot . '/tmp') && !@mkdir($appRoot . '/tmp', 0700, true) && !is_dir($appRoot . '/tmp')) {
+        // Apache (Passenger's core) reads Passengerfile.json and tmp/: the
+        // directories may be passed through, not listed. Only the app, as
+        // this account, reads the secret.
+        if (!is_dir($appRoot . '/tmp') && !@mkdir($appRoot . '/tmp', 0711, true) && !is_dir($appRoot . '/tmp')) {
             throw new \RuntimeException('could not create ' . $appRoot . '/tmp');
+        }
+        if (!@chmod($appRoot, 0711) || !@chmod($appRoot . '/tmp', 0711)) {
+            throw new \RuntimeException('could not make ' . $appRoot . ' and its tmp/ passable (0711)');
         }
         if (!is_file($secretPath)) {
             self::writeAtomically($secretPath, bin2hex(random_bytes(32)), 0600);
@@ -368,18 +396,27 @@ final class SwooleSetup
         $command = $phpBinary . ($extension === '' ? '' : ' -d extension=' . $extension) . ' ' . $server . ' ' . $secretPath;
         $passengerfile = json_encode(['app_start_command' => $command], JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR) . "\n";
         if (!is_file($appRoot . '/Passengerfile.json') || file_get_contents($appRoot . '/Passengerfile.json') !== $passengerfile) {
-            self::writeAtomically($appRoot . '/Passengerfile.json', $passengerfile, 0600);
+            self::writeAtomically($appRoot . '/Passengerfile.json', $passengerfile, 0644);
             fwrite($out, 'wrote ' . $appRoot . '/Passengerfile.json: ' . $command . "\n");
         }
 
+        // index.php's rewrite would hand every request to PHP before
+        // Passenger sees it, so mod_rewrite is off here while this block
+        // stands. A file that exists is still served by Apache itself, not
+        // Passenger, so the config, logs and databases are refused here
+        // rather than by a rewrite rule that is now off.
         return self::BEGIN . "\n"
+            . 'RewriteEngine Off' . "\n"
+            . '<FilesMatch "^(config(\.local)?\.(toml|php)|error_log)$|\.sqlite">' . "\n"
+            . '    Require all denied' . "\n"
+            . '</FilesMatch>' . "\n"
             . 'PassengerAppRoot "' . $appRoot . '"' . "\n"
             . 'PassengerBaseURI "' . ($baseUri === '' ? '/' : $baseUri) . '"' . "\n"
             . 'RequestHeader set X-Front-Secret "' . $secret . '"' . "\n"
             . self::END . "\n";
     }
 
-    /** @return array{0: int, 1: ?string} the status and runtime.server */
+    /** @return array{0: int, 1: ?string, 2: ?int} the status, runtime.server and runtime.started_at */
     private static function healthRuntime(string $url): array
     {
         $curl = curl_init($url);
@@ -388,8 +425,9 @@ final class SwooleSetup
         $status = (int) curl_getinfo($curl, CURLINFO_RESPONSE_CODE);
         $decoded = is_string($body) ? json_decode($body, true) : null;
         $server = is_array($decoded) && is_string($decoded['runtime']['server'] ?? null) ? $decoded['runtime']['server'] : null;
+        $startedAt = is_array($decoded) && is_int($decoded['runtime']['started_at'] ?? null) ? $decoded['runtime']['started_at'] : null;
 
-        return [$status, $server];
+        return [$status, $server, $startedAt];
     }
 
     private static function writeAtomically(string $path, string $content, int $mode): void
