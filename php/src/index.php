@@ -511,6 +511,24 @@ final class Config
         );
         $config['registration'] = $registrationConfig;
 
+        // [swoole]: enable_swoole says which server answers this node, the
+        // Swoole entry under Passenger or index.php under Apache; `php
+        // index.php runtime` makes Apache route requests that way (see
+        // SwooleSetup). Off by default.
+        $swooleConfig = $config['swoole'] ?? [];
+        if (!is_array($swooleConfig)) {
+            throw new RuntimeException('swoole configuration must be an object');
+        }
+        $swooleConfig['enable_swoole'] = self::configBoolOrDefault($swooleConfig, 'enable_swoole', 'swoole.enable_swoole', false);
+        $swooleConfig['workers'] = self::positiveConfigIntOrDefault($swooleConfig, 'workers', 'swoole.workers', 4);
+        $swooleConfig['max_body_bytes'] = self::positiveConfigIntOrDefault($swooleConfig, 'max_body_bytes', 'swoole.max_body_bytes', 8 * 1024 * 1024);
+        foreach (['base_uri', 'app_root', 'php_binary', 'extension'] as $field) {
+            if (array_key_exists($field, $swooleConfig) && !is_string($swooleConfig[$field])) {
+                throw new RuntimeException('swoole.' . $field . ' must be a string');
+            }
+        }
+        $config['swoole'] = $swooleConfig;
+
         // [interfaces] is the PHP peering (one [[Name]] per peer: type =
         // PostInterface, node_url, wake_url), read by initializeNode() and
         // ensureConfiguredPeerSessions(), which pass over an entry that is not
@@ -1123,16 +1141,18 @@ final class HttpApi
     use RequestHttpApiHelperTrait;
 
     /**
-     * $build: the build stamp as it was when this code was loaded, from a
-     * process that serves many requests (the Swoole entry). /health must name
-     * the code that answers, and a deploy replaces the files under a running
-     * process; otherwise the stamp is read from $buildStampDir.
+     * $build: the build stamp, from a process that serves many requests (the
+     * Swoole entry, LoadedCode::buildStamp()). /health must name the code that
+     * answers, and a deploy replaces the files under a running process;
+     * otherwise the stamp is read from $buildStampDir.
+     *
+     * @param (\Closure(): array{commit: ?string, stamped_at: ?string})|null $build
      */
     public function __construct(
         private readonly array $config,
         private readonly Storage $storage,
         private readonly string $buildStampDir = __DIR__,
-        private readonly ?array $build = null
+        private readonly ?\Closure $build = null
     ) {
     }
 
@@ -1152,7 +1172,13 @@ final class HttpApi
             'status' => 'ok',
             'transport_basis' => requestTransportMechanism(),
             'environment' => Environment::verify(),
-            'build' => $this->build ?? BuildStamp::read($this->buildStampDir),
+            'build' => $this->build !== null ? ($this->build)() : BuildStamp::read($this->buildStampDir),
+            // Which server answered and on which database: what the config's
+            // swoole.enable_swoole and storage.backend asked for, as running.
+            'runtime' => [
+                'server' => PHP_SAPI === 'cli' && extension_loaded('swoole') ? 'swoole' : 'php',
+                'storage' => Database::backend($this->config),
+            ],
             'queues' => $this->storage->healthSummary(),
             'php_interface_registry' => $this->storage->healthInterfaceRegistry(5),
             'registration' => $this->storage->registrationHealth(),
@@ -1474,6 +1500,12 @@ function initializeRuntime(string $projectRoot, ?array $reticulumPhpConfig = nul
 function runIndexCli(string $projectRoot, array $argv): int
 {
     $mode = $argv[1] ?? 'once';
+    if ($mode === 'runtime') {
+        // Before initializeRuntime(): routing needs the config, not the database.
+        require_once __DIR__ . '/lib/swoole_node.php';
+
+        return SwooleSetup::apply(loadRuntimeConfig($projectRoot), __DIR__, !in_array('--no-verify', $argv, true), STDOUT, STDERR);
+    }
     if ($mode === 'migrate') {
         // Before initializeRuntime(), whose migrateIfNeeded() would record
         // the version: this mode records none.

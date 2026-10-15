@@ -94,6 +94,19 @@
 # build back. A ref whose index.php has no migrate mode (any before Stage 1, on
 # a rollback) skips the step.
 #
+# THE SERVER THE CONFIG NAMES
+# ===========================
+# A node is answered by index.php under Apache, or by the Swoole entry
+# (swoole_server.php) that Passenger keeps running, as its config's
+# [swoole] enable_swoole says. A running Swoole process keeps the code it
+# loaded, so after each node's swap the deploy runs the new release's
+# `php index.php runtime`: it routes Apache as the config says, restarts the
+# Swoole app on the code now on disk (tmp/restart.txt), and checks that
+# /health's runtime.server agrees; the deploy stops if it does not. A ref
+# without that mode (before it, on a rollback) is refused before anything is
+# uploaded to a node whose .htaccess hands requests to Swoole: set
+# enable_swoole = false and run `php index.php runtime` there first.
+#
 # Credentials come from the environment. Keep them in a gitignored deploy.env:
 #
 #   export RETICHAT_SSH_PASS=...   RETICHAT_SSH_HOST=retichat@retichat.com
@@ -399,6 +412,23 @@ migrate_node() {
   echo "  ${GREEN}✓${NC} ${label} — schema ready for ${REF_SHA} (no version recorded; its first request records it)"
 }
 
+# index.php's runtime mode (THE SERVER THE CONFIG NAMES); a ref without it
+# skips the step, and is refused where the node is routed to Swoole.
+RUNTIME_MARKER='SwooleSetup::apply('
+SWOOLE_BLOCK_MARKER='# BEGIN Reticulum Swoole'
+RUNTIME_OK="runtime-ok"
+
+runtime_node() {
+  local label="$1" host="$2"
+  local applied
+  applied="$("${ssh_cmd[@]}" "$host" "cd ~/${REMOTE_DIR} || exit 1; trap '' HUP PIPE; php index.php runtime 2>&1 && echo ${RUNTIME_OK}")"
+  sed -e "/^${RUNTIME_OK}\$/d" -e 's/^/    /' <<< "${applied:-(no answer from the node)}"
+  if [[ "${applied##*$'\n'}" != "$RUNTIME_OK" ]]; then
+    rollback_hint "$host" "$pass_var"
+    die "${label}: the code is live, but the server its config names does not answer (php index.php runtime failed)"
+  fi
+}
+
 # Nodes holding this ref, linted, in ~/reticulum-incoming, one
 # "label|host_var|pass_var" per line; step 5 swaps exactly these.
 STAGED=""
@@ -411,6 +441,11 @@ stage_node() {
   if ! node_commands "$host_var" "$pass_var"; then
     echo "  ${DIM}skipped — ${host_var} not set${NC}"
     return 0
+  fi
+
+  if ! grep -qF "$RUNTIME_MARKER" "$STAGE_SRC/index.php" \
+    && "${ssh_cmd[@]}" "$host" "grep -qF '${SWOOLE_BLOCK_MARKER}' ~/${REMOTE_DIR}/.htaccess 2>/dev/null"; then
+    die "${label} is routed to Swoole, and ${REF_SHA} has no runtime mode to restart or remove it: set enable_swoole = false there and run php index.php runtime first (nothing changed)"
   fi
 
   # A fresh incoming directory every deploy, so nothing a previous one left
@@ -524,6 +559,10 @@ swap_node() {
     sed -e "/^${LINT_OK}\$/d" -e 's/^/    /' <<< "${lint:-(no answer from the node)}"
     rollback_hint "$host" "$pass_var"
     die "${label}: deployed code does not parse (or could not be linted)"
+  fi
+
+  if grep -qF "$RUNTIME_MARKER" "$STAGE_SRC/index.php"; then
+    runtime_node "$label" "$host"
   fi
 
   DEPLOYED="${DEPLOYED}${label}|${host_var}|${pass_var}"$'\n'

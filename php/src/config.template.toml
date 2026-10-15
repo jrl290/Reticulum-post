@@ -1,7 +1,12 @@
 host_url = "https://your-domain.com/reticulum"
 
 [storage]
+# "mysql" or "sqlite". SQLite keeps the node in one file, sqlite_path
+# (default var/reticulum-php.sqlite, under the web directory: keep var/
+# refused there, see README). Switching starts on that database as it is;
+# the other one is left untouched, so switching back finds it as it was.
 backend = "mysql"
+# sqlite_path = "/home/you/reticulum-data/node.sqlite"
 mysql_host = "127.0.0.1"
 mysql_port = 3306
 mysql_dbname = "reticulum_php"
@@ -51,6 +56,15 @@ path_expiry_default_seconds = 604800
 path_expiry_access_point_seconds = 86400
 path_expiry_roaming_seconds = 21600
 max_random_blobs = 64
+
+[swoole]
+# Which server answers this node: false = index.php under Apache; true = the
+# Swoole entry (swoole_server.php), a resident process Passenger starts
+# behind Apache. `php index.php runtime` (deploy.sh runs it) routes Apache
+# accordingly and checks /health's runtime.server. Other settings: see the
+# top of swoole_server.php.
+enable_swoole = false
+# workers = 4
 
 [registration]
 enforce_signed_registration = false   # browsers only. James turns it on, on a date he sets.

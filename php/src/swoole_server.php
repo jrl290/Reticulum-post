@@ -10,35 +10,35 @@ declare(strict_types=1);
  * in lib/swoole_node.php.
  *
  * Apache keeps 80 and 443 and TLS; Passenger starts this file, gives it PORT
- * on 127.0.0.1 and proxies plain HTTP to it with the full path. Setup, with
- * the node's files where deploy.sh puts them (~/public_html/reticulum) and
- * the app root outside the web root, as the 2026-10-14 probes ran:
+ * on 127.0.0.1 and proxies plain HTTP to it with the full path.
  *
- *   ~/reticulum-swoole/Passengerfile.json:
- *     {"app_start_command": "/usr/local/bin/php -d extension=swoole.so
- *       /home/<user>/public_html/reticulum/swoole_server.php"}
- *   ~/public_html/reticulum/.htaccess, ahead of the existing rules:
- *     PassengerAppRoot /home/<user>/reticulum-swoole
- *     PassengerBaseURI /reticulum
- *     RequestHeader set X-Front-Secret "<swoole.front_secret>"
+ * It runs only where the config says so, [swoole] enable_swoole = true, and
+ * `php index.php runtime` (deploy.sh runs it after every swap) writes the
+ * rest: the Passenger app root outside the web root (~/reticulum-swoole:
+ * Passengerfile.json, whose app_start_command starts this file with the
+ * front secret's path; the secret; tmp/restart.txt) and the block in the web
+ * directory's .htaccess that hands requests to Passenger with the secret in
+ * X-Front-Secret. A request without it is refused with 403: the loopback
+ * port is open to every account on the host. Setting enable_swoole = false
+ * and running `php index.php runtime` hands the node back to index.php.
+ * See SwooleSetup in lib/swoole_node.php.
  *
  * Config, [swoole] (all optional):
- *   workers       worker processes, each answering one request at a time
- *                 like one lsphp process (default 4)
- *   base_uri      the URL path the node answers under, index.php's directory
- *                 in SCRIPT_NAME under Apache (default: PassengerBaseURI,
- *                 which Passenger exports, else host_url's path)
- *   front_secret  when set, a request without this X-Front-Secret header is
- *                 refused with 403: the loopback port is open to every
- *                 account on the host, Apache's .htaccess adds the header
+ *   enable_swoole   this server answers the node (default false)
+ *   workers         worker processes, each answering one request at a time
+ *                   like one lsphp process (default 4)
+ *   base_uri        the URL path the node answers under (default: host_url's
+ *                   path; PassengerBaseURI, which Passenger exports, here)
+ *   app_root        the Passenger app root (default ~/reticulum-swoole)
+ *   php_binary      the PHP CLI Passenger starts (default /usr/local/bin/php)
+ *   extension       the extension to load (default swoole.so; "" if built in)
  *   max_body_bytes  largest request body (default 8 MiB; Swoole answers 413)
- *   max_requests  replace a worker after this many requests (default 0, never)
+ *   max_requests    replace a worker after this many requests (default 0, never)
  *
  * The code and the config are read once, at start, before the workers fork,
- * so every worker runs the same release and /health names it. A deploy or a
- * config change takes effect only when the app restarts
- * (`touch ~/reticulum-swoole/tmp/restart.txt`, or kill it: Passenger starts
- * it again).
+ * so every worker runs the same release. A deploy or a config change takes
+ * effect when the app restarts (`php index.php runtime` touches restart.txt);
+ * until then /health's build is unknown (LoadedCode).
  */
 
 namespace ReticulumPhp;
@@ -71,15 +71,27 @@ require_once __DIR__ . '/index.php';
 require_once __DIR__ . '/lib/swoole_node.php';
 
 $config = loadRuntimeConfig(resolveRuntimeProjectRoot(__DIR__));
-$build = BuildStamp::read(__DIR__);
-$settings = is_array($config['swoole'] ?? null) ? $config['swoole'] : [];
-$frontSecret = (string) ($settings['front_secret'] ?? '');
+if (!SwooleSetup::enabled($config)) {
+    fwrite(STDERR, "swoole_server.php: swoole.enable_swoole is off in the config; `php index.php runtime` hands the node back to index.php\n");
+    exit(1);
+}
+$code = new LoadedCode(__DIR__);
+$settings = $config['swoole'];
+// The path Passengerfile.json's app_start_command passes; none for a test.
+$frontSecret = '';
+if (isset($argv[1])) {
+    $frontSecret = trim((string) @file_get_contents($argv[1]));
+    if (preg_match('/^[0-9a-f]{64}$/', $frontSecret) !== 1) {
+        fwrite(STDERR, "swoole_server.php: {$argv[1]} does not hold a front secret\n");
+        exit(1);
+    }
+}
 $baseUri = rtrim((string) ($settings['base_uri']
     ?? (getenv('PASSENGER_BASE_URI') ?: (parse_url((string) ($config['host_url'] ?? ''), PHP_URL_PATH) ?: ''))), '/');
 
 $server = new \Swoole\Http\Server('127.0.0.1', $port, SWOOLE_PROCESS);
 $server->set([
-    'worker_num' => max(1, (int) ($settings['workers'] ?? 4)),
+    'worker_num' => $settings['workers'],
     // A request goes to an idle worker, never queued behind a busy one.
     'dispatch_mode' => 3,
     // exit becomes Swoole\ExitException only inside a coroutine; with the
@@ -88,7 +100,7 @@ $server->set([
     'enable_coroutine' => true,
     'hook_flags' => 0,
     'max_request' => max(0, (int) ($settings['max_requests'] ?? 0)),
-    'package_max_length' => max(1, (int) ($settings['max_body_bytes'] ?? 8 * 1024 * 1024)),
+    'package_max_length' => $settings['max_body_bytes'],
     'http_compression' => false,
     'http_parse_post' => false,
     'http_parse_cookie' => false,
@@ -99,8 +111,8 @@ $server->set([
 /** @var SwooleNode|null $node this worker's */
 $node = null;
 
-$server->on('workerStart', static function () use (&$node, $config, $build): void {
-    $node = new SwooleNode($config, $build);
+$server->on('workerStart', static function () use (&$node, $config, $code): void {
+    $node = new SwooleNode($config, $code);
 });
 
 $server->on('request', static function (\Swoole\Http\Request $request, \Swoole\Http\Response $response) use (&$node, $frontSecret, $baseUri): void {

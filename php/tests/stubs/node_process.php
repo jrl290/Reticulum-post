@@ -23,6 +23,11 @@ function startNodeProcess(string $srcDir, int $port, string $outFile)
         $command = $extension === ''
             ? [PHP_BINARY, $srcDir . '/swoole_server.php']
             : [PHP_BINARY, '-d', 'extension=' . $extension, $srcDir . '/swoole_server.php'];
+        // The entry runs only where the config enables it.
+        $config = (string) @file_get_contents($srcDir . '/config.toml');
+        if (!str_contains($config, '[swoole]')) {
+            file_put_contents($srcDir . '/config.toml', rtrim($config, "\n") . "\n\n[swoole]\nenable_swoole = true\n");
+        }
         $env = getenv();
         $env['PORT'] = (string) $port;
         echo "(runtime: swoole_server.php)\n";

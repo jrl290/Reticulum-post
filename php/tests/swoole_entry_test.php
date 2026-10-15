@@ -20,6 +20,16 @@
  *     finds nothing cannot pass.
  * (d) swoole_server.php reached through a web server answers 404 and starts
  *     nothing.
+ * (e) The flags: [swoole] enable_swoole and [storage] backend read as the
+ *     node's other switches do, off and mysql by default, and the template
+ *     loads.
+ * (f) `php index.php runtime` (SwooleSetup): on, it writes the app root
+ *     (Passengerfile.json, the front secret, tmp/restart.txt) and the
+ *     .htaccess block; again, nothing changes; off, it removes only the
+ *     block. It refuses an app root inside the web directory and a node with
+ *     no base path.
+ * (g) LoadedCode: /health names the stamp on disk only while the code on
+ *     disk is the code the process loaded.
  *
  * The node's answers under Swoole are held to index.php's by running the
  * HTTP tests on it: RETICULUM_TEST_RUNTIME=swoole (tests/stubs/node_process.php).
@@ -231,6 +241,103 @@ proc_terminate($proc);
 proc_close($proc);
 @unlink($out);
 check('404, empty', $status === 404 && $body === '', "$status " . var_export($body, true));
+
+echo "\n(e) the flags read as the node's other switches do\n";
+$tmp = sys_get_temp_dir() . '/swoole-entry-test-' . bin2hex(random_bytes(4));
+mkdir($tmp . '/web/lib', 0777, true);
+$load = static function (string $toml) use ($tmp): array {
+    file_put_contents($tmp . '/web/config.toml', $toml);
+    return \ReticulumPhp\Config::load($tmp . '/web');
+};
+$defaults = $load("host_url = \"https://example.test/reticulum\"\n");
+check('enable_swoole is off by default, and the database is mysql',
+    $defaults['swoole']['enable_swoole'] === false && \ReticulumPhp\Database::backend($defaults) === 'mysql'
+    && !\ReticulumPhp\SwooleSetup::enabled($defaults));
+foreach (['true' => true, '"yes"' => true, '1' => true, 'false' => false, '"off"' => false, '"no"' => false] as $value => $expected) {
+    $loaded = $load("[swoole]\nenable_swoole = {$value}\n");
+    check("enable_swoole = {$value} is " . ($expected ? 'on' : 'off'), \ReticulumPhp\SwooleSetup::enabled($loaded) === $expected);
+}
+$sqlite = $load("[storage]\nbackend = \"sqlite\"\n");
+check('backend = "sqlite" is SQLite, at var/ under the project root by default',
+    \ReticulumPhp\Database::backend($sqlite) === 'sqlite'
+    && in_array($sqlite['storage']['sqlite_path'], [realpath($tmp . '/web') . '/var/reticulum-php.sqlite', $tmp . '/web/var/reticulum-php.sqlite'], true),
+    (string) $sqlite['storage']['sqlite_path']);
+try {
+    $load("[swoole]\nworkers = 0\n");
+    check('workers = 0 is refused', false);
+} catch (\RuntimeException $error) {
+    check('workers = 0 is refused', true);
+}
+copy($src . '/config.template.toml', $tmp . '/web/config.toml');
+$template = \ReticulumPhp\Config::load($tmp . '/web');
+check('the template loads, with enable_swoole off and mysql', !\ReticulumPhp\SwooleSetup::enabled($template)
+    && \ReticulumPhp\Database::backend($template) === 'mysql');
+
+echo "\n(f) php index.php runtime routes Apache as the config says\n";
+use ReticulumPhp\SwooleSetup;
+$web = $tmp . '/web';
+touch($web . '/swoole_server.php');
+$appRoot = $tmp . '/app';
+$existing = "RewriteEngine On\nRedirectMatch 404 ^/reticulum/(error_log|var/)\nRewriteRule ^ index.php [L]\n";
+file_put_contents($web . '/.htaccess', $existing);
+$config = static fn (bool $on, array $extra = []): array => [
+    'host_url' => 'https://example.test/reticulum',
+    'swoole' => $extra + ['enable_swoole' => $on, 'app_root' => $appRoot],
+];
+$run = static function (array $config) use ($web): array {
+    $out = fopen('php://memory', 'w+');
+    $err = fopen('php://memory', 'w+');
+    $code = SwooleSetup::apply($config, $web, false, $out, $err);
+    rewind($out);
+    rewind($err);
+    return [$code, stream_get_contents($out), stream_get_contents($err)];
+};
+[$code, $said, $errors] = $run($config(true));
+$htaccess = (string) file_get_contents($web . '/.htaccess');
+$secret = trim((string) @file_get_contents($appRoot . '/front_secret'));
+check('on: exit 0', $code === 0, $errors);
+check('...a 64-hex front secret, mode 600', preg_match('/^[0-9a-f]{64}$/', $secret) === 1
+    && (fileperms($appRoot . '/front_secret') & 0777) === 0600);
+check('...Passengerfile.json starts swoole_server.php with the secret\'s path',
+    json_decode((string) @file_get_contents($appRoot . '/Passengerfile.json'), true)
+        === ['app_start_command' => '/usr/local/bin/php -d extension=swoole.so ' . $web . '/swoole_server.php ' . $appRoot . '/front_secret'],
+    (string) @file_get_contents($appRoot . '/Passengerfile.json'));
+check('...restart.txt is touched', is_file($appRoot . '/tmp/restart.txt'));
+check('...the .htaccess keeps its rules and ends with the block',
+    $htaccess === $existing . "\n" . SwooleSetup::BEGIN . "\nPassengerAppRoot \"{$appRoot}\"\nPassengerBaseURI \"/reticulum\"\n"
+        . "RequestHeader set X-Front-Secret \"{$secret}\"\n" . SwooleSetup::END . "\n", $htaccess);
+[$code] = $run($config(true));
+check('on again: the same .htaccess and the same secret', $code === 0
+    && file_get_contents($web . '/.htaccess') === $htaccess && trim((string) file_get_contents($appRoot . '/front_secret')) === $secret);
+[$code] = $run($config(false));
+check('off: only the block is removed', $code === 0 && file_get_contents($web . '/.htaccess') === $existing,
+    (string) file_get_contents($web . '/.htaccess'));
+[$code] = $run($config(false));
+check('off again: nothing changes', $code === 0 && file_get_contents($web . '/.htaccess') === $existing);
+[$code, , $errors] = $run($config(true, ['app_root' => $web . '/app']));
+check('an app root inside the web directory is refused, .htaccess untouched', $code === 1
+    && str_contains($errors, 'outside the web directory') && file_get_contents($web . '/.htaccess') === $existing, $errors);
+[$code, , $errors] = $run(['swoole' => ['enable_swoole' => true, 'app_root' => $appRoot]]);
+check('no host_url and no base_uri is refused', $code === 1 && str_contains($errors, 'needs host_url'), $errors);
+[$code, , $errors] = $run($config(true, ['php_binary' => '/usr/bin/php; rm -rf ~']));
+check('a value that would need quoting is refused', $code === 1 && str_contains($errors, 'swoole.php_binary'), $errors);
+check('withBlock() on an empty file is the block alone',
+    SwooleSetup::withBlock('', "B\n") === "B\n" && SwooleSetup::withBlock('', null) === '');
+
+echo "\n(g) /health's build is unknown once the loaded code was replaced\n";
+file_put_contents($web . '/index.php', '<?php // one release');
+file_put_contents($web . '/lib/a.php', '<?php // one release');
+file_put_contents($web . '/build.json', json_encode(['commit' => str_repeat('a', 40), 'stamped_at' => '2026-10-14T00:00:00Z']));
+$loaded = new \ReticulumPhp\LoadedCode($web);
+check('the stamp, while the code is the code loaded', $loaded->buildStamp()['commit'] === str_repeat('a', 40));
+file_put_contents($web . '/build.json', json_encode(['commit' => null]));
+check('...an unknown stamp on disk is unknown here too', $loaded->buildStamp()['commit'] === null);
+file_put_contents($web . '/build.json', json_encode(['commit' => str_repeat('a', 40), 'stamped_at' => '2026-10-14T00:00:00Z']));
+file_put_contents($web . '/lib/b.tmp', '<?php // the next release');
+rename($web . '/lib/b.tmp', $web . '/lib/a.php');
+check('a lib file renamed over (as the swap does): unknown, whatever the stamp says', $loaded->buildStamp() === ['commit' => null, 'stamped_at' => null]);
+check('...and a process that loads it now names the stamp', (new \ReticulumPhp\LoadedCode($web))->buildStamp()['commit'] === str_repeat('a', 40));
+exec('rm -rf ' . escapeshellarg($tmp));
 
 echo "\n$pass passed, $fail failed\n";
 exit($fail > 0 ? 1 : 0);
