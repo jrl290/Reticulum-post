@@ -108,6 +108,18 @@ $server->set([
     'log_level' => SWOOLE_LOG_WARNING,
 ]);
 
+// Start, shutdown and a worker's abnormal exit go to the node's error_log
+// (SwooleLifecycle says how to read them).
+$server->on('start', static function (\Swoole\Http\Server $server) use ($settings, $port, $code): void {
+    error_log(SwooleLifecycle::start((int) $server->master_pid, (int) $server->manager_pid, (int) $settings['workers'], $port, $code->buildStamp()['commit']));
+});
+$server->on('shutdown', static function (\Swoole\Http\Server $server) use ($code): void {
+    error_log(SwooleLifecycle::shutdown((int) $server->master_pid, $code->loadedAt, time()));
+});
+$server->on('workerError', static function (\Swoole\Http\Server $server, int $workerId, int $workerPid, int $exitCode, int $signal): void {
+    error_log(SwooleLifecycle::workerError($workerId, $workerPid, $exitCode, $signal));
+});
+
 /** @var SwooleNode|null $node this worker's */
 $node = null;
 
