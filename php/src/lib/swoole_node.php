@@ -226,6 +226,43 @@ final class LoadedCode
 }
 
 /**
+ * The lines swoole_server.php writes to the node's error_log when the server
+ * starts, when it shuts down, and when a worker dies, so a restart leaves a
+ * trace where the node's own lines are. On selectiv Passenger's output goes
+ * to Apache's error log, which the account cannot read: on 2026-10-15 the
+ * server restarted twice (runtime.started_at) with nothing to say why.
+ *
+ * Reading them: a SWOOLE-SHUTDOWN before a SWOOLE-START means the server was
+ * asked to stop (Passenger, an Apache restart, a deploy's restart.txt); a
+ * SWOOLE-START with no SWOOLE-SHUTDOWN since the last one means it was
+ * killed outright (SIGKILL, e.g. a CloudLinux limit), since a killed master
+ * says nothing. SWOOLE-WORKER-ERROR names a worker that exited abnormally;
+ * the manager starts another in its place.
+ */
+final class SwooleLifecycle
+{
+    private const SIGNALS = [1 => 'SIGHUP', 2 => 'SIGINT', 6 => 'SIGABRT', 9 => 'SIGKILL', 11 => 'SIGSEGV', 15 => 'SIGTERM'];
+
+    public static function start(int $masterPid, int $managerPid, int $workers, int $port, ?string $commit): string
+    {
+        return sprintf('[SWOOLE-START] master=%d manager=%d workers=%d port=%d build=%s',
+            $masterPid, $managerPid, $workers, $port, $commit === null ? 'unknown' : substr($commit, 0, 12));
+    }
+
+    public static function shutdown(int $masterPid, int $startedAt, int $now): string
+    {
+        return sprintf('[SWOOLE-SHUTDOWN] master=%d after %d s', $masterPid, max(0, $now - $startedAt));
+    }
+
+    public static function workerError(int $workerId, int $workerPid, int $exitCode, int $signal): string
+    {
+        $name = $signal === 0 ? '' : ' (' . (self::SIGNALS[$signal] ?? 'signal ' . $signal) . ')';
+
+        return sprintf('[SWOOLE-WORKER-ERROR] worker=%d pid=%d exit=%d signal=%d%s', $workerId, $workerPid, $exitCode, $signal, $name);
+    }
+}
+
+/**
  * `php index.php runtime`: makes Apache route the node the way the config
  * says, and checks that it does. deploy.sh runs it after every swap.
  *
