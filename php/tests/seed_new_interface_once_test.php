@@ -26,10 +26,16 @@
  *   (c) a browser with nothing queued before its first exchange is seeded,
  *       as before;
  *   (d) a PHP node peering row is never seeded;
- *   (e) the 64 cap holds;
+ *   (e) the 64 cap holds, and takes the destinations announced last;
  *   (f) a row that was there before the marker column (the schema the live
  *       nodes' code built) is not seeded by the migration's first request,
- *       while a row registered after it is.
+ *       while a row registered after it is;
+ *   (g) one destination whose accepted announces fill the newest 768
+ *       rows and more is seeded once, with the 63 destinations before it.
+ *
+ * On MySQL with ONLY_FULL_GROUP_BY in sql_mode (8.4's default) the seeding
+ * query was a SELECT DISTINCT ordered by a column it did not select, error
+ * 3065, until 2026-10-15; run this there with that mode to check it.
  *
  * Run: php tests/seed_new_interface_once_test.php
  * On MySQL (every table in the database is dropped first):
@@ -214,11 +220,29 @@ $node->seedInterfaceIfNew($peer);
 check('no announce is queued for it', queuedAnnounces($db, $peer) === [], json_encode(queuedAnnounces($db, $peer)));
 
 echo "\n(e) the 64 cap\n";
-announceThrough($node, $gateway, 70);
+$newest = announceThrough($node, $gateway, 70);
 $crowded = browserRow($node);
 firstExchange($node, $crowded);
 $count = count(queuedAnnounces($db, $crowded));
 check('with 74 destinations cached, a new browser gets 64', $count === 64, (string) $count);
+check('the 64 whose announces are newest', sameSet(queuedAnnounces($db, $crowded), array_slice($newest, -64)));
+
+echo "\n(g) one destination announcing 900 times does not crowd out the others\n";
+$chatty = RegFixture::identity();
+$chattyHash = '';
+for ($i = 0; $i < 900; $i++) {
+    $a = AnnounceFixture::announce($chatty, 'lxmf.delivery');
+    RegFixture::capture(static fn () => AnnounceFixture::ingest($node, $gateway, $a['raw']));
+    $chattyHash = $a['packet_hash_hex'];
+}
+$accepted = (int) $db->query("SELECT COUNT(*) FROM inbound_packets WHERE packet_type = 1 AND destination_hash_hex = '" . bin2hex(substr(hash('sha256', substr(hash('sha256', 'lxmf.delivery', true), 0, 10) . $chatty['hash'], true), 0, 16)) . "' AND announce_status IN ('validated', 'path_updated')")->fetchColumn();
+check('(precondition) its newest accepted announces fill the first chunks (' . $accepted . ' rows)', $accepted > 256 + 512);
+$behind = browserRow($node);
+firstExchange($node, $behind);
+$queued = queuedAnnounces($db, $behind);
+check('a new browser gets it once and the 63 destinations announced before it',
+    count($queued) === 64 && sameSet(array_diff($queued, array_slice($newest, -63)), [$chattyHash]) && count(array_unique($queued)) === 64,
+    count($queued) . ' ' . json_encode(array_values(array_diff($queued, array_slice($newest, -63)))));
 
 echo "\n(f) rows from before the marker\n";
 $oldPath = $dir . '/live.sqlite';
