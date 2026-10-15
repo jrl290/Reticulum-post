@@ -25,8 +25,9 @@ declare(strict_types=1);
  * Config, [swoole] (all optional):
  *   workers       worker processes, each answering one request at a time
  *                 like one lsphp process (default 4)
- *   base_uri      the URL path the node answers under (default: host_url's
- *                 path); index.php's SCRIPT_NAME under Apache
+ *   base_uri      the URL path the node answers under, index.php's directory
+ *                 in SCRIPT_NAME under Apache (default: PassengerBaseURI,
+ *                 which Passenger exports, else host_url's path)
  *   front_secret  when set, a request without this X-Front-Secret header is
  *                 refused with 403: the loopback port is open to every
  *                 account on the host, Apache's .htaccess adds the header
@@ -73,7 +74,8 @@ $config = loadRuntimeConfig(resolveRuntimeProjectRoot(__DIR__));
 $build = BuildStamp::read(__DIR__);
 $settings = is_array($config['swoole'] ?? null) ? $config['swoole'] : [];
 $frontSecret = (string) ($settings['front_secret'] ?? '');
-$baseUri = rtrim((string) ($settings['base_uri'] ?? (parse_url((string) ($config['host_url'] ?? ''), PHP_URL_PATH) ?: '')), '/');
+$baseUri = rtrim((string) ($settings['base_uri']
+    ?? (getenv('PASSENGER_BASE_URI') ?: (parse_url((string) ($config['host_url'] ?? ''), PHP_URL_PATH) ?: ''))), '/');
 
 $server = new \Swoole\Http\Server('127.0.0.1', $port, SWOOLE_PROCESS);
 $server->set([
