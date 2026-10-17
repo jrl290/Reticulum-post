@@ -107,8 +107,7 @@ trait RequestControlPlaneTrait
             $tagBytes = substr($tagBytes, 0, 16);
         }
 
-        $tagKeyHex = bin2hex(hex2bin($destinationHashHex) . $tagBytes);
-        if (!$this->rememberPathRequestTag($tagKeyHex)) {
+        if (!$this->rememberPathRequestTag(self::pathRequestTagKey($destinationHashHex, $tagBytes))) {
             return ['ignored', 'duplicate_path_request_tag', 0];
         }
 
