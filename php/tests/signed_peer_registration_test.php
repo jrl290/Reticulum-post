@@ -34,6 +34,13 @@
  *       token. The signed row is not touched.
  *   (5) the signed peer re-registers with its own key: its own row, re-bound
  *       in place with the fields it signed
+ *   (6) two rows with one peer_url (a gateway's first signed registration
+ *       beside its old unsigned row): phpPeerInterfaceByPeerUrl() and
+ *       exchangeWithPhpPeer() take the row seen most recently, in every form
+ *       of the URL; not "signed first", so a signed registration naming a PHP
+ *       peer's URL does not shadow the peer's own, more recently seen, row
+ *   (7) /health's browsers_online counts browsers only: signed gateways and
+ *       peers online leave it at 0, a signed browser makes it 1
  *
  * Nothing leaves the process: curl and sockets are recorded, not sent.
  *
@@ -448,6 +455,76 @@ if (isset($peers['signed'])) {
         $db->query("SELECT * FROM interfaces WHERE registration_proof = 'none' ORDER BY interface_id")->fetchAll(PDO::FETCH_ASSOC) === $squatRows);
     check('exactly one signed row', (int) $db->query("SELECT COUNT(*) FROM interfaces WHERE registration_proof = 'signed'")->fetchColumn() === 1);
 }
+
+echo "\n(6) two rows with one peer_url: the lookup takes the one seen most recently\n";
+// A gateway's first signed registration: its old unsigned row, last seen
+// before the restart and offline since, stays beside the new signed row with
+// the same peer_url (no row is re-bound across the two). Until 2026-10-16 the
+// lookup had no ORDER BY: SQLite's index order gave the OLD row, MySQL's
+// whichever interface_id sorts first.
+$node = node();
+$db = RegFixture::db($node);
+$gatewayUrl = 'http://switching-gateway.example:4371';
+$oldMd = ['client' => 'reticulum-php', 'implementation' => 'PostInterface', 'mode' => 6, 'peer_url' => $gatewayUrl,
+    'peer_interface_id' => 'old-' . bin2hex(random_bytes(14)), 'peer_session_token' => 'old-' . bin2hex(random_bytes(30))];
+[$old] = RegFixture::capture(static fn () => $node->registerFromBody(['name' => 'gateway, unsigned', 'bitrate' => 10000000, 'mtu' => 500, 'metadata' => $oldMd]));
+check('the gateway registers unsigned, as before its upgrade (200)', is_array($old), json_encode(RegFixture::outcome($old)));
+$db->prepare("UPDATE interfaces SET status = 'offline', last_seen_at = :t WHERE interface_id = :i")
+    ->execute([':t' => time() - 600, ':i' => $old['interface_id']]);
+$oldRow = rowById($node, $old['interface_id']);
+$switchIdentity = RegFixture::identity();
+$newMd = ['peer_interface_id' => 'new-' . bin2hex(random_bytes(14)), 'peer_session_token' => 'new-' . bin2hex(random_bytes(30))] + $oldMd;
+[$new] = RegFixture::capture(static fn () => RegFixture::register($node, $switchIdentity, $newMd, 'gateway, signed'));
+check('restarted on a signing build, it registers signed (200): a row of its own beside the old one',
+    is_array($new) && $new['interface_id'] !== $old['interface_id'], json_encode(RegFixture::outcome($new)));
+foreach ([$gatewayUrl, $gatewayUrl . '/', $gatewayUrl . '/v1/wake'] as $form) {
+    $lookup = $node->phpPeerInterfaceByPeerUrl($form);
+    check('phpPeerInterfaceByPeerUrl(' . json_encode($form) . '): the signed row, seen now, with its credentials; not the old one',
+        is_array($new) && ($lookup['interface_id'] ?? null) === $new['interface_id'] && ($lookup['peer_interface_id'] ?? null) === $newMd['peer_interface_id'],
+        json_encode($lookup));
+}
+Sent::$requests = [];
+[$result] = RegFixture::capture(static fn () => $node->exchangeWithPhpPeer($gatewayUrl));
+$payload = json_decode((Sent::$requests[0] ?? ['body' => ''])['body'], true);
+check('exchangeWithPhpPeer() posts the signed row\'s peer credentials, not the old row\'s',
+    ($result['status'] ?? null) === 'ok' && ($payload['interface_id'] ?? null) === $newMd['peer_interface_id']
+    && ($payload['session_token'] ?? null) === $newMd['peer_session_token'], json_encode([$result, Sent::$requests]));
+check('...and marks the signed row online; the old row is untouched, still offline',
+    is_array($new) && (rowById($node, $new['interface_id'])['status'] ?? null) === 'online' && rowById($node, $old['interface_id']) === $oldRow);
+
+// Not "signed first": a PHP node's own peering row is unsigned (connectToPeer
+// does not sign), and no address is checked, so a signed registration naming
+// that peer's URL must not shadow the row the peer itself keeps seen.
+$peerUrl = 'https://configured-peer.example/reticulum';
+$peerMd = ['client' => 'reticulum-php', 'mode' => 1, 'peer_url' => $peerUrl,
+    'peer_interface_id' => bin2hex(random_bytes(16)), 'peer_session_token' => bin2hex(random_bytes(32))];
+[$peerRow] = RegFixture::capture(static fn () => $node->registerFromBody(['name' => 'configured-peer.example', 'bitrate' => 1000000, 'mtu' => 500, 'metadata' => $peerMd]));
+$namerMd = ['peer_interface_id' => bin2hex(random_bytes(16)), 'peer_session_token' => bin2hex(random_bytes(32))] + $peerMd;
+[$namer] = RegFixture::capture(static fn () => RegFixture::register($node, RegFixture::identity(), $namerMd, 'names the peer'));
+check('a signed registration naming the PHP peer\'s peer_url: 200, a row of its own', is_array($peerRow) && is_array($namer)
+    && $namer['interface_id'] !== $peerRow['interface_id'], json_encode([RegFixture::outcome($peerRow), RegFixture::outcome($namer)]));
+if (is_array($peerRow) && is_array($namer)) {
+    // The signed row was last seen a minute ago; the peer exchanges now.
+    $db->prepare('UPDATE interfaces SET last_seen_at = :t WHERE interface_id = :i')->execute([':t' => time() - 60, ':i' => $namer['interface_id']]);
+    $node->touchInterface($peerRow['interface_id']);
+    check('the lookup takes the peer\'s own row, seen more recently, over the signed one',
+        ($node->phpPeerInterfaceByPeerUrl($peerUrl)['interface_id'] ?? null) === $peerRow['interface_id']);
+}
+
+echo "\n(7) /health's browsers_online counts browsers: a signed gateway or peer is none\n";
+$node = node();
+foreach (['a signed gateway in wake mode' => $signedMetadata, 'a signed gateway in poll mode' => RegFixture::pollGatewayMetadata(),
+          'a signed PHP-node peer' => ['client' => 'reticulum-php', 'mode' => 1] + RegFixture::phpPeerMetadata()] as $what => $md) {
+    [$answer] = RegFixture::capture(static fn () => RegFixture::register($node, RegFixture::identity(), $md, $what));
+    check("$what registers (200), online", is_array($answer) && (rowById($node, $answer['interface_id'])['status'] ?? null) === 'online',
+        json_encode(RegFixture::outcome($answer)));
+}
+$health = $node->registrationHealth();
+check('three signed rows online, none a browser: browsers_online {signed 0, legacy 0}',
+    ($health['browsers_online'] ?? null) === ['signed' => 0, 'legacy' => 0], json_encode($health));
+RegFixture::capture(static fn () => RegFixture::register($node, RegFixture::identity()));
+check('a signed browser joins them: browsers_online {signed 1, legacy 0}',
+    ($node->registrationHealth()['browsers_online'] ?? null) === ['signed' => 1, 'legacy' => 0], json_encode($node->registrationHealth()));
 
 echo "\n$pass passed, $fail failed\n";
 exit($fail === 0 ? 0 : 1);
