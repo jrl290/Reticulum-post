@@ -16,8 +16,9 @@
  * 409, each race leaving one row; a tampered field 403; a body without a
  * valid signature over a challenge whose count has since moved 403, not 409;
  * an audience key, a low-order key, bitrate 2^31, a 65-byte or numeric
- * implementation and a transport of 5: 400 bad_registration; a signed
- * reticulum-php or rns-post-interface 400 unknown_client; no refusal writes
+ * implementation and a transport of 5: 400 bad_registration; a signed client
+ * other than rns-js, reticulum-php and rns-post-interface 400 unknown_client
+ * (a signed peer or gateway: signed_peer_registration_test.php); no refusal writes
  * anything, not even the node secret; the answer has no plaintext token or
  * count; a bind whose §4.5 removal fails still answers its encrypted token
  * and logs failed=.
@@ -230,10 +231,8 @@ foreach (['an implementation of 65 bytes' => ['implementation', str_repeat('i', 
 refused($node, 'metadata with wake_url', RegFixture::body($browser, $fresh, RegFixture::browserMetadata() + ['wake_url' => 'https://x.example/wake']), 400, 'unsigned_metadata');
 refused($node, 'metadata.identity_hash of another identity',
     RegFixture::body($browser, $fresh, RegFixture::browserMetadata() + ['identity_hash' => $other['hash_hex']]), 400, 'identity_hash_mismatch');
-refused($node, 'a signed reticulum-php', RegFixture::body($browser, $fresh, ['client' => 'reticulum-php', 'implementation' => 'Reticulum-post', 'mode' => 1,
-    'peer_url' => 'https://relay-b.example.org/reticulum', 'peer_interface_id' => bin2hex(random_bytes(16)), 'peer_session_token' => bin2hex(random_bytes(32))]),
-    400, 'unknown_client');
-refused($node, 'a signed rns-post-interface', RegFixture::body($browser, $fresh, RegFixture::pollGatewayMetadata()), 400, 'unknown_client');
+refused($node, 'a signed client "x"', RegFixture::body($browser, $fresh, ['client' => 'x', 'implementation' => 'PostInterface', 'mode' => 1]), 400, 'unknown_client');
+refused($node, 'a signed client "RNS-JS"', RegFixture::body($browser, $fresh, ['client' => 'RNS-JS', 'mode' => 1]), 400, 'unknown_client');
 refused($node, 'a signed browser in mode 6', RegFixture::body($browser, $fresh, ['client' => 'rns-js', 'mode' => 6]), 400, 'transit_mode_not_allowed');
 refused($node, 'a signed browser with a transport', RegFixture::body($browser, $fresh, RegFixture::browserMetadata() + ['transport' => 'tcp']), 400, 'metadata_not_allowed');
 $lowx = RegFixture::identity('lowx');
@@ -259,7 +258,7 @@ foreach ([
         return $b;
     })(), [403, 'bad_registration_signature']],
     'a malformed body (400)' => [['registration' => ['version' => 1]], [400, 'bad_registration']],
-    'an unknown client (400)' => [RegFixture::body($browser, $forgedChallenge, RegFixture::pollGatewayMetadata()), [400, 'unknown_client']],
+    'an unknown client (400)' => [RegFixture::body($browser, $forgedChallenge, ['client' => 'x', 'mode' => 1]), [400, 'unknown_client']],
     'a low-order key (409 first: no challenge here)' => [RegFixture::body($lowx, $forgedChallenge, RegFixture::browserMetadata()), [409, 'stale_challenge']],
 ] as $label => [$refusedBody, $want]) {
     [$r] = RegFixture::capture(static fn () => $virgin->registerFromBody($refusedBody));
