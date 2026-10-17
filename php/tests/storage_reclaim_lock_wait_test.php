@@ -29,7 +29,8 @@ declare(strict_types=1);
  *      table is logged as not run;
  *  (f) `index.php once` reaches the same rebuilds through
  *      enforceStorageBudget(), under the same 2 s;
- *  (g) on SQLite the reclaim is a VACUUM, with no lock_wait_timeout;
+ *  (g) on SQLite the reclaim does nothing: no VACUUM, no OPTIMIZE, no
+ *      lock_wait_timeout, and the throttle is not stamped;
  *  (h) an exception other than PDOException out of an OPTIMIZE leaves the
  *      reclaim as before, thrown, and the session's value is put back on its
  *      way out.
@@ -227,12 +228,14 @@ check('both tables rebuilt, each once at 2, the value put back',
     ($summary['storage_reclaimed_tables'] ?? null) === RECLAIMED && ceilingHolds($pdo->log) && $pdo->lockWait === 86400,
     json_encode([$summary['storage_reclaimed_tables'] ?? null, ceilingOrder($pdo->log)]));
 
-echo "(g) on SQLite the reclaim is a VACUUM, with no lock_wait_timeout\n";
+echo "(g) on SQLite the reclaim does nothing\n";
 [$pdo, $storage] = node($dir . '/g.sqlite', 'sqlite', ['maintenance' => ['storage_reclaim_min_free_bytes' => 0]]);
 $summary = $storage->reclaimStorage();
-check('VACUUM, and no lock_wait_timeout read or set',
-    $summary['storage_reclaimed_tables'] === ['sqlite:vacuum'] && positions($pdo->log, '/\AVACUUM\z/') !== []
-    && positions($pdo->log, '/lock_wait_timeout|\AOPTIMIZE /') === [], json_encode(array_column($pdo->log, 'sql')));
+$stamp = $pdo->query("SELECT state_value FROM transport_state WHERE state_key = 'storage_reclaim_last_run_at'")->fetchColumn();
+check('nothing reclaimed; no VACUUM, OPTIMIZE or lock_wait_timeout; the throttle not stamped',
+    $summary['storage_reclaimed_tables'] === [] && $stamp === false
+    && positions($pdo->log, '/\AVACUUM|lock_wait_timeout|\AOPTIMIZE /i') === [],
+    json_encode([$stamp, array_column($pdo->log, 'sql')]));
 
 echo "(h) any other exception out of an OPTIMIZE leaves the reclaim as before, and the session's value is put back\n";
 [$pdo, $storage] = node($dir . '/h.sqlite');

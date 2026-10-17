@@ -3882,7 +3882,8 @@ so through one fixture, `php/tests/stubs/test_db.php`:
   run's leftovers are dropped by their name prefix at the next run's start (an
   event, not a timer);
 - the SQLite-only tests are named, each with its reason:
-  `sqlite_schema_upsert_test` and `storage_budget_test`'s vacuum case; the
+  `sqlite_schema_upsert_test` and `storage_budget_test`'s free-pages case
+  (SQLite is never vacuumed since 2026-10-17); the
   `sqlite_master` table probes elsewhere become a check that runs on every
   backend;
 - `wake_exchanges_only_with_stored_peer_url_test`'s simulated collation is

@@ -136,9 +136,9 @@ final class StorageBudgetHarness
     /** Drive the pruner with a footprint the SQLite file could never produce. */
     /**
      * Grow the database, then delete it back down, leaving pages on the
-     * freelist — SQLite's equivalent of InnoDB's data_free. Nothing returns
-     * them to the file until a VACUUM, which is exactly the situation the
-     * footprint has to be able to see.
+     * freelist — SQLite's equivalent of InnoDB's data_free. The node never
+     * returns them to the filesystem (the next insert reuses them), and the
+     * host still bills them, so the footprint has to be able to see them.
      */
     public function stageFreePages(): void
     {
@@ -346,8 +346,9 @@ check(true, $remaining >= 90, 'storage_prune_max_rows_per_pass bounds a single p
 
 // ── 11. Reclaim targeting on both backends ─────────────────────────────
 // MySQL reports free space per table; SQLite has one file and an empty
-// per_table map. Reading only per_table would silently never reclaim on
-// SQLite, and the budget would report success while the file stayed huge.
+// per_table map. SQLite is never reclaimed: the next insert reuses its freed
+// pages, and a VACUUM rewrites the whole file while every writer waits
+// (James, 2026-10-17). So however much is free, it has no targets.
 $harness = new StorageBudgetHarness();
 check(
     ['outbound_packets'],
@@ -361,9 +362,14 @@ check(
     'only tables with real slack are rebuilt'
 );
 check(
-    ['sqlite:vacuum'],
-    $harness->reclaimTargets(['database_free_bytes' => 120_000_000, 'per_table' => []], 64_000_000),
-    'a per_table-less footprint reclaims the whole file'
+    [],
+    $harness->reclaimTargets(['database_free_bytes' => 120_000_000, 'database_bytes' => 150_000_000, 'per_table' => []], 64_000_000),
+    'a SQLite footprint has nothing to rebuild, however much is free'
+);
+check(
+    [],
+    $harness->reclaimTargets(['database_free_bytes' => 120_000_000, 'database_bytes' => 150_000_000], 0),
+    '...even with no per_table key and no free-space threshold'
 );
 check(
     [],
@@ -444,6 +450,17 @@ check(
     $measured['database_bytes'] + $measured['database_free_bytes'] + $measured['log_bytes'],
     $measured['total_bytes'],
     'total_bytes counts freed-but-allocated pages, which the host still bills'
+);
+
+// Those free pages start nothing on SQLite: under budget, with every page
+// counted as worth reclaiming, the request path spawns no reclaim.
+$harness = new StorageBudgetHarness(['storage_reclaim_min_free_bytes' => 0]);
+$harness->stageFreePages();
+$summary = $harness->enforce(PHP_INT_MAX, $harness->storageFootprint('sqlite', false));
+check(
+    [false, false],
+    [array_key_exists('storage_reclaim_spawned', $summary), array_key_exists('storage_reclaim_deferred', $summary)],
+    'free SQLite pages spawn no reclaim and defer none'
 );
 
 // Pruning, by contrast, must stay keyed on live bytes. A DELETE moves bytes

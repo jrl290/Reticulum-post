@@ -46,6 +46,7 @@ storage_prune_min_age_seconds = 300
 outbound_pending_max_age_seconds = 86400
 # Reclaiming space means rebuilding the table (InnoDB frees pages to the
 # tablespace, not to the filesystem). Only `php index.php once` does this.
+# MySQL only: SQLite reuses its freed pages and is never rebuilt.
 storage_reclaim_min_free_bytes = 64000000
 storage_reclaim_min_interval_seconds = 3600
 

@@ -54,6 +54,13 @@ use RuntimeException;
  *      the operation that noticed the waste is the one that schedules the
  *      cleanup — there is no cron.
  *
+ * SQLite is never reclaimed. A DELETE does not shrink its file either, but its
+ * tables share one file and one freelist, and the next insert reuses a freed
+ * page before the file grows. Pruning keeps the live bytes under the budget, so the file stays
+ * near it too. A VACUUM would only hand slack back to the account after a
+ * spike, and it rewrites the whole file while every writer waits (James,
+ * 2026-10-17: "definitely get rid of VACUUM").
+ *
  * CONFIG (all under [maintenance])
  * ================================
  * storage_max_bytes: Total budget for everything Reticulum-php stores —
@@ -78,10 +85,10 @@ use RuntimeException;
  *   peer that stops acking otherwise pins its queue forever. Default 86400.
  *
  * storage_reclaim_min_free_bytes: Rebuild a table when its data_free exceeds
- *   this. Default 64000000 (64 MB).
+ *   this. Default 64000000 (64 MB). MySQL only.
  *
  * storage_reclaim_min_interval_seconds: Minimum gap between rebuilds.
- *   Default 3600.
+ *   Default 3600. MySQL only.
  */
 
 trait RequestStorageBudgetTrait
@@ -751,12 +758,7 @@ trait RequestStorageBudgetTrait
         $summary['storage_reclaimed_tables'] = [];
 
         if ($backend === 'sqlite') {
-            if (($footprint['database_free_bytes'] ?? 0) < $minFree) {
-                return;
-            }
-            $this->storageStateSet('storage_reclaim_last_run_at', (string) $now);
-            $this->db->exec('VACUUM');
-            $summary['storage_reclaimed_tables'][] = 'sqlite:vacuum';
+            // SQLite reuses its freed pages; see the header.
             return;
         }
 
@@ -849,8 +851,9 @@ trait RequestStorageBudgetTrait
      * Units of reclaimable space, or [] when there is nothing worth rebuilding.
      *
      * MySQL reports free space per table, so each qualifying table is its own
-     * target. SQLite has one file and no per-table accounting, so the whole
-     * database is a single target keyed off its freelist.
+     * target. SQLite's footprint has no per-table map, and SQLite is never
+     * reclaimed (see the header), so it has no targets and the request path
+     * spawns nothing for it.
      *
      * A table qualifies on either an absolute or a proportional test:
      *
@@ -874,15 +877,8 @@ trait RequestStorageBudgetTrait
             return $free >= $ratioFloor && $allocated > 0 && $free * 2 >= $allocated;
         };
 
-        if (($footprint['per_table'] ?? []) === []) {
-            return $qualifies(
-                (int) ($footprint['database_free_bytes'] ?? 0),
-                (int) ($footprint['database_bytes'] ?? 0)
-            ) ? ['sqlite:vacuum'] : [];
-        }
-
         $targets = [];
-        foreach ($footprint['per_table'] as $tableName => $stats) {
+        foreach ($footprint['per_table'] ?? [] as $tableName => $stats) {
             if ($qualifies((int) ($stats['free_bytes'] ?? 0), (int) ($stats['bytes'] ?? 0))) {
                 $targets[] = $tableName;
             }
