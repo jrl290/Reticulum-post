@@ -803,7 +803,9 @@ INDEX` with `Non_unique = 0` on MySQL and MariaDB, `PRAGMA index_list` with
 1061, 1072 and 1146 as harmless, so `migrate()` can report a clean run without
 the index. A query of this object that fails reports `schema_migrated: false`
 rather than answering `500`. `enforce_signed_registration` is the switch as
-loaded; `browsers_online` counts online signed rows, and online legacy rows
+loaded; `browsers_online` counts online signed browser rows (`client`
+`rns-js`, found by `metadata_json LIKE '%"client":"rns-js"%'`; since
+2026-10-16 a signed gateway or peer is not counted), and online legacy rows
 with a claim. `hash_only_challenges` counts challenge POSTs by
 `identity_hash` since the last database reset, each adding one by a single
 upsert on `executeWithRetry` that runs on all three engines; GETs and the
