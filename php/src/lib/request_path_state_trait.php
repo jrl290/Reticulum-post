@@ -103,6 +103,21 @@ trait RequestPathStateTrait
         Database::executeWithRetry($stmt, 'deletePathEntries');
     }
 
+    /**
+     * The key a path request's tag is remembered under: Python's unique_tag,
+     * the destination hash then the tag (Transport.py path_request_handler),
+     * hashed to 16 bytes so it fits path_request_tags.tag_key_hex
+     * (VARCHAR(32)). Until 2026-10-16 the key was those bytes in hex, 64
+     * characters: MySQL's INSERT IGNORE cut it to 32, the destination hash
+     * alone, so after one browser's path request every other request for
+     * that destination, with any tag, was ignored as a duplicate for
+     * path_request_tag_ttl_seconds (24 h). SQLite keeps the whole string.
+     */
+    private static function pathRequestTagKey(string $destinationHashHex, string $tagBytes): string
+    {
+        return bin2hex(substr(hash('sha256', hex2bin($destinationHashHex) . $tagBytes, true), 0, 16));
+    }
+
     private function rememberPathRequestTag(string $tagKeyHex): bool
     {
         $stmt = $this->db->prepare(Database::insertOrSql($this->backend,
