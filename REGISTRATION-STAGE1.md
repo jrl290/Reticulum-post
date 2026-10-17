@@ -117,10 +117,13 @@ word: its `relay` means PHP node.
 
 **Left as today.**
 
-- **Gateways** register unsigned (`reticulum-php` in wake mode,
-  `rns-post-interface` in poll mode), are found by their exact `peer_url`,
-  and are woken and exchange as today; a signed registration from anything
-  but a browser gets `400 unknown_client` (§4.3). Stage 2.
+- **Gateways** (`reticulum-php` in wake mode, `rns-post-interface` in poll
+  mode) and PHP-node peers register as today, unsigned, or, since
+  2026-10-16, sign the same registration (§4.3) under the rules their
+  unsigned one has; they are woken and exchange as today, and no address is
+  checked. An unsigned registration re-binds only an unsigned row by its
+  exact `peer_url`, never a signed one (§4.6). Any other client's signed
+  registration gets `400 unknown_client` (§4.3).
 - **Peering** (`connectToPeer`, the exchange inside the `/v1/wake` handler,
   the hourly repair of a dead session): Stage 3. **Paths and announces** on
   rows that are not browser rows (REGISTRATION.md §12.5): Stage 2.
@@ -264,7 +267,7 @@ Nothing is written before step 8.
 | 1 | Shape: the `registration` object (§4.1); `name` a non-empty JSON string of valid Unicode, at most 255 bytes as UTF-8; `bitrate` and `mtu` JSON integers from 1 to 2^31 − 1 (what today's `INT` columns hold); `mode` a JSON integer from 1 to 7; `client` a non-empty string of at most 64 bytes; `implementation`, `transport`, `peer_url`, `peer_interface_id` and `peer_session_token` each absent, `null`, or a JSON string of valid Unicode of at most 64, 64, 512, 64 and 128 bytes as UTF-8; `challenge`, `public_key`, `signature` lower-case hex of 96, 128, 128 characters. Strings, booleans and floats such as `1e6` where an integer belongs, and numbers, booleans, arrays and objects where a string belongs, are refused. | `400 bad_registration` |
 | 2 | Metadata keys within §4.1's set | `400 unsigned_metadata` |
 | 3 | `H = SHA-256(public_key)[:16]`; `metadata.identity_hash`, if present, equals `H` | `400 identity_hash_mismatch` |
-| 4 | `client` is `rns-js`; then `mode` is 1, 2, 4 or 7, not a transit mode; then `transport` and the three `peer_*` fields are empty (absent, `null` or `""`) | `400 unknown_client`, then `transit_mode_not_allowed`, then `metadata_not_allowed` |
+| 4 | `client` is `rns-js`, `reticulum-php` or `rns-post-interface`. For `rns-js`, then `mode` is 1, 2, 4 or 7, not a transit mode; then `transport` and the three `peer_*` fields are empty (absent, `null` or `""`). A `reticulum-php` peer or `rns-post-interface` gateway signs its mode and its own fields under the rules its unsigned registration has (since 2026-10-16) | `400 unknown_client`, then `transit_mode_not_allowed`, then `metadata_not_allowed` |
 | 5 | `sodium_crypto_sign_verify_detached(signature, signed, public_key[32:64])`, over bytes rebuilt from the received body | `403 bad_registration_signature` |
 | 6 | Read the row with `identity_hash = H` (its count, or 0); recompute the MAC over `H`, that count and the challenge's nonce; compare in constant time | `409 stale_challenge` |
 | 7 | A fresh session token, encrypted to `public_key[0:32]` (§5); an all-zero X25519 result (a low-order key) fails | `400 bad_registration` |
@@ -313,8 +316,13 @@ lower-case hex only, so no collation folds two values together.
   ```
 
 The row keeps its `interface_id`, so its queue, paths and local destinations
-survive a reload; `metadata_json` holds only `client`, `implementation` and
-`mode`. No placeholder appears twice. Every write goes through
+survive a reload; a browser's `metadata_json` holds only `client`,
+`implementation` and `mode`. A peer's or gateway's holds its metadata as
+signed, less `identity_hash`, and a `reticulum-php` row's `peer_url`
+(trimmed, no trailing `/`), `peer_interface_id` and `peer_session_token` are
+written by the INSERT and the UPDATE, as the unsigned registration stores
+them (empty ones as `NULL`); for any other client they are `NULL`
+(2026-10-16). No placeholder appears twice. Every write goes through
 `Database::executeWithRetry` (§2). Each is one autocommit statement, so
 InnoDB undoes all of it on 1213 or 1205 and a re-run leaves nothing
 half-done; a duplicate key (1062) on the count-0 INSERT is never re-run and
@@ -372,8 +380,10 @@ The answer is today's, with a plaintext `session_token`. The `LIKE` lookup on
 by `claimed_identity_hash = :claim`, and only browser rows carry one. So
 another `client`'s legacy registration can no longer re-bind a browser row by
 naming its identity hash (A8): the hash is ignored and logged
-`[REG-CLAIM-IGNORED]`, and the rest runs as today (a `reticulum-php` row
-re-bound by its exact `peer_url`, anything else a new row). Gateways send no
+`[REG-CLAIM-IGNORED]`, and the rest runs as today (an unsigned
+`reticulum-php` row re-bound by its exact `peer_url`, anything else a new
+row). Since 2026-10-16 a signed row is never re-bound so: a registration
+naming its `peer_url` gets what it would get without it. Gateways send no
 `identity_hash`.
 
 ## 5. The answer and its encrypted token
@@ -593,7 +603,7 @@ Every 4xx and 5xx body that carries an `error` is `{"error": "<code>",
 | 400 | `bad_registration` | a malformed `registration` object, signed field or `implementation`; a key that cannot receive a token | stops, says why |
 | 400 | `unsigned_metadata` | a metadata key outside §4.1's set | stops, says why |
 | 400 | `identity_hash_mismatch` | `metadata.identity_hash` ≠ `H` | stops, says why |
-| 400 | `unknown_client` | a signed registration whose `client` is not `rns-js` | stops, says why |
+| 400 | `unknown_client` | a signed registration whose `client` is not `rns-js`, `reticulum-php` or `rns-post-interface` | stops, says why |
 | 400 | `transit_mode_not_allowed` | `rns-js` in mode 3, 5 or 6, signed or legacy | stops, says why |
 | 400 | `metadata_not_allowed` | a signed `rns-js` registration with `transport` or a `peer_*` field | stops, says why |
 | 403 | `bad_registration_signature` | the signature does not verify | stops, says why |
@@ -1000,11 +1010,19 @@ with a bound that only fails it.
   valid signature over a challenge whose count has since moved `403`, not
   `409`; an `audience` key, a low-order key, `bitrate` 2^31, a 65-byte or
   numeric `implementation` and a `transport` of `5` `400 bad_registration`;
-  signed `reticulum-php` and `rns-post-interface` `400 unknown_client`; no
+  a signed client other than `rns-js`, `reticulum-php` and
+  `rns-post-interface` `400 unknown_client`; no
   refusal writes anything, not even the node secret; the answer has no
   plaintext token or count; a bind whose §4.5 removal fails still answers its
   encrypted token and logs `failed=`. *Today:* no challenge; a body with
   `registration` gets a plaintext token.
+- **`signed_peer_registration_test.php`** (2026-10-16): the gateway-wake,
+  php-relay-peer and gateway-poll vectors accepted, peer columns stored; the
+  peer negatives; the unsigned rules, no more; a signed peer row woken and
+  exchanged exactly like an unsigned one; an unsigned registration naming
+  its `peer_url` gets a row of its own and leaves it untouched; its own key
+  re-binds it. *Today:* `400 unknown_client`, and the unsigned registration
+  takes the row over.
 - **`registration_vectors_test.php`:** §15's browser vectors through the real
   code, the encrypted token byte for byte; it names each vector it skips.
   *Today:* no signed path.
@@ -1434,11 +1452,13 @@ as asked, "relay" included.
 | 2026-10-14 | "The browser's wait of 5 s" (§19, question 4) | "Back off 2 s to 5 min": option (b), now recorded in the principles' §3 | header, §2, §10, §14, §17.2, §19 |
 | 2026-10-14 | "The browser's backoff (2 s doubling to 5 min) resets only on a successful registration. After a network drop the session is still valid, so the next attempt is an exchange, and a successful exchange wouldn't reset it: separate drops over hours would grow an open tab's wait toward 5 min. What should reset the wait to 2 s?" | "Any success resets it (Recommended)": a successful exchange or registration | §2, §10, §14, §19, the principles' §3 |
 | 2026-10-14 | "Sign the address of the PHP node?" (§19, question 5) | "the verdict was to rely on Reticulum's security for PHP nodes. A compromised node still can only manifest as a black hole. It can't actually manipulate the messages. This is a standard risk of Reticulum." No address is signed. | §4.2, §14, §15, §16 item 6, §19 |
+| 2026-10-16 | Gateways and PHP-node peers signing the registration they already send, as browsers do: no address check, nothing else new | "Yes, thank you. I don't know why we were making anything special for the gateway anyway. The gateway should use the same negotiation as any other bidirectional peer" | §4.3, §4.4, §4.6, §9 |
 
 **This file's own choices**, which James may overrule:
 
-- The challenge is stateless (§3); only `rns-js` signs in Stage 1, others get
-  `400 unknown_client` (§4.3); `bitrate` and `mtu` stop at 2^31 − 1 (§4.3).
+- The challenge is stateless (§3); only `rns-js` signed in Stage 1 as first
+  built, and since 2026-10-16 `reticulum-php` and `rns-post-interface` sign
+  too (James's decision, above); others get `400 unknown_client` (§4.3); `bitrate` and `mtu` stop at 2^31 − 1 (§4.3).
 - The signature is checked before the challenge, so a request without the
   key learns nothing about the row (§4.3); the 11:57 explanation listed the
   code first.

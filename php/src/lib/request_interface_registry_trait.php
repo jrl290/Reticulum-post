@@ -185,7 +185,12 @@ trait RequestInterfaceRegistryTrait
         return $stmt->fetch(PDO::FETCH_NUM) !== false;
     }
 
-    public function phpPeerInterfaceByPeerUrl(string $peerUrl): ?array
+    /**
+     * $unsignedOnly: only a row no signature holds (identity_hash NULL), for
+     * the unsigned re-bind by peer_url (registerInterface), which must never
+     * touch a signed row.
+     */
+    public function phpPeerInterfaceByPeerUrl(string $peerUrl, bool $unsignedOnly = false): ?array
     {
         $peerUrl = rtrim($peerUrl, '/');
 
@@ -197,7 +202,7 @@ trait RequestInterfaceRegistryTrait
             'SELECT interface_id, peer_url, peer_interface_id, peer_session_token,
                     status, last_seen_at
              FROM interfaces
-             WHERE peer_url = :peer_url
+             WHERE peer_url = :peer_url' . ($unsignedOnly ? ' AND identity_hash IS NULL' : '') . '
              LIMIT 1'
         );
         $stmt->bindValue(':peer_url', $peerUrl, PDO::PARAM_STR);

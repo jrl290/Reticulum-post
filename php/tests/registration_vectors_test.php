@@ -14,7 +14,8 @@
  * checks; each pinned token through the real encryption, byte for byte.
  * Stage 2's vectors (the gateway and PHP-node registrations and negatives,
  * registration-capacity, url_canonical, gateway_confirm, php_relay_peer) are
- * skipped, each by name.
+ * skipped, each by name; since 2026-10-16 the gateway and PHP-node
+ * registrations and their negatives run in signed_peer_registration_test.php.
  *
  * Before Stage 1 none of this exists: registerInterface() takes the body's
  * metadata on trust and answers every negative 200 with a plaintext token.

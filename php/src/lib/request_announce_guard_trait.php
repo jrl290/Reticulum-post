@@ -22,9 +22,10 @@ use PDO;
  * It runs inside processAcceptedAnnounce(), right after
  * AnnounceValidator::validate and before anything is remembered, bound,
  * routed, cached or relayed, so both of that function's callers (an inbound
- * packet, and a cache request's replay) get it. A browser row is a signed row
- * or a row whose client is rns-js, in every mode; every other row follows
- * today's rules. A row that is gone when the announce is read owns nothing,
+ * packet, and a cache request's replay) get it. A browser row is a row whose
+ * client is rns-js, signed or not, in every mode; every other row, a signed
+ * peer's or gateway's too, follows today's rules. A row that is gone when the
+ * announce is read owns nothing,
  * so its announce is refused as foreign, whatever the row was, and logged
  * owner=gone: a PHP node peering row that connectToPeer() replaced during an
  * exchange must not read as a foreign announce. owner=none stays for a row
@@ -91,8 +92,9 @@ trait RequestAnnounceGuardTrait
     private function announceGuardRefusal(string $interfaceId, array $packet, array $announce): ?string
     {
         $facts = $this->rowRegistrationFacts($interfaceId);
-        if ($facts !== null && $facts['proof'] !== 'signed' && $facts['client'] !== 'rns-js') {
-            // Not a browser row: today's rules.
+        if ($facts !== null && $facts['client'] !== 'rns-js') {
+            // Not a browser row, signed or not: today's rules. A signed peer
+            // or gateway carries others' announces as an unsigned one does.
             return null;
         }
         $destinationHashHex = strtolower((string) ($packet['destination_hash_hex'] ?? ''));

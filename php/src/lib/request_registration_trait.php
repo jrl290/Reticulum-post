@@ -27,10 +27,13 @@ use PDOException;
  *   §11  [REG-*] and [SESSION-SUPERSEDED], each refusal logged, the two
  *        legacy 403s once per row and count
  *
- * Only a browser (client rns-js) signs in Stage 1; every other client's
- * registration runs as before, apart from an identity_hash it carries, which
- * is ignored. The announce rule for browser rows (§9) is
- * RequestAnnounceGuardTrait's.
+ * A browser (client rns-js) signs as Stage 1 has it. Since 2026-10-16 a
+ * bidirectional peer (reticulum-php) and a poll-mode gateway
+ * (rns-post-interface) may sign the same registration, under the rules their
+ * unsigned one has; a signed peer row also holds its peer columns, and no
+ * unsigned registration re-binds it. An unsigned registration runs as before,
+ * apart from an identity_hash it carries, which is ignored. The announce rule
+ * for browser rows (§9) is RequestAnnounceGuardTrait's.
  *
  * No log line carries a session token, signature, challenge or the node
  * secret (§11).
@@ -232,23 +235,30 @@ trait RequestRegistrationTrait
                 'metadata.identity_hash is not the hash of the registration key.', $context);
         }
 
-        // Step 4: only a browser signs, in an endpoint mode, with no transit
-        // fields. Step 1 took the mode only as a JSON integer from 1 to 7,
-        // which the signed bytes carry as one byte; it is read as the
-        // runtime reads it all the same.
-        if ($metadata['client'] !== 'rns-js') {
-            throw $this->registrationRefusal(400, 'unknown_client',
-                'A signed registration must name the client rns-js.', $context);
-        }
-        if (in_array(self::metadataMode($metadata), [3, 5, 6], true)) {
-            throw $this->registrationRefusal(400, 'transit_mode_not_allowed',
-                'A browser registers in mode 1, 2, 4 or 7.', $context);
-        }
-        foreach (['transport', 'peer_url', 'peer_interface_id', 'peer_session_token'] as $key) {
-            if (is_string($metadata[$key] ?? null) && $metadata[$key] !== '') {
-                throw $this->registrationRefusal(400, 'metadata_not_allowed',
-                    "A browser may not register {$key}.", $context);
+        // Step 4: who may sign. A browser (rns-js) in an endpoint mode, with
+        // no transit fields. A bidirectional peer (reticulum-php: a PHP
+        // node's peering, a gateway in wake mode) or a gateway in poll mode
+        // (rns-post-interface) signs its mode and its own fields under the
+        // rules its unsigned registration has (registerInterface): any mode,
+        // and peer columns only for reticulum-php. Anything else: 400.
+        // Step 1 took the mode only as a JSON integer from 1 to 7, which the
+        // signed bytes carry as one byte; it is read as the runtime reads it
+        // all the same.
+        $client = $metadata['client'];
+        if ($client === 'rns-js') {
+            if (in_array(self::metadataMode($metadata), [3, 5, 6], true)) {
+                throw $this->registrationRefusal(400, 'transit_mode_not_allowed',
+                    'A browser registers in mode 1, 2, 4 or 7.', $context);
             }
+            foreach (['transport', 'peer_url', 'peer_interface_id', 'peer_session_token'] as $key) {
+                if (is_string($metadata[$key] ?? null) && $metadata[$key] !== '') {
+                    throw $this->registrationRefusal(400, 'metadata_not_allowed',
+                        "A browser may not register {$key}.", $context);
+                }
+            }
+        } elseif ($client !== 'reticulum-php' && $client !== 'rns-post-interface') {
+            throw $this->registrationRefusal(400, 'unknown_client',
+                'A signed registration must name the client rns-js, reticulum-php or rns-post-interface.', $context);
         }
 
         // Step 5: the signature, over bytes rebuilt from the body as
@@ -281,14 +291,16 @@ trait RequestRegistrationTrait
                 'No session token can be encrypted to this key.', $context);
         }
 
-        // Step 8: the bind (§4.4).
-        $storedMetadata = $this->signedStoredMetadata($metadata);
+        // Step 8: the bind (§4.4). A peer's row also holds its peer columns,
+        // as the unsigned bind stores them; a field the signature reads as
+        // empty (absent, null or "") is stored as none.
+        $storedMetadata = $client === 'rns-js' ? $this->signedStoredMetadata($metadata) : self::signedPeerStoredMetadata($metadata);
         $values = [
             'name' => $body['name'],
             'bitrate' => $body['bitrate'],
             'mtu' => $body['mtu'],
             'metadata_json' => self::encodeJson($storedMetadata),
-        ];
+        ] + array_map(static fn (?string $value): ?string => $value === '' ? null : $value, self::peerColumns($metadata));
         if ($row === null) {
             $interfaceId = $this->bindSignedInsert($identityHashHex, $registration['public_key'], $sessionToken, $values, $context);
             $action = 'created';
@@ -375,6 +387,18 @@ trait RequestRegistrationTrait
     }
 
     /**
+     * A signed peer's or gateway's metadata_json: its metadata as signed, as
+     * registerInterface() stores an unsigned one's (identity_hash, which is
+     * H by step 3, lives in its own column).
+     */
+    private static function signedPeerStoredMetadata(array $metadata): array
+    {
+        unset($metadata['identity_hash']);
+
+        return $metadata;
+    }
+
+    /**
      * §4.4, count 0: INSERT a new identity row. A unique-key conflict means
      * another registration of H won the race: look the row up only to log
      * it, and answer 409 stale_challenge. Never a second INSERT.
@@ -387,11 +411,13 @@ trait RequestRegistrationTrait
             'INSERT INTO interfaces (
                 interface_id, name, session_token, bitrate, mtu, status, metadata_json,
                 created_at, last_seen_at, updated_at,
-                identity_hash, identity_public_key, registration_seq, registration_proof
+                identity_hash, identity_public_key, registration_seq, registration_proof,
+                peer_url, peer_interface_id, peer_session_token
             ) VALUES (
                 :interface_id, :name, :session_token, :bitrate, :mtu, :status, :metadata_json,
                 :created_at, :last_seen_at, :updated_at,
-                :identity_hash, :identity_public_key, :registration_seq, :registration_proof
+                :identity_hash, :identity_public_key, :registration_seq, :registration_proof,
+                :peer_url, :peer_interface_id, :peer_session_token
             )'
         );
         $stmt->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
@@ -408,6 +434,7 @@ trait RequestRegistrationTrait
         $stmt->bindValue(':identity_public_key', $publicKeyHex, PDO::PARAM_STR);
         $stmt->bindValue(':registration_seq', 1, PDO::PARAM_INT);
         $stmt->bindValue(':registration_proof', 'signed', PDO::PARAM_STR);
+        $this->bindPeerColumns($stmt, $values);
         try {
             Database::executeWithRetry($stmt, 'signedRegistrationInsert');
         } catch (PDOException $error) {
@@ -437,9 +464,11 @@ trait RequestRegistrationTrait
                 SET previous_session_token_hash = :old_token_sha256, session_token = :token,
                     name = :name, bitrate = :bitrate, mtu = :mtu, status = 'online',
                     metadata_json = :metadata_json, last_seen_at = :last_seen_at,
-                    updated_at = :updated_at, registration_seq = :next_count
+                    updated_at = :updated_at, registration_seq = :next_count,
+                    peer_url = :peer_url, peer_interface_id = :peer_interface_id, peer_session_token = :peer_session_token
               WHERE identity_hash = :h AND registration_seq = :count AND identity_public_key = :pub"
         );
+        $this->bindPeerColumns($stmt, $values);
         $this->bindNullable($stmt, ':old_token_sha256', $oldToken === '' ? null : hash('sha256', $oldToken));
         $stmt->bindValue(':token', $sessionToken, PDO::PARAM_STR);
         $stmt->bindValue(':name', $values['name'], PDO::PARAM_STR);
@@ -468,6 +497,37 @@ trait RequestRegistrationTrait
     private function bindNullable(\PDOStatement $stmt, string $placeholder, ?string $value): void
     {
         $stmt->bindValue($placeholder, $value, $value === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
+    }
+
+    /** :peer_url, :peer_interface_id and :peer_session_token from $values (peerColumns()). */
+    private function bindPeerColumns(\PDOStatement $stmt, array $values): void
+    {
+        foreach (['peer_url', 'peer_interface_id', 'peer_session_token'] as $column) {
+            $this->bindNullable($stmt, ':' . $column, $values[$column] ?? null);
+        }
+    }
+
+    /**
+     * The peer columns a registration binds, signed or not: a reticulum-php
+     * row's peer_url (trimmed, no trailing '/'), peer_interface_id and
+     * peer_session_token, each as given when it is a string; none for any
+     * other client.
+     *
+     * @return array{peer_url: ?string, peer_interface_id: ?string, peer_session_token: ?string}
+     */
+    private static function peerColumns(array $metadata): array
+    {
+        $field = static fn (string $key): ?string => isset($metadata[$key]) && is_string($metadata[$key]) ? $metadata[$key] : null;
+        if (($metadata['client'] ?? null) !== 'reticulum-php') {
+            return ['peer_url' => null, 'peer_interface_id' => null, 'peer_session_token' => null];
+        }
+        $peerUrl = $field('peer_url');
+
+        return [
+            'peer_url' => $peerUrl === null ? null : rtrim(trim($peerUrl), '/'),
+            'peer_interface_id' => $field('peer_interface_id'),
+            'peer_session_token' => $field('peer_session_token'),
+        ];
     }
 
     // ── §4.5 Legacy rows claiming the identity ──────────────────────────
@@ -660,8 +720,9 @@ trait RequestRegistrationTrait
 
     /**
      * A legacy (unsigned) registration. A browser's (client rns-js) follows
-     * §4.6. Any other client's runs as it always has: a reticulum-php row is
-     * re-bound by its exact peer_url, anything else gets a new row. Its
+     * §4.6. Any other client's runs as it always has: an unsigned
+     * reticulum-php row is re-bound by its exact peer_url (a signed one never
+     * is), anything else gets a new row. Its
      * identity_hash is ignored and logged [REG-CLAIM-IGNORED]: since Stage 1 a
      * claim is found only by claimed_identity_hash, and only browser rows
      * carry one (A8).
@@ -683,20 +744,16 @@ trait RequestRegistrationTrait
         $now = time();
         $sessionToken = bin2hex(random_bytes(32));
 
-        $peerUrl = null;
-        $peerInterfaceId = null;
-        $peerSessionToken = null;
-        if ($client === 'reticulum-php') {
-            $peerUrl = isset($metadata['peer_url']) && is_string($metadata['peer_url']) ? rtrim(trim($metadata['peer_url']), '/') : null;
-            $peerInterfaceId = isset($metadata['peer_interface_id']) && is_string($metadata['peer_interface_id']) ? $metadata['peer_interface_id'] : null;
-            $peerSessionToken = isset($metadata['peer_session_token']) && is_string($metadata['peer_session_token']) ? $metadata['peer_session_token'] : null;
-        }
+        ['peer_url' => $peerUrl, 'peer_interface_id' => $peerInterfaceId, 'peer_session_token' => $peerSessionToken] = self::peerColumns($metadata);
 
         // Bridge interface dedup: if a peer_url already has an interface, update it
         // instead of creating a duplicate. Matches Python RNS where interfaces are
-        // singletons identified by transport object identity.
+        // singletons identified by transport object identity. Only an unsigned
+        // row: a signed row is its key's alone, so an unsigned registration
+        // naming its peer_url gets what it would get without it (the unsigned
+        // row with that peer_url, re-bound, or a new row).
         if ($peerUrl !== null && $peerInterfaceId !== null) {
-            $existing = $this->phpPeerInterfaceByPeerUrl($peerUrl);
+            $existing = $this->phpPeerInterfaceByPeerUrl($peerUrl, true);
             if ($existing !== null) {
                 $interfaceId = (string) $existing['interface_id'];
                 $updateStmt = $this->db->prepare(
