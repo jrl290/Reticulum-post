@@ -1504,7 +1504,7 @@ as asked, "relay" included.
 | 2026-10-14 | "The browser's backoff (2 s doubling to 5 min) resets only on a successful registration. After a network drop the session is still valid, so the next attempt is an exchange, and a successful exchange wouldn't reset it: separate drops over hours would grow an open tab's wait toward 5 min. What should reset the wait to 2 s?" | "Any success resets it (Recommended)": a successful exchange or registration | §2, §10, §14, §19, the principles' §3 |
 | 2026-10-14 | "Sign the address of the PHP node?" (§19, question 5) | "the verdict was to rely on Reticulum's security for PHP nodes. A compromised node still can only manifest as a black hole. It can't actually manipulate the messages. This is a standard risk of Reticulum." No address is signed. | §4.2, §14, §15, §16 item 6, §19 |
 | 2026-10-16 | Gateways and PHP-node peers signing the registration they already send, as browsers do: no address check, nothing else new | "Yes, thank you. I don't know why we were making anything special for the gateway anyway. The gateway should use the same negotiation as any other bidirectional peer" | §4.3, §4.4, §4.6, §9 |
-| 2026-10-16 | (pending James) A signed peer's bind removes the unsigned rows at its `peer_url`, as a browser's removes the legacy rows claiming it: staging showed the gateway's old row otherwise collecting traffic and waking it for good | not yet asked | §4.5, §13 |
+| 2026-10-16 | "Keep the rule that deletes unsigned rows with the same wake address when a signed registration arrives?" (staging showed the gateway's old row otherwise collecting traffic and waking it for good) | "Keep the rule (Recommended)" | §4.5, §13 |
 
 **This file's own choices**, which James may overrule:
 
