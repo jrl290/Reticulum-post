@@ -1171,18 +1171,22 @@ trait RequestRegistrationTrait
         try {
             // Browsers only: since 2026-10-16 a gateway or PHP-node peer may
             // sign too, and Phase 2's gate (b) and Phase 3 read this number.
-            // A signed row's client is one of three (§4.3 step 4), and JSON
-            // escapes every quote inside a value, so the pattern matches
-            // exactly the rns-js rows (as the debug report finds poll-mode
-            // gateways).
+            // A browser row is one whose decoded client is rns-js, checked in
+            // PHP as legacyBrowserRowByClaim() checks it: no SQL compares
+            // metadata_json (§12).
             $signed = $this->db->prepare(
-                'SELECT COUNT(*) FROM interfaces
-                  WHERE status = :online AND registration_proof = :signed AND metadata_json LIKE :browser'
+                'SELECT metadata_json FROM interfaces WHERE status = :online AND registration_proof = :signed'
             );
             $signed->bindValue(':online', 'online', PDO::PARAM_STR);
             $signed->bindValue(':signed', 'signed', PDO::PARAM_STR);
-            $signed->bindValue(':browser', '%"client":"rns-js"%', PDO::PARAM_STR);
             $signed->execute();
+            $signedBrowsers = 0;
+            while (($metadataJson = $signed->fetchColumn()) !== false) {
+                if ((self::decodeJson((string) $metadataJson)['client'] ?? null) === 'rns-js') {
+                    $signedBrowsers++;
+                }
+            }
+            $signed->closeCursor();
             $legacy = $this->db->prepare(
                 'SELECT COUNT(*) FROM interfaces
                   WHERE status = :online AND registration_proof = :none AND claimed_identity_hash IS NOT NULL'
@@ -1194,7 +1198,7 @@ trait RequestRegistrationTrait
             $count->bindValue(':state_key', RegistrationProtocol::HASH_ONLY_CHALLENGES_STATE_KEY, PDO::PARAM_STR);
             $count->execute();
             $health['browsers_online'] = [
-                'signed' => (int) $signed->fetchColumn(),
+                'signed' => $signedBrowsers,
                 'legacy' => (int) $legacy->fetchColumn(),
             ];
             $health['hash_only_challenges'] = (int) $count->fetchColumn();
