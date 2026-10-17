@@ -189,6 +189,17 @@ trait RequestInterfaceRegistryTrait
      * $unsignedOnly: only a row no signature holds (identity_hash NULL), for
      * the unsigned re-bind by peer_url (registerInterface), which must never
      * touch a signed row.
+     *
+     * Of several rows with the peer_url, the one seen most recently, as
+     * interfaceRowsNamingPeer() orders them. Since 2026-10-16 a signed row and
+     * an unsigned one can share a peer_url: a gateway's first signed
+     * registration leaves its old unsigned row beside the new one, and an
+     * unsigned registration naming a signed row's peer_url gets a row of its
+     * own. Without an order, SQLite's index gave the oldest row and MySQL
+     * whichever interface_id sorts first. Not "signed first": a PHP node's own
+     * peering row is unsigned and no address is checked, so a signed row
+     * naming that peer must not shadow the row the peer keeps seen. Pinned by
+     * tests/signed_peer_registration_test.php (6).
      */
     public function phpPeerInterfaceByPeerUrl(string $peerUrl, bool $unsignedOnly = false): ?array
     {
@@ -203,6 +214,7 @@ trait RequestInterfaceRegistryTrait
                     status, last_seen_at
              FROM interfaces
              WHERE peer_url = :peer_url' . ($unsignedOnly ? ' AND identity_hash IS NULL' : '') . '
+             ORDER BY last_seen_at DESC, created_at DESC
              LIMIT 1'
         );
         $stmt->bindValue(':peer_url', $peerUrl, PDO::PARAM_STR);

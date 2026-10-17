@@ -120,10 +120,13 @@ word: its `relay` means PHP node.
 - **Gateways** (`reticulum-php` in wake mode, `rns-post-interface` in poll
   mode) and PHP-node peers register as today, unsigned, or, since
   2026-10-16, sign the same registration (§4.3) under the rules their
-  unsigned one has; they are woken and exchange as today, and no address is
-  checked. An unsigned registration re-binds only an unsigned row by its
-  exact `peer_url`, never a signed one (§4.6). Any other client's signed
-  registration gets `400 unknown_client` (§4.3).
+  unsigned one has, and no address is checked. They are woken and exchange
+  as today, except once: a gateway's first signed registration at a PHP node
+  makes a new row and leaves its old unsigned one, whose queue it never
+  collects (§13, "A gateway that starts signing"). An unsigned registration
+  re-binds only an unsigned row by its exact `peer_url`, never a signed one
+  (§4.6). Any other client's signed registration gets `400 unknown_client`
+  (§4.3).
 - **Peering** (`connectToPeer`, the exchange inside the `/v1/wake` handler,
   the hourly repair of a dead session): Stage 3. **Paths and announces** on
   rows that are not browser rows (REGISTRATION.md §12.5): Stage 2.
@@ -384,7 +387,13 @@ naming its identity hash (A8): the hash is ignored and logged
 `reticulum-php` row re-bound by its exact `peer_url`, anything else a new
 row). Since 2026-10-16 a signed row is never re-bound so: a registration
 naming its `peer_url` gets what it would get without it. Gateways send no
-`identity_hash`.
+`identity_hash`. A signed row and an unsigned one can therefore share a
+`peer_url`, so the lookup by `peer_url` (`phpPeerInterfaceByPeerUrl`, which
+`exchangeWithPhpPeer` and `connectToPeer` use) takes the row seen most
+recently (`ORDER BY last_seen_at DESC, created_at DESC`, as
+`interfaceRowsNamingPeer` orders them), not the signed one first: a PHP
+node's own peering row is unsigned, and a signed row naming that peer must
+not shadow it.
 
 ## 5. The answer and its encrypted token
 
@@ -950,6 +959,25 @@ whenever a selectiv tab shows offline and whenever `/health`'s
 again. The search for the file's source goes on, including other machines
 that deploy there.
 
+**A gateway that starts signing** (2026-10-16), once its PHP node accepts
+it. **What it costs**, once per gateway per PHP node: its first signed
+registration makes a new row (§4.4 finds a signed row by its key alone) and
+leaves its old unsigned row, with the same `peer_url`, in place; nothing
+re-binds one into the other, and maintenance only marks the old row
+offline, never removes it. Packets queued on the old row are never
+delivered, since the gateway exchanges as its new row. Until they expire
+(`outbound_packet_ttl_seconds`, 24 h by default), `dispatchWakes` still
+wakes the gateway's address for them, at most once per
+`min_wake_interval_ms` (1 s by default), and each wake makes the gateway
+exchange as its new row; for as long, the EmptyPoll wake mark stays set, so
+idle polls skip that shortcut. Lookups by `peer_url` take the new row, the
+one seen most recently (§4.6). To end it at once, the old row is removed by
+hand once the gateway's signed row is online, as `connectToPeer` removes a
+dead peer row: `DELETE FROM interfaces WHERE peer_url = '<the gateway's
+peer_url>' AND identity_hash IS NULL`; maintenance then drops its queue as
+orphans. Whether the PHP node should instead retire that row itself at the
+signed bind is James's call.
+
 **Phase 3: enforcement, on James's date.** On selectiv, a hand edit of its
 config: `enforce_signed_registration = true`. Before it, the same day,
 Retichat-js's `verify-deploy.sh` shows a signing build on the sites that use
@@ -1021,8 +1049,11 @@ with a bound that only fails it.
   peer negatives; the unsigned rules, no more; a signed peer row woken and
   exchanged exactly like an unsigned one; an unsigned registration naming
   its `peer_url` gets a row of its own and leaves it untouched; its own key
-  re-binds it. *Today:* `400 unknown_client`, and the unsigned registration
-  takes the row over.
+  re-binds it; of two rows with one `peer_url` (a gateway's first signed
+  registration beside its old row), the lookup and `exchangeWithPhpPeer`
+  take the one seen most recently, never the signed one for being signed.
+  *Today:* `400 unknown_client`, and the unsigned registration takes the row
+  over.
 - **`registration_vectors_test.php`:** §15's browser vectors through the real
   code, the encrypted token byte for byte; it names each vector it skips.
   *Today:* no signed path.
@@ -1242,7 +1273,10 @@ stays as today for every user. What stays exposed:
    with a new token. The real one gets `401`, registers again and takes it
    back, and the two alternate; meanwhile the stranger collects what was
    queued there (end-to-end encrypted: delivery denied, metadata seen). As
-   today, until Stage 2 (gateways) and Stage 3 (peering).
+   today, until Stage 2 (gateways) and Stage 3 (peering). A gateway or peer
+   that signs (since 2026-10-16) is not taken over: the stranger gets a row
+   of its own beside it (§4.6), whose wakes go to the address it named, as in
+   item 2.
 2. **Anyone can still make an unsigned `reticulum-php` or
    `rns-post-interface` row.** Its announces skip §9 (they never make local
    destinations, as today), can move paths with a lowered hop count (A4), and
