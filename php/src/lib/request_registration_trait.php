@@ -312,8 +312,9 @@ trait RequestRegistrationTrait
         error_log(sprintf('[REG-SIGNED] identity=%s interface=%s %s', $identityHashHex, substr($interfaceId, 0, 8), $action));
 
         // §4.5: after every bind, never adopt a legacy row claiming H;
-        // remove it. A failure there is logged, and the bind still answers.
-        $this->retireSquattedRows($identityHashHex);
+        // remove it, and a peer's unsigned rows at its peer_url. A failure
+        // there is logged, and the bind still answers.
+        $this->retireSquattedRows($identityHashHex, $values['peer_url']);
 
         return [
             'status' => 'registered',
@@ -540,8 +541,17 @@ trait RequestRegistrationTrait
      * [REG-RETIRE] ... failed=<table> and ends the removal; the bind has
      * succeeded, and the next bind of H runs the removal again. Returns the
      * number of rows removed.
+     *
+     * A signed peer's bind ($peerUrl set, since 2026-10-16) also removes the
+     * unsigned rows holding its peer_url, in every form the lookup by
+     * peer_url matches: the gateway's row from before it signed. A peer row
+     * is a routing target whether online or not (allOtherInterfaceIds), so
+     * left in place it would queue path requests and announces, and wake the
+     * gateway for them, for good. An unsigned registration naming that
+     * peer_url re-binds such a row today, so removing it gives a signature
+     * no more than that.
      */
-    private function retireSquattedRows(string $identityHashHex): int
+    private function retireSquattedRows(string $identityHashHex, ?string $peerUrl = null): int
     {
         $removed = 0;
         $dropped = 0;
@@ -555,6 +565,9 @@ trait RequestRegistrationTrait
             $stmt->bindValue(':none', 'none', PDO::PARAM_STR);
             $stmt->execute();
             $ids = array_map('strval', $stmt->fetchAll(PDO::FETCH_COLUMN));
+            if ($peerUrl !== null) {
+                $ids = array_values(array_unique(array_merge($ids, $this->unsignedRowIdsAtPeerUrl($peerUrl))));
+            }
         } catch (\Throwable $error) {
             $ids = [];
             $failed = ['interfaces', $error];
@@ -579,6 +592,35 @@ trait RequestRegistrationTrait
         }
 
         return $removed;
+    }
+
+    /**
+     * The unsigned rows holding $peerUrl as phpPeerInterfaceByPeerUrl()
+     * matches it: as given (no trailing '/'), with /v1/wake appended, and
+     * without a /v1/wake it ends in.
+     *
+     * @return list<string>
+     */
+    private function unsignedRowIdsAtPeerUrl(string $peerUrl): array
+    {
+        $peerUrl = rtrim($peerUrl, '/');
+        $forms = [$peerUrl, $peerUrl . '/v1/wake'];
+        if (str_ends_with($peerUrl, '/v1/wake')) {
+            $forms[] = substr($peerUrl, 0, -strlen('/v1/wake'));
+        }
+        $stmt = $this->db->prepare(
+            'SELECT interface_id FROM interfaces
+              WHERE peer_url = :peer_url AND identity_hash IS NULL AND registration_proof = :none'
+        );
+        $ids = [];
+        foreach ($forms as $form) {
+            $stmt->bindValue(':peer_url', $form, PDO::PARAM_STR);
+            $stmt->bindValue(':none', 'none', PDO::PARAM_STR);
+            $stmt->execute();
+            $ids = array_merge($ids, array_map('strval', $stmt->fetchAll(PDO::FETCH_COLUMN)));
+        }
+
+        return $ids;
     }
 
     /**

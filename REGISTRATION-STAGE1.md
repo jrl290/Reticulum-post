@@ -357,6 +357,21 @@ the next bind of `H` runs the removal again. Meanwhile those rows are inert:
 holders `401`. Whoever held a removed row gets `401`; an old page then
 registers the legacy way and gets `403 identity_requires_signature`.
 
+**A signed peer's unsigned rows** (2026-10-16). When the signed row holds a
+`peer_url` (a `reticulum-php` peer or gateway), the same removal also takes
+every row with `identity_hash IS NULL`, `registration_proof = 'none'` and
+that `peer_url` in any form the lookup by `peer_url` matches (as given,
+with `/v1/wake` appended, without a `/v1/wake` it ends in): the gateway's
+row from before it signed, and any unsigned row made at its `peer_url`
+since. A peer row is a routing target whether online or not
+(`allOtherInterfaceIds`), so left in place such a row queues path requests
+and announces and wakes the gateway for them for good (seen on staging
+2026-10-16). An unsigned registration naming that `peer_url` re-binds such a
+row today (§4.6), so removing it gives a signature no more than that. A
+PHP node's own peering row is unsigned, so a signed registration naming
+its URL removes it; the peering heal then finds no row and connects again.
+The log line is the same.
+
 ### 4.6 Legacy registration while the switch is off
 
 A body without `registration` whose `client` is `rns-js`, in order:
@@ -388,7 +403,8 @@ naming its identity hash (A8): the hash is ignored and logged
 row). Since 2026-10-16 a signed row is never re-bound so: a registration
 naming its `peer_url` gets what it would get without it. Gateways send no
 `identity_hash`. A signed row and an unsigned one can therefore share a
-`peer_url`, so the lookup by `peer_url` (`phpPeerInterfaceByPeerUrl`, which
+`peer_url` (one made after the signed bind, until the peer's next signed
+registration removes it, §4.5), so the lookup by `peer_url` (`phpPeerInterfaceByPeerUrl`, which
 `exchangeWithPhpPeer` and `connectToPeer` use) takes the row seen most
 recently (`ORDER BY last_seen_at DESC, created_at DESC`, as
 `interfaceRowsNamingPeer` orders them), not the signed one first: a PHP
@@ -962,23 +978,19 @@ again. The search for the file's source goes on, including other machines
 that deploy there.
 
 **A gateway that starts signing** (2026-10-16), once its PHP node accepts
-it. **What it costs**, once per gateway per PHP node: its first signed
-registration makes a new row (§4.4 finds a signed row by its key alone) and
-leaves its old unsigned row, with the same `peer_url`, in place; nothing
-re-binds one into the other, and maintenance only marks the old row
-offline, never removes it. Packets queued on the old row are never
-delivered, since the gateway exchanges as its new row. Until they expire
-(`outbound_packet_ttl_seconds`, 24 h by default), `dispatchWakes` still
-wakes the gateway's address for them, at most once per
-`min_wake_interval_ms` (1 s by default), and each wake makes the gateway
-exchange as its new row; for as long, the EmptyPoll wake mark stays set, so
-idle polls skip that shortcut. Lookups by `peer_url` take the new row, the
-one seen most recently (§4.6). To end it at once, the old row is removed by
-hand once the gateway's signed row is online, as `connectToPeer` removes a
-dead peer row: `DELETE FROM interfaces WHERE peer_url = '<the gateway's
-peer_url>' AND identity_hash IS NULL`; maintenance then drops its queue as
-orphans. Whether the PHP node should instead retire that row itself at the
-signed bind is James's call.
+it. Its first signed registration makes a new row (§4.4 finds a signed row
+by its key alone) and removes its old unsigned row, with the same
+`peer_url`, and that row's queue (§4.5, "A signed peer's unsigned rows"):
+the packets queued for the gateway but not yet collected when it restarted
+are lost once, as a browser's are when it first signs. Without that removal
+(as first built, on staging 2026-10-16) the old row stayed for good:
+maintenance only marks a row offline, and a peer row is a routing target
+whether online or not, so it went on collecting path requests and announces
+and `dispatchWakes` woke the gateway for them each second. A gateway rolled
+back to an unsigned build gets a new unsigned row beside its signed one
+(§4.6 never re-binds a signed row), and the signed row stays, in the same
+way, until removed by hand: `DELETE FROM interfaces WHERE peer_url = '<the
+gateway's peer_url>' AND identity_hash IS NOT NULL`.
 
 **Phase 3: enforcement, on James's date.** On selectiv, a hand edit of its
 config: `enforce_signed_registration = true`. Before it, the same day,
@@ -1051,9 +1063,12 @@ with a bound that only fails it.
   peer negatives; the unsigned rules, no more; a signed peer row woken and
   exchanged exactly like an unsigned one; an unsigned registration naming
   its `peer_url` gets a row of its own and leaves it untouched; its own key
-  re-binds it; of two rows with one `peer_url` (a gateway's first signed
-  registration beside its old row), the lookup and `exchangeWithPhpPeer`
-  take the one seen most recently, never the signed one for being signed.
+  re-binds it; a gateway's first signed registration removes its old
+  unsigned row (either stored form of its `peer_url`) and that row's queue,
+  and nothing at another `peer_url`, and its next one removes an unsigned
+  row made since; of two rows with one `peer_url` (an unsigned one made after
+  the signed bind), the lookup and `exchangeWithPhpPeer` take the one seen
+  most recently, never the signed one for being signed.
   *Today:* `400 unknown_client`, and the unsigned registration takes the row
   over.
 - **`registration_vectors_test.php`:** §15's browser vectors through the real
@@ -1489,6 +1504,7 @@ as asked, "relay" included.
 | 2026-10-14 | "The browser's backoff (2 s doubling to 5 min) resets only on a successful registration. After a network drop the session is still valid, so the next attempt is an exchange, and a successful exchange wouldn't reset it: separate drops over hours would grow an open tab's wait toward 5 min. What should reset the wait to 2 s?" | "Any success resets it (Recommended)": a successful exchange or registration | §2, §10, §14, §19, the principles' §3 |
 | 2026-10-14 | "Sign the address of the PHP node?" (§19, question 5) | "the verdict was to rely on Reticulum's security for PHP nodes. A compromised node still can only manifest as a black hole. It can't actually manipulate the messages. This is a standard risk of Reticulum." No address is signed. | §4.2, §14, §15, §16 item 6, §19 |
 | 2026-10-16 | Gateways and PHP-node peers signing the registration they already send, as browsers do: no address check, nothing else new | "Yes, thank you. I don't know why we were making anything special for the gateway anyway. The gateway should use the same negotiation as any other bidirectional peer" | §4.3, §4.4, §4.6, §9 |
+| 2026-10-16 | (pending James) A signed peer's bind removes the unsigned rows at its `peer_url`, as a browser's removes the legacy rows claiming it: staging showed the gateway's old row otherwise collecting traffic and waking it for good | not yet asked | §4.5, §13 |
 
 **This file's own choices**, which James may overrule:
 
