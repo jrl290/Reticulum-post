@@ -520,7 +520,7 @@ class PostInterface(Interface):
         packet queued via process_outgoing().  No timer-based fallback.
         """
         last_exchange = 0
-        _min_interval = 3.0
+        _min_interval = 1.0   # the node's idle_exchange_interval_ms (1 s) is used as it is
 
         while self._running:
             now = time.time()
