@@ -611,6 +611,12 @@ trait RequestPhpWakeTrait
      * <node_url>/v1/wake). initialize, the heal in maintenance and the admin
      * page all read them here, so they cannot disagree about a URL.
      *
+     * An entry is a peer only while it is on and a PostInterface (L76): one
+     * with `enabled` or `interface_enabled` and neither of them true is off,
+     * as in RNS, and one with a `type` other than PostInterface is some other
+     * interface. Unlike RNS, an entry that leaves both out stays on, as every
+     * [interfaces] entry was before.
+     *
      * @return array<string|int, array{exchange_url: string, wake_url: string}>
      */
     private function configuredPeerEndpoints(): array
@@ -623,6 +629,14 @@ trait RequestPhpWakeTrait
         $endpoints = [];
         foreach ($interfaces as $ifaceName => $ifaceConfig) {
             if (!is_array($ifaceConfig)) {
+                continue;
+            }
+
+            $switches = array_intersect_key($ifaceConfig, ['enabled' => true, 'interface_enabled' => true]);
+            if ($switches !== [] && !in_array(true, array_map([self::class, 'configuredSwitchIsOn'], $switches), true)) {
+                continue;
+            }
+            if (array_key_exists('type', $ifaceConfig) && trim((string) $ifaceConfig['type']) !== 'PostInterface') {
                 continue;
             }
 
@@ -642,6 +656,19 @@ trait RequestPhpWakeTrait
         }
 
         return $endpoints;
+    }
+
+    /** An [interfaces] on/off value read as config booleans are: yes, true, 1 on; no, false, off, 0 or empty off. */
+    private static function configuredSwitchIsOn(mixed $value): bool
+    {
+        if (is_bool($value)) {
+            return $value;
+        }
+        if (is_int($value) || is_float($value)) {
+            return (int) $value !== 0;
+        }
+
+        return is_string($value) && !in_array(strtolower(trim($value)), ['', '0', 'false', 'no', 'off'], true);
     }
 
     private function configuredHostUrl(): ?string
