@@ -187,16 +187,30 @@ trait RequestPhpWakeTrait
 
         $errno = 0;
         $errstr = '';
+        $connectTimeout = 2; // seconds — just enough for TCP+TLS handshake
+        $started = microtime(true);
         $fp = @stream_socket_client(
             ($isTls ? 'tls://' : 'tcp://') . $host . ':' . $port,
             $errno,
             $errstr,
-            2, // 2s connect timeout — just enough for TCP+TLS handshake
+            $connectTimeout,
             STREAM_CLIENT_ASYNC_CONNECT
         );
 
         if ($fp === false) {
-            error_log("[WAKE-DROP] {$host}:{$port} connect failed: {$errstr} ({$errno})");
+            // tls:// with STREAM_CLIENT_ASYNC_CONNECT reports every failure
+            // with no message and the connect's errno EINPROGRESS (115 on
+            // Linux): a refusal at once, and a TCP+TLS setup still unfinished
+            // when the 2 s ran out (a wake that finishes inside them leaves).
+            // retichat.com logged selectiv's wakes as "connect failed:  (115)"
+            // from ~10-01 (L75). How long it took is what tells them apart.
+            $tookMs = (int) round((microtime(true) - $started) * 1000);
+            if ($errstr === '' && $tookMs >= ($connectTimeout - 0.1) * 1000) {
+                error_log("[WAKE-DROP] {$host}:{$port} did not finish connecting"
+                    . ($isTls ? ' (TCP and TLS)' : '') . " within {$connectTimeout} s");
+            } else {
+                error_log("[WAKE-DROP] {$host}:{$port} connect failed after {$tookMs} ms: {$errstr} ({$errno})");
+            }
             return;
         }
 
