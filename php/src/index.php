@@ -68,6 +68,12 @@ final class Config
         return false;
     }
 
+    /** The file load() reads: the first of CONFIG_CANDIDATES that exists. */
+    public static function path(string $projectRoot): string
+    {
+        return self::resolveConfigPath($projectRoot);
+    }
+
     private static function resolveConfigPath(string $projectRoot): string
     {
         foreach (self::CONFIG_CANDIDATES as $candidate) {
@@ -1456,6 +1462,14 @@ function runIndexCli(string $projectRoot, array $argv): int
         require_once __DIR__ . '/lib/swoole_node.php';
 
         return SwooleSetup::apply(loadRuntimeConfig($projectRoot), __DIR__, !in_array('--no-verify', $argv, true), STDOUT, STDERR);
+    }
+    if ($mode === 'switch-storage') {
+        // Before initializeRuntime(): it edits the config the node would
+        // open its database from.
+        require_once __DIR__ . '/lib/swoole_node.php';
+        require_once __DIR__ . '/lib/storage_switch.php';
+
+        return StorageSwitch::run($projectRoot, array_slice($argv, 2), STDOUT, STDERR);
     }
     if ($mode === 'migrate') {
         // Before initializeRuntime(), whose migrateIfNeeded() would record
