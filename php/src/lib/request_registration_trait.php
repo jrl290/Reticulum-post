@@ -455,7 +455,9 @@ trait RequestRegistrationTrait
      * §4.4, count n > 0: update in place, matched on the count step 6 read.
      * The statement always changes registration_seq and session_token, so
      * MySQL's affected rows equal its matched rows. :old_token_sha256 is the
-     * SHA-256 of the token the row held when step 6 read it (§8).
+     * SHA-256 of the token the row held when step 6 read it (§8). seeded_at
+     * goes back to NULL: a registration is a new session that knows nothing
+     * yet (a reloaded tab, 2026-10-19), so its first exchange is seeded.
      */
     private function bindSignedUpdate(string $identityHashHex, string $publicKeyHex, int $count, string $oldToken, string $sessionToken, array $values, array $context): void
     {
@@ -466,7 +468,8 @@ trait RequestRegistrationTrait
                     name = :name, bitrate = :bitrate, mtu = :mtu, status = 'online',
                     metadata_json = :metadata_json, last_seen_at = :last_seen_at,
                     updated_at = :updated_at, registration_seq = :next_count,
-                    peer_url = :peer_url, peer_interface_id = :peer_interface_id, peer_session_token = :peer_session_token
+                    peer_url = :peer_url, peer_interface_id = :peer_interface_id, peer_session_token = :peer_session_token,
+                    seeded_at = NULL
               WHERE identity_hash = :h AND registration_seq = :count AND identity_public_key = :pub"
         );
         $this->bindPeerColumns($stmt, $values);
@@ -938,6 +941,7 @@ trait RequestRegistrationTrait
      * §4.6 step 5's re-bind of a legacy browser row, in place. False when the
      * UPDATE changed no row: the row went after step 5 read it. It always
      * writes a new token, so MySQL's affected rows equal its matched rows.
+     * seeded_at goes back to NULL, as in bindSignedUpdate.
      */
     private function rebindLegacyBrowserRow(string $interfaceId, string $sessionToken, int $bitrate, int $mtu, array $metadata): bool
     {
@@ -945,7 +949,7 @@ trait RequestRegistrationTrait
             'UPDATE interfaces
                 SET session_token = :session_token, previous_session_token_hash = NULL,
                     bitrate = :bitrate, mtu = :mtu, status = :status,
-                    metadata_json = :metadata_json, last_seen_at = :last_seen_at
+                    metadata_json = :metadata_json, last_seen_at = :last_seen_at, seeded_at = NULL
               WHERE interface_id = :interface_id AND identity_hash IS NULL'
         );
         $stmt->bindValue(':session_token', $sessionToken, PDO::PARAM_STR);

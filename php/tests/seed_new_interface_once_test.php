@@ -32,6 +32,8 @@
  *       while a row registered after it is;
  *   (g) one destination whose accepted announces fill the newest 768
  *       rows and more is seeded once, with the 63 destinations before it.
+ *   (h) a reload, a registration that gets its old row back (signed, or a
+ *       legacy browser naming its identity_hash), is seeded again, once.
  *
  * On MySQL with ONLY_FULL_GROUP_BY in sql_mode (8.4's default) the seeding
  * query was a SELECT DISTINCT ordered by a column it did not select, error
@@ -243,6 +245,36 @@ $queued = queuedAnnounces($db, $behind);
 check('a new browser gets it once and the 63 destinations announced before it',
     count($queued) === 64 && sameSet(array_diff($queued, array_slice($newest, -63)), [$chattyHash]) && count(array_unique($queued)) === 64,
     count($queued) . ' ' . json_encode(array_values(array_diff($queued, array_slice($newest, -63)))));
+
+echo "\n(h) a reload is a fresh browser\n";
+// A reloaded tab registers again with its identity and gets its old row back
+// (signed: bindSignedUpdate; a legacy browser naming its identity_hash:
+// rebindLegacyBrowserRow). Until 2026-10-19 the row kept its seeded_at, so
+// the reloaded tab, which had lost everything it knew, got no cached
+// announce until each destination announced again.
+$expected = queuedAnnounces($db, $behind);
+$tab = RegFixture::identity();
+[$first] = RegFixture::capture(static fn () => RegFixture::register($node, $tab));
+$tabRow = (string) $first['interface_id'];
+firstExchange($node, $tabRow);
+// Delivered and pruned, as maintenance does once they are acked.
+$db->prepare('DELETE FROM outbound_packets WHERE interface_id = :i')->execute([':i' => $tabRow]);
+[$again] = RegFixture::capture(static fn () => RegFixture::register($node, $tab));
+check('(precondition) the reload gets its row back', is_array($again) && $again['interface_id'] === $tabRow, json_encode(RegFixture::outcome($again)));
+firstExchange($node, $tabRow);
+check('a signed reload is seeded again on its first exchange', sameSet(queuedAnnounces($db, $tabRow), $expected), count(queuedAnnounces($db, $tabRow)) . ' queued');
+$seeded = queuedAnnounces($db, $tabRow);
+firstExchange($node, $tabRow);
+check('once: its next exchange queues nothing more', queuedAnnounces($db, $tabRow) === $seeded);
+
+$claim = bin2hex(random_bytes(16));
+$legacy = row($node, ['client' => 'rns-js', 'mode' => 1, 'identity_hash' => $claim], 'browser');
+firstExchange($node, $legacy);
+$db->prepare('DELETE FROM outbound_packets WHERE interface_id = :i')->execute([':i' => $legacy]);
+$legacyAgain = row($node, ['client' => 'rns-js', 'mode' => 1, 'identity_hash' => $claim], 'browser');
+check('(precondition) the legacy reload gets its row back', $legacyAgain === $legacy, "$legacyAgain vs $legacy");
+firstExchange($node, $legacy);
+check('a legacy reload is seeded again on its first exchange', sameSet(queuedAnnounces($db, $legacy), $expected), count(queuedAnnounces($db, $legacy)) . ' queued');
 
 echo "\n(f) rows from before the marker\n";
 $oldPath = $dir . '/live.sqlite';

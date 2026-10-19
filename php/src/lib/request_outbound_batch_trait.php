@@ -572,8 +572,11 @@ trait RequestOutboundBatchTrait
 
     /**
      * Seed a newly-registered interface with cached announces from other
-     * interfaces, once per interface row, on its first exchange. PHP node
-     * peering rows are never seeded.
+     * interfaces, once per registration, on its first exchange. PHP node
+     * peering rows are never seeded. A registration that gets its old row
+     * back (a reloaded tab) clears the marker, so it is seeded like a new
+     * browser (2026-10-19; until then once per row, and a reload started
+     * blind).
      *
      * "New" is the row's seeded_at marker, claimed by the one UPDATE that
      * finds it NULL, so of two concurrent exchanges only one seeds. Until
