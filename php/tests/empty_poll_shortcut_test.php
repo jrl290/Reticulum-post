@@ -90,10 +90,6 @@ file_put_contents($dir . '/src/config.toml', implode("\n", [
     'sqlite_path = "' . $dir . '/node.sqlite"',
     'log_path = "' . $dir . '/router.log"',
     'query_log_path = "' . $queryLog . '"',
-    '[http]',
-    // Long enough that a wake mark written this second is never "due" while
-    // a step runs; the due test is checked with a mark written long ago.
-    'min_wake_interval_ms = 10000',
     '[maintenance]',
     'interface_stale_after_seconds = 30',
     '',
@@ -205,13 +201,13 @@ check('an old mark sends the poll to the full path', $s === 200 && $db);
 [$s, , , $db] = request($exchange, $empty);
 check('...which writes a fresh one', $s === 200 && !$db);
 
-echo "(f) an owed wake sends polls to the full path once an epilogue is due\n";
+echo "(f) an owed wake sends polls to the full path once its ping is due\n";
+touch($markDir . '/wakes-owed', time() + 20);
+[$s, , , $db] = request($exchange, $empty);
+check('an owed wake whose ping is not yet due leaves the shortcut on', $s === 200 && !$db);
 touch($markDir . '/wakes-owed', time());
 [$s, , , $db] = request($exchange, $empty);
-check('an owed wake inside min_wake_interval_ms leaves the shortcut on', $s === 200 && !$db);
-touch($markDir . '/wakes-owed', time() - 20);
-[$s, , , $db] = request($exchange, $empty);
-check('an owed wake past min_wake_interval_ms takes the full path', $s === 200 && $db);
+check('an owed wake whose ping is due takes the full path', $s === 200 && $db);
 check('...whose epilogue, finding no peer owed, removes the wake mark', !is_file($markDir . '/wakes-owed'));
 [$s, , , $db] = request($exchange, $empty);
 check('the shortcut is back', $s === 200 && !$db);

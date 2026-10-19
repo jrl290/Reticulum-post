@@ -114,42 +114,24 @@ trait RequestInterfaceRegistryTrait
         return isset($row['bitrate']) ? (int) $row['bitrate'] : null;
     }
 
+    /**
+     * PHP peers with unacknowledged packets. has_unsent is 1 when some of
+     * them have not been handed out yet (they missed the last train), 0 when
+     * every one is in a batch the peer has collected and not yet confirmed.
+     */
     public function phpPeerInterfaceIdsWithPendingOutbound(): array
     {
         $stmt = $this->db->prepare(
-            'SELECT DISTINCT i.interface_id, i.peer_url, i.peer_interface_id, i.peer_session_token, i.last_wake_sent_at
+            'SELECT i.interface_id, i.peer_url, i.peer_interface_id, i.peer_session_token, i.wake_sent_at_ms, i.wake_backoff_ms,
+                    i.last_seen_at, MAX(CASE WHEN op.delivered_batch_id IS NULL THEN 1 ELSE 0 END) AS has_unsent
              FROM interfaces i
              INNER JOIN outbound_packets op ON op.interface_id = i.interface_id
              WHERE i.peer_url IS NOT NULL
                AND i.peer_interface_id IS NOT NULL
                AND i.peer_session_token IS NOT NULL
                AND op.acked_at IS NULL
+             GROUP BY i.interface_id, i.peer_url, i.peer_interface_id, i.peer_session_token, i.wake_sent_at_ms, i.wake_backoff_ms, i.last_seen_at
              ORDER BY i.interface_id'
-        );
-        $stmt->execute();
-
-        $rows = [];
-        while (($row = $stmt->fetch(PDO::FETCH_ASSOC)) !== false) {
-            if (!is_array($row)) {
-                continue;
-            }
-            $rows[] = $row;
-        }
-
-        return $rows;
-    }
-
-    public function phpPeerInterfaceIdsWithPendingAcks(): array
-    {
-        $stmt = $this->db->prepare(
-            "SELECT i.interface_id, i.peer_url, i.peer_interface_id, i.peer_session_token, i.last_wake_sent_at
-             FROM interfaces i
-             WHERE i.peer_url IS NOT NULL
-               AND i.peer_interface_id IS NOT NULL
-               AND i.peer_session_token IS NOT NULL
-               AND i.pending_ack_batch_ids_json IS NOT NULL
-               AND i.pending_ack_batch_ids_json != '[]'
-               AND i.pending_ack_batch_ids_json != ''"
         );
         $stmt->execute();
 
@@ -306,12 +288,34 @@ trait RequestInterfaceRegistryTrait
         return $claim;
     }
 
-    public function touchPeerWakeSent(string $interfaceId): void
+    /**
+     * Takes the right to ping $interfaceId: only if its outstanding ping is
+     * still the one this request read ($seenSentAtMs, 0 for none), so two
+     * requests never both ping it. Records the ping and the wait before it
+     * may go again unanswered.
+     */
+    public function claimPeerWake(string $interfaceId, int $seenSentAtMs, int $nowMs, int $backoffMs): bool
     {
         $stmt = $this->db->prepare(
-            'UPDATE interfaces SET last_wake_sent_at = :now WHERE interface_id = :interface_id'
+            'UPDATE interfaces SET wake_sent_at_ms = :now_ms, wake_backoff_ms = :backoff_ms
+              WHERE interface_id = :interface_id AND wake_sent_at_ms = :seen_ms'
         );
-        $stmt->bindValue(':now', time(), PDO::PARAM_INT);
+        $stmt->bindValue(':now_ms', $nowMs, PDO::PARAM_INT);
+        $stmt->bindValue(':backoff_ms', $backoffMs, PDO::PARAM_INT);
+        $stmt->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
+        $stmt->bindValue(':seen_ms', $seenSentAtMs, PDO::PARAM_INT);
+        $stmt->execute();
+
+        return $stmt->rowCount() > 0;
+    }
+
+    /** The peer exchanged: its ping, if one was out, is answered, and the backoff starts over. */
+    public function clearPeerWake(string $interfaceId): void
+    {
+        $stmt = $this->db->prepare(
+            'UPDATE interfaces SET wake_sent_at_ms = 0, wake_backoff_ms = 0
+              WHERE interface_id = :interface_id AND wake_sent_at_ms <> 0'
+        );
         $stmt->bindValue(':interface_id', $interfaceId, PDO::PARAM_STR);
         $stmt->execute();
     }

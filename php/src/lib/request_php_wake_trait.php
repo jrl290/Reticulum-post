@@ -44,11 +44,42 @@ use PDO;
  *   - CURLOPT_RETURNTRANSFER is always true — responses must never leak
  *     to stdout and corrupt our own HTTP response to the client.
  *
- * WAKE GATING
+ * WAKE TRAINS
  * -----------
- * Each peer has a last_wake_sent_at timestamp. dispatchWakes() skips peers
- * whose last wake was less than min_wake_interval_ms ago (default 1000ms).
- * This prevents wake storms when multiple exchanges happen simultaneously.
+ * James, 2026-10-19: "there should be a queue with a limit of one behind the
+ * active wake response ... another train should just come up directly
+ * behind it. No need to resend the wake", and "A wake is as short as
+ * possible. It is a ping. We don't want to detect failures. And yes, if
+ * there are packets still waiting after idle for more than 5 seconds, it can
+ * ping again. After that, exponential backoff".
+ *
+ * So a peer has at most one ping outstanding (wake_sent_at_ms, 0 for none):
+ *   - packets queued while it is out need no ping: they go in the exchange
+ *     it brings, which collects whatever is queued when it arrives;
+ *   - that exchange answers it (authenticateInterface clears it), so a
+ *     packet queued after the train has left finds none outstanding and
+ *     gets the next ping at once, from the same wake pass that queued it or
+ *     the one at the end of that very exchange;
+ *   - unanswered, with packets still waiting, it may go again after
+ *     5 s, then after double that each time, up to 5 min
+ *     (wake_backoff_ms). The peer's next exchange resets
+ *     it. A PHP node runs no timer: the ping goes at the first wake pass
+ *     after the wait, and the empty-poll shortcut's wake mark is dated then;
+ *   - packets the train took are still waiting until the peer confirms them,
+ *     which it does in its next exchange. They did not miss the train, so
+ *     they ping only once the peer has been idle 5 s (then 10 s, 20 s, ...
+ *     as above). Pinging for them at once cost two to six pings a packet on
+ *     staging: each ping's exchange left a batch to confirm, and so on;
+ *   - acknowledgements we owe the peer ping nothing: they go only in our call
+ *     to its exchange, which the peer's own ping for its waiting batch brings.
+ * No failure is detected or acted on: a ping that did not arrive looks the
+ * same as one whose exchange is still to come.
+ *
+ * Until 2026-10-19 a peer was woken at most once per min_wake_interval_ms
+ * (1000), comparing whole seconds of time(): a packet queued just after the
+ * peer's exchange had collected the rest, in the same second as the last
+ * wake, got no wake and waited for the next request that ran a wake pass.
+ * tests/wake_train_test.php.
  *
  * WAKE URL CONSTRUCTION
  * ---------------------
@@ -63,8 +94,8 @@ use PDO;
  *     leak into our HTTP response, causing JSON parse errors in clients).
  *   - Make the wake blocking — the raw socket approach MUST remain the
  *     primary path. cURL fallback is for compatibility only.
- *   - Add retry logic (violates DESIGN_PRINCIPLES.md Rule #1).
- *   - Remove the min_wake_interval gating.
+ *   - Ping a peer again while its ping is outstanding, other than after
+ *     the backoff (above).
  */
 
 trait RequestPhpWakeTrait
@@ -83,35 +114,32 @@ trait RequestPhpWakeTrait
         // (EmptyPoll, "THE WAKE MARK").
         EmptyPoll::clearWakesOwed($this->config ?? []);
 
-        // Collect peers with pending outbound packets.
+        // Peers with packets not yet acknowledged. Acknowledgements we owe a
+        // peer wake nothing: they travel only in our call to its exchange,
+        // which its own ping brings (its batch waits on them, so it pings).
         $peers = $this->phpPeerInterfaceIdsWithPendingOutbound();
-
-        // Also collect peers with pending acks (they need to know we received
-        // their data so they can release those batches).
-        $ackPeers = $this->phpPeerInterfaceIdsWithPendingAcks();
-        $seen = [];
-        foreach ($peers as $p) { $seen[(string)$p['interface_id']] = true; }
-        foreach ($ackPeers as $p) {
-            if (!isset($seen[(string)$p['interface_id']])) {
-                $peers[] = $p;
-                $seen[(string)$p['interface_id']] = true;
-            }
-        }
-        if ($peers !== []) {
-            EmptyPoll::noteWakesOwed($this->config ?? []);
-        }
-
-        // Gate: don't wake the same peer more than once per min_wake_interval_ms.
-        // This prevents wake storms when multiple exchanges stack up.
-        $minWakeInterval = (int) ($this->config['http']['min_wake_interval_ms'] ?? 1000);
         // Note: wakeTimeoutMs has a floor of 5000 in config but the cURL helper
         // caps it at 1000ms to maintain the non-blocking contract.
         $wakeTimeoutMs = max(5000, (int) ($this->config['http']['wake_timeout_ms'] ?? 500));
-        $now = time();
+        $nowMs = (int) floor(microtime(true) * 1000);
+        $nextDueMs = null;
 
         foreach ($peers as $peer) {
-            $lastWake = isset($peer['last_wake_sent_at']) ? (int) $peer['last_wake_sent_at'] : 0;
-            if (($now - $lastWake) * 1000 < $minWakeInterval) {
+            $interfaceId = (string) $peer['interface_id'];
+            $sentAtMs = (int) ($peer['wake_sent_at_ms'] ?? 0);
+            $backoffMs = (int) ($peer['wake_backoff_ms'] ?? 0);
+            if ($sentAtMs !== 0 && $nowMs - $sentAtMs < $backoffMs) {
+                // A train is coming: these packets go with it.
+                $nextDueMs = min($nextDueMs ?? PHP_INT_MAX, $sentAtMs + $backoffMs);
+                continue;
+            }
+            // No ping out, and every packet left on the last train: its
+            // confirmation comes with the peer's next exchange. Ping only once
+            // the peer has been idle 5 s, then as if that ping went unanswered.
+            $idleMs = $nowMs - (int) ($peer['last_seen_at'] ?? 0) * 1000;
+            $confirmOnly = $sentAtMs === 0 && (int) ($peer['has_unsent'] ?? 1) === 0;
+            if ($confirmOnly && $idleMs < self::wakeFirstAgainMs()) {
+                $nextDueMs = min($nextDueMs ?? PHP_INT_MAX, $nowMs - $idleMs + self::wakeFirstAgainMs());
                 continue;
             }
 
@@ -120,9 +148,45 @@ trait RequestPhpWakeTrait
                 continue;
             }
 
+            $nextBackoffMs = match (true) {
+                $confirmOnly => self::wakeFirstAgainMs() * 2,
+                $sentAtMs === 0 => self::wakeFirstAgainMs(),
+                default => min(max($backoffMs, self::wakeFirstAgainMs()) * 2, self::wakeBackoffCapMs()),
+            };
+            if (!$this->claimPeerWake($interfaceId, $sentAtMs, $nowMs, $nextBackoffMs)) {
+                continue; // another request pinged it, or its exchange just came
+            }
+            if ($sentAtMs !== 0 || $confirmOnly) {
+                error_log(sprintf(
+                    '[WAKE-AGAIN] interface=%s %s=%d next_after_ms=%d',
+                    substr($interfaceId, 0, 8),
+                    $confirmOnly ? 'unconfirmed_idle_ms' : 'unanswered_ms',
+                    $confirmOnly ? $idleMs : $nowMs - $sentAtMs,
+                    $nextBackoffMs
+                ));
+            }
             $this->fireAndForgetWake($peerUrl, $wakeTimeoutMs);
-            $this->touchPeerWakeSent((string) $peer['interface_id']);
+            $nextDueMs = min($nextDueMs ?? PHP_INT_MAX, $nowMs + $nextBackoffMs);
         }
+
+        if ($nextDueMs !== null) {
+            EmptyPoll::noteWakesOwed($this->config ?? [], intdiv($nextDueMs + 999, 1000));
+        }
+    }
+
+    /**
+     * How long an unanswered ping waits before it may go again (methods, not
+     * constants: a trait constant needs PHP 8.2, and the floor is 8.1).
+     */
+    private static function wakeFirstAgainMs(): int
+    {
+        return 5000;
+    }
+
+    /** The longest wait between unanswered pings. */
+    private static function wakeBackoffCapMs(): int
+    {
+        return 300000;
     }
 
     /**
@@ -455,8 +519,6 @@ trait RequestPhpWakeTrait
 
     private function appendPeerAckBatchId(string $peerInterfaceId, string $batchId): void
     {
-        // An acknowledgement owed to a peer is a wake owed (EmptyPoll).
-        EmptyPoll::noteWakesOwed($this->config ?? []);
         $stmt = $this->db->prepare(
             'SELECT pending_ack_batch_ids_json FROM interfaces WHERE interface_id = :interface_id'
         );

@@ -134,7 +134,6 @@ final class Config
                 'idle_exchange_interval_ms' => 1000,
                 'max_batch_packets' => 64,
                 'max_packet_bytes' => 512,
-                'min_wake_interval_ms' => 1000,
                 'wake_timeout_ms' => 500,
             ],
             'maintenance' => [

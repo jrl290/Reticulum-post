@@ -1071,7 +1071,7 @@ trait RequestRegistrationTrait
         $stmt = $this->db->prepare(
             'SELECT i.interface_id, i.name, i.session_token, i.bitrate, i.mtu, i.status, i.metadata_json,
                     i.registration_proof, i.previous_session_token_hash, i.superseded_logged_hash,
-                    i.identity_hash, i.claimed_identity_hash,
+                    i.identity_hash, i.claimed_identity_hash, i.wake_sent_at_ms,
                     CASE WHEN EXISTS (SELECT 1 FROM interfaces s WHERE s.identity_hash = i.claimed_identity_hash)
                          THEN 1 ELSE 0 END AS claim_is_signed
                FROM interfaces i WHERE i.interface_id = :interface_id'
@@ -1112,6 +1112,11 @@ trait RequestRegistrationTrait
                 }
             }
             $this->touchInterface($interfaceId, 'online');
+            // A ping to this connector was out: this exchange is the train it
+            // brought (RequestPhpWakeTrait, WAKE TRAINS).
+            if ((int) ($row['wake_sent_at_ms'] ?? 0) !== 0) {
+                $this->clearPeerWake($interfaceId);
+            }
 
             return [
                 'interface_id' => $interfaceId,

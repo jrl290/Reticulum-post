@@ -137,7 +137,7 @@ trait RequestInterfaceRuntimeTrait
         // follows this request (/v1/wake has none): idle polls must stop
         // taking the shortcut until an epilogue has woken the peer.
         if ($this->isPhpPeerInterface($interfaceId)) {
-            EmptyPoll::noteWakesOwed($this->config ?? []);
+            EmptyPoll::noteWakesOwed($this->config ?? [], time());
         }
 
         // Cap pending outbound per interface at 256. Drop oldest unissued entries.

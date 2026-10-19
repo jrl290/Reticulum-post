@@ -68,7 +68,7 @@ trait RequestSchemaTrait
      */
     private function schemaVersion(): string
     {
-        return 'key-width-1';
+        return 'wake-train-1';
     }
 
     private function recordedSchemaFingerprint(): ?string
@@ -284,6 +284,8 @@ trait RequestSchemaTrait
                     superseded_logged_hash VARCHAR(64) NOT NULL DEFAULT '',
                     refusal_logged_seq BIGINT NOT NULL DEFAULT -1,
                     seeded_at INT DEFAULT NULL,
+                    wake_sent_at_ms BIGINT NOT NULL DEFAULT 0,
+                    wake_backoff_ms INT NOT NULL DEFAULT 0,
                     PRIMARY KEY (interface_id)
                 ){$engine}",
 
@@ -521,6 +523,10 @@ trait RequestSchemaTrait
             ['interfaces', 'refusal_logged_seq', 'BIGINT NOT NULL DEFAULT -1', null],
             // seedInterfaceIfNew()'s marker: NULL until the row is seeded.
             ['interfaces', 'seeded_at', 'INT DEFAULT NULL', null],
+            // dispatchWakes()'s outstanding ping (0: none) and the wait before
+            // it may go again, unanswered (RequestPhpWakeTrait, WAKE TRAINS).
+            ['interfaces', 'wake_sent_at_ms', 'BIGINT NOT NULL DEFAULT 0', null],
+            ['interfaces', 'wake_backoff_ms', 'INT NOT NULL DEFAULT 0', null],
         ];
 
         // Ask each table for its columns once and add only the missing ones,
@@ -1153,7 +1159,7 @@ trait RequestSchemaTrait
             $probe = $this->db->query(
                 'SELECT identity_hash, identity_public_key, registration_seq, registration_proof,
                         claimed_identity_hash, previous_session_token_hash, superseded_logged_hash,
-                        refusal_logged_seq
+                        refusal_logged_seq, wake_sent_at_ms, wake_backoff_ms
                    FROM interfaces LIMIT 0'
             );
             if ($probe === false) {

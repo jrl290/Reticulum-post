@@ -34,8 +34,8 @@ require_once $root . '/src/index.php';
 // if the change alters what migrate() builds, raise schemaVersion() too, so
 // every database that recorded the old version migrates again; then pin the
 // new pair here.
-const PINNED_SCHEMA_VERSION = 'key-width-1';
-const PINNED_SCHEMA_TRAIT_MASKED_SHA1 = 'cf0e054753caec93121ea2fdd9559a92d433dc85';
+const PINNED_SCHEMA_VERSION = 'wake-train-1';
+const PINNED_SCHEMA_TRAIT_MASKED_SHA1 = 'afaa10d67c3f91012eb3049e21defbc4d811e04f';
 
 $dir = sys_get_temp_dir() . '/reticulum-php-marker-test-' . bin2hex(random_bytes(4));
 mkdir($dir, 0775, true);
@@ -167,6 +167,10 @@ $stage1Columns = [
     // Not §12: seedInterfaceIfNew()'s marker (2026-10-14), also new to a
     // 50c870b database.
     'seeded_at'                   => ['INT', 0, 'NULL'],
+    // Not §12 either: dispatchWakes()'s outstanding ping and its backoff
+    // (2026-10-19, tests/wake_train_test.php).
+    'wake_sent_at_ms'             => ['BIGINT', 1, '0'],
+    'wake_backoff_ms'             => ['INT', 1, '0'],
 ];
 $stage1Indexes = [
     'idx_interfaces_identity_hash'    => ['interfaces', 1, ['identity_hash']],

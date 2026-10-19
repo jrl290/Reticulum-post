@@ -47,11 +47,12 @@ namespace ReticulumPhp;
  * -------------
  * <dir>/wakes-owed exists while some PHP peer has packets or acknowledgements
  * waiting for it; RequestPhpWakeTrait::dispatchWakes rewrites it at every
- * epilogue that finds such a peer, so its mtime is that epilogue's time. The
- * epilogue wakes such peers, at most once per min_wake_interval_ms each. So
- * once min_wake_interval_ms has passed since the last epilogue, no poll takes
- * the shortcut until one has run again: the peers are woken as often as
- * before, while a peer that stays unreachable does not turn the shortcut off.
+ * epilogue that finds such a peer, dated when the earliest of their
+ * outstanding pings may go again unanswered (WAKE TRAINS there). Until then
+ * a wake pass would send nothing, so idle polls may take the shortcut; from
+ * then on none does until an epilogue has run again. The peers are pinged
+ * as often as the backoff allows, while a peer that stays unreachable does
+ * not keep the shortcut off between its pings.
  *
  * Anything this class cannot read or write means "no shortcut": the poll
  * takes the full path, which is what every poll did before.
@@ -101,10 +102,9 @@ final class EmptyPoll
             return;
         }
         $dir = self::dir($config);
-        // The same test as dispatchWakes' gate: a wake would go out now.
-        $owedSince = @filemtime($dir . '/' . self::WAKES_OWED);
-        $minWakeInterval = (int) ($config['http']['min_wake_interval_ms'] ?? 1000);
-        if ($owedSince !== false && (time() - $owedSince) * 1000 >= $minWakeInterval) {
+        // A wake pass would send a ping now.
+        $owedDueAt = @filemtime($dir . '/' . self::WAKES_OWED);
+        if ($owedDueAt !== false && time() >= $owedDueAt) {
             return;
         }
 
@@ -222,21 +222,22 @@ final class EmptyPoll
      * dispatchWakes calls this before it looks for peers to wake, and
      * noteWakesOwed() after, if it found any. Removing first and writing after
      * means two overlapping epilogues can leave a mark nothing is owed for
-     * (a poll per min_wake_interval_ms takes the full path until an epilogue
-     * finds nothing), but never remove one that is owed.
+     * (polls past its date take the full path until an epilogue finds
+     * nothing), but never remove one that is owed.
      */
     public static function clearWakesOwed(array $config): void
     {
         @unlink(self::dir($config) . '/' . self::WAKES_OWED);
     }
 
-    public static function noteWakesOwed(array $config): void
+    /** $dueAt: the second from which a wake pass would ping someone. */
+    public static function noteWakesOwed(array $config, int $dueAt): void
     {
         $dir = self::dir($config);
         if (!is_dir($dir) && !@mkdir($dir, 0700) && !is_dir($dir)) {
             return;
         }
-        @touch($dir . '/' . self::WAKES_OWED);
+        @touch($dir . '/' . self::WAKES_OWED, $dueAt);
     }
 
     /**
