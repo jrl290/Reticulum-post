@@ -556,4 +556,6 @@ All three components speak the same HTTP exchange protocol:
 
 ## License
 
-Reticulum Post is James LaFarge's work. Parts of the PHP router follow the transport behaviour of the Python reference implementation (`Transport.py`), so it is distributed under the Reticulum License, with Mark Qvist's notice for those parts. See [LICENSE](LICENSE).
+MIT, see [LICENSE](LICENSE).
+
+The PHP router implements Reticulum's transport behaviour. It was written with Mark Qvist's Python implementation as the reference, and its comments cite the functions it matches by file and line, but it contains none of his code: a request-driven node keeping its tables in a database is its own design. The Reticulum nodes it connects to run Mark Qvist's Reticulum, which is under the Reticulum License.

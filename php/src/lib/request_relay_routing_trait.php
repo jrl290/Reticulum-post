@@ -407,8 +407,7 @@ trait RequestRelayRoutingTrait
         $update->bindValue(':old_remaining_hops', $oldRemainingHops, PDO::PARAM_INT);
         Database::executeWithRetry($update, 'rebalanceLinkTransportEntry');
 
-        // Upstream: path_entry = path_table.get(link_destination);
-        // if path_entry: path_entry[IDX_PT_HOPS] = packet.hops
+        // The destination's path, if there is one, takes the proof's hop count too.
         $destinationHashHex = strtolower((string) ($linkEntry['destination_hash_hex'] ?? ''));
         if ($destinationHashHex !== '') {
             $path = $this->db->prepare(
